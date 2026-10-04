@@ -33,7 +33,7 @@
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
     "@snazzah/davey": "^0.1.11",
-    "better-sqlite3": "^12.9.0",
+    "better-sqlite3": "^13.0.3",
     "discord.js": "^14.26.3",
     "dotenv": "^17.4.2",
     "node-cron": "^4.2.1",
