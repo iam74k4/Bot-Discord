@@ -1,8 +1,8 @@
 # Discord Bot
 
-![Build Status](https://img.shields.io/github/actions/workflow/status/iam74k4/DiscordBot/.github/workflows/ci.yml?style=flat-square)
-![Version](https://img.shields.io/github/v/release/iam74k4/DiscordBot?style=flat-square)
-![License](https://img.shields.io/github/license/iam74k4/DiscordBot?style=flat-square)
+![Build Status](https://img.shields.io/github/actions/workflow/status/iam74k4/Bot-Discord/.github/workflows/ci.yml?style=flat-square)
+![Version](https://img.shields.io/github/v/release/iam74k4/Bot-Discord?style=flat-square)
+![License](https://img.shields.io/github/license/iam74k4/Bot-Discord?style=flat-square)
 ![Node.js Version](https://img.shields.io/badge/node-22.12%2B-339933?style=flat-square&logo=node.js&logoColor=white)
 
 A modular Discord bot built with TypeScript and discord.js v14.

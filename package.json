@@ -55,7 +55,7 @@
     "vitest": "^4.1.4"
   },
   "overrides": {
-    "undici": "6.28.0",
+    "undici": "6.29.0",
     "flatted": "3.4.2",
     "ws": "8.21.2"
   }
