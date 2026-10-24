@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js';
+import { InteractionContextType, SlashCommandBuilder } from 'discord.js';
 import { Command } from '../../../shared/types/index.js';
 import { autocompleteTts, executeTtsCommand } from '../application/index.js';
 import { MAX_SPEED, MIN_SPEED } from '../tts/voicevoxClient.js';
@@ -14,6 +14,8 @@ export const command: Command = {
     .setDescriptionLocalizations({
       ja: 'チャットをVCで読み上げ（VOICEVOX）',
     })
+    // Reading happens in a server's voice channel; there is nothing to do in DMs.
+    .setContexts(InteractionContextType.Guild)
     .addSubcommand((sub) =>
       sub
         .setName('start')

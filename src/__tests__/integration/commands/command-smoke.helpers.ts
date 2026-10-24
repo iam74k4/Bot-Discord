@@ -292,7 +292,7 @@ export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
   },
   tts: {
     defaultMemberPermissions: null,
-    contexts: null,
+    contexts: [InteractionContextType.Guild],
     cooldownMs: 2_000,
     autocomplete: ['tts voice speaker', 'tts dict remove word'],
     // Reading is for people who cannot or would rather not speak, so no

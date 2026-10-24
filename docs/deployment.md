@@ -57,6 +57,19 @@ If you enable voice recording in production, remember that `/voice record` now r
 
 Size the instance from `AUDIO_BUFFER_DURATION × 0.27MB × MAX_CONCURRENT_VC_CONNECTIONS` — about 410MB at the defaults — plus the bot's baseline, and set `MEMORY_LIMIT_MB` to the memory the host actually grants. That is the worst case, not the steady state: a channel's buffer is allocated on its first decoded audio chunk, so idle connections cost nothing. Servers that do not want the bot buffering their voice channels can turn it off per guild or per channel with `/voice autojoin`.
 
+### Shutdown and restarts
+
+`railway.toml` starts the bot with `node dist/index.js`, not `npm start`: npm
+does not pass SIGTERM on to node, so the graceful shutdown (final backup,
+closing open VC sessions, leaving voice channels) was skipped on every
+redeploy. `drainingSeconds = 15` gives that shutdown time to finish before
+Railway sends SIGKILL; keep it above `SHUTDOWN_TIMEOUT_MS / 1000`. A crash
+exits with code 1 so the `ON_FAILURE` restart policy brings the bot back.
+
+After a redeploy, the old deployment's logs should end with
+`Received SIGTERM, initiating graceful shutdown...` and
+`Graceful shutdown complete`.
+
 ### Text-to-speech (optional)
 
 `/tts` reads chat aloud with [VOICEVOX](https://voicevox.hiroshiba.jp/), which

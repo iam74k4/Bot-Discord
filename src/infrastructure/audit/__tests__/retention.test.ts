@@ -25,6 +25,7 @@ vi.mock('../../../shared/utils/logger.js', () => ({
     warn: loggerWarn,
     error: loggerError,
   },
+  getErrorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
 describe('audit log retention', () => {
@@ -120,60 +121,52 @@ describe('audit log retention', () => {
   });
 
   /**
-   * KNOWN BUG (reported, production code untouched): cleanupOldAuditLogs has
-   * no try/catch. A failed purge on the first run throws out of
-   * startAuditRetention() and so out of app start(); on a later daily tick it
-   * throws from setInterval into the process uncaughtException handler, which
-   * shuts the bot down. A purge is housekeeping and should be logged and
-   * retried tomorrow. Drop `.fails` once retention.ts catches the error.
+   * Regression: a failed purge used to throw out of startAuditRetention()
+   * (aborting app start) on the first run, and from setInterval into the
+   * uncaughtException handler on later ticks, shutting the bot down. A purge
+   * is housekeeping: it is logged and retried the next day.
    */
   describe('when a purge fails', () => {
     function loggedProblems(): unknown[][] {
       return [...loggerError.mock.calls, ...loggerWarn.mock.calls];
     }
 
-    it.fails(
-      'logs a failed first purge instead of throwing out of start',
-      async () => {
-        deleteOldLogs.mockImplementationOnce(() => {
-          throw new Error('database is locked');
-        });
-        const { startAuditRetention, stopAuditRetention } =
-          await import('../retention.js');
+    it('logs a failed first purge instead of throwing out of start', async () => {
+      deleteOldLogs.mockImplementationOnce(() => {
+        throw new Error('database is locked');
+      });
+      const { startAuditRetention, stopAuditRetention } =
+        await import('../retention.js');
 
-        try {
-          expect(() => startAuditRetention()).not.toThrow();
-          expect(loggedProblems()).not.toHaveLength(0);
+      try {
+        expect(() => startAuditRetention()).not.toThrow();
+        expect(loggedProblems()).not.toHaveLength(0);
 
-          // The schedule still runs the next day.
-          vi.advanceTimersByTime(DAY);
-          expect(deleteOldLogs).toHaveBeenCalledTimes(2);
-        } finally {
-          stopAuditRetention();
-        }
+        // The schedule still runs the next day.
+        vi.advanceTimersByTime(DAY);
+        expect(deleteOldLogs).toHaveBeenCalledTimes(2);
+      } finally {
+        stopAuditRetention();
       }
-    );
+    });
 
-    it.fails(
-      'keeps the daily schedule alive when a later purge fails',
-      async () => {
-        const { startAuditRetention, stopAuditRetention } =
-          await import('../retention.js');
-        startAuditRetention();
-        deleteOldLogs.mockImplementationOnce(() => {
-          throw new Error('database is locked');
-        });
+    it('keeps the daily schedule alive when a later purge fails', async () => {
+      const { startAuditRetention, stopAuditRetention } =
+        await import('../retention.js');
+      startAuditRetention();
+      deleteOldLogs.mockImplementationOnce(() => {
+        throw new Error('database is locked');
+      });
 
-        try {
-          expect(() => vi.advanceTimersByTime(DAY)).not.toThrow();
-          expect(loggedProblems()).not.toHaveLength(0);
+      try {
+        expect(() => vi.advanceTimersByTime(DAY)).not.toThrow();
+        expect(loggedProblems()).not.toHaveLength(0);
 
-          vi.advanceTimersByTime(DAY);
-          expect(deleteOldLogs).toHaveBeenCalledTimes(3);
-        } finally {
-          stopAuditRetention();
-        }
+        vi.advanceTimersByTime(DAY);
+        expect(deleteOldLogs).toHaveBeenCalledTimes(3);
+      } finally {
+        stopAuditRetention();
       }
-    );
+    });
   });
 });
