@@ -122,6 +122,25 @@ const DOCUMENTED_SCHEMA: Record<string, TableShape> = {
       idx_polls_creator: ['creator_id', 'channel_id'],
     },
   },
+  tts_dictionary: {
+    columns: {
+      guild_id: col('TEXT', { notNull: true, pk: 1 }),
+      word: col('TEXT', { notNull: true, pk: 2 }),
+      reading: col('TEXT', { notNull: true }),
+      created_by: col('TEXT', { notNull: true }),
+      created_at: col('INTEGER', { notNull: true }),
+    },
+    indexes: {},
+  },
+  tts_user_settings: {
+    columns: {
+      user_id: col('TEXT', { pk: 1 }),
+      speaker_id: col('INTEGER', { notNull: true }),
+      speed: col('REAL', { notNull: true, default: '1.0' }),
+      updated_at: col('INTEGER', { notNull: true }),
+    },
+    indexes: {},
+  },
   voice_autojoin_exclusions: {
     columns: {
       guild_id: col('TEXT', { notNull: true, pk: 1 }),
@@ -363,7 +382,8 @@ describe('initializeDatabase', () => {
         '007',
         '008',
         '009',
-        '010'
+        '010',
+        '011'
       );
 
       expect(describeSchema(db)).toEqual(schemaBefore);

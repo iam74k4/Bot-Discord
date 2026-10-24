@@ -256,6 +256,7 @@ describe('VoiceConnectionManager', () => {
         guildId: 'guild-1',
         connectedAt: NOW,
         lastActivity: NOW,
+        receiving: true,
       });
       expect(manager.getConnectionCount()).toBe(1);
     });

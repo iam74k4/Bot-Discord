@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { Events } from 'discord.js';
+import { Events, GatewayIntentBits } from 'discord.js';
 import type { AppConfig } from '../../config/index.js';
 import type { ExtendedClient } from '../../client.js';
 import {
@@ -8,7 +8,6 @@ import {
   defaultDependencies,
   type AppDependencies,
 } from '../composition.js';
-import { createClient } from '../../client.js';
 import { loadCommands } from '../../handlers/commandHandler.js';
 import { loadEvents } from '../../handlers/eventHandler.js';
 import {
@@ -314,7 +313,6 @@ describe('defaultDependencies', () => {
   it('wires the production collaborators', () => {
     const deps = defaultDependencies();
 
-    expect(deps.createClient).toBe(createClient);
     expect(deps.initializeDatabase).toBe(initializeDatabase);
     expect(deps.closeDatabase).toBe(closeDatabase);
     expect(deps.loadFeatures).toBe(loadFeatures);
@@ -326,6 +324,33 @@ describe('defaultDependencies', () => {
     expect(deps.startAuditRetention).toBe(startAuditRetention);
     expect(deps.stopAuditRetention).toBe(stopAuditRetention);
   });
+
+  it.each([
+    ['', false],
+    ['http://voicevox.railway.internal:50021', true],
+  ])(
+    'asks for the Message Content intent only when VOICEVOX_URL is set (%j)',
+    (voicevoxUrl, expected) => {
+      const client = defaultDependencies().createClient({
+        VOICEVOX_URL: voicevoxUrl,
+      } as AppConfig);
+
+      expect(client.options.intents.has(GatewayIntentBits.MessageContent)).toBe(
+        expected
+      );
+      expect(client.options.intents.has(GatewayIntentBits.GuildMessages)).toBe(
+        expected
+      );
+      // The intents every feature relies on are always there.
+      expect(
+        client.options.intents.has([
+          GatewayIntentBits.Guilds,
+          GatewayIntentBits.GuildMembers,
+          GatewayIntentBits.GuildVoiceStates,
+        ])
+      ).toBe(true);
+    }
+  );
 
   it('logs the client in with the token', async () => {
     const client = emitterClient(false);
