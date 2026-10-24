@@ -291,6 +291,8 @@ describe('executeOwnerCommand', () => {
 
       const result = lastEdit(editReply);
       expect(result.content).toBe('');
+      // The source hard-codes this title per locale rather than using a key.
+      expect(embedAt(result).title).toBe('Broadcast Complete');
       expect(embedAt(result).description).toBe(
         t('owner.broadcast.complete', 'en', {
           sent: 1,
@@ -329,7 +331,9 @@ describe('executeOwnerCommand', () => {
         }),
         expect.anything()
       );
-      expect(embedAt(lastEdit(editReply)).description).toBe(
+      const result = embedAt(lastEdit(editReply));
+      expect(result.title).toBe('一斉通知完了');
+      expect(result.description).toBe(
         t('owner.broadcast.complete', 'ja', {
           sent: 1,
           failed: 0,
@@ -394,8 +398,7 @@ describe('executeOwnerCommand', () => {
         expect.anything()
       );
 
-      // Initial progress, one every 12 guilds (20), the final guild, result.
-      expect(editReply).toHaveBeenCalledTimes(23);
+      // Progress names the cap from the first edit to the last one.
       expect(payloadOf<Payload>(editReply, 0).content).toBe(
         t('owner.broadcast.progress', 'en', {
           processed: 0,
@@ -405,11 +408,13 @@ describe('executeOwnerCommand', () => {
           capNote: ' [250/260]',
         })
       );
-      expect(payloadOf<Payload>(editReply, 1).content).toBe(
+      expect(
+        payloadOf<Payload>(editReply, editReply.mock.calls.length - 2).content
+      ).toBe(
         t('owner.broadcast.progress', 'en', {
-          processed: 12,
+          processed: 250,
           total: 250,
-          sent: 12,
+          sent: 250,
           failed: 0,
           capNote: ' (cap 250/260 guilds)',
         })
@@ -424,6 +429,43 @@ describe('executeOwnerCommand', () => {
             total: 260,
           }),
         })
+      );
+    });
+
+    it('clears the confirmation buttons, then reports progress every 12 guilds and on the last', async () => {
+      const opted = Array.from({ length: 25 }, (_, i) =>
+        optedInGuild(`g${i}`, { canSend: i !== 5 })
+      );
+      const { interaction, editReply } = setup({
+        subcommand: 'broadcast',
+        guilds: opted.map((o) => o.guild),
+      });
+
+      await executeOwnerCommand(interaction);
+
+      const progress = (processed: number, sent: number, failed: number) =>
+        t('owner.broadcast.progress', 'en', {
+          processed,
+          total: 25,
+          sent,
+          failed,
+          capNote: '',
+        });
+      // The first edit replaces the confirmation prompt: leaving its
+      // (disabled) Confirm/Cancel buttons up for the whole run would mislead.
+      expect(payloadOf<Payload>(editReply, 0)).toEqual({
+        content: progress(0, 0, 0),
+        embeds: [],
+        components: [],
+      });
+      expect(editReply.mock.calls.map(([p]) => (p as Payload).content)).toEqual(
+        [
+          progress(0, 0, 0),
+          progress(12, 11, 1),
+          progress(24, 23, 1),
+          progress(25, 24, 1),
+          '',
+        ]
       );
     });
 
@@ -505,13 +547,15 @@ describe('executeOwnerCommand', () => {
       await executeOwnerCommand(interaction);
 
       expect(editReply).toHaveBeenCalledTimes(2);
-      expect(payloadOf<Payload>(editReply, 0)).toMatchObject({
+      // Progress text and titles are hard-coded per locale in the source.
+      expect(payloadOf<Payload>(editReply, 0)).toEqual({
         embeds: [],
         components: [],
-        content: expect.any(String),
+        content: 'Running backup...',
       });
       const result = lastEdit(editReply);
       expect(result.content).toBe('');
+      expect(embedAt(result).title).toBe('Backup Complete');
       expect(embedAt(result).description).toBe(
         t('owner.backup.complete', 'en', {
           filename: 'backup-2026-10-24.db',
@@ -532,23 +576,41 @@ describe('executeOwnerCommand', () => {
 
       await executeOwnerCommand(interaction);
 
-      expect(embedAt(lastEdit(editReply)).description).toBe(
+      expect(payloadOf<Payload>(editReply, 0).content).toBe(
+        'バックアップを実行中...'
+      );
+      const result = embedAt(lastEdit(editReply));
+      expect(result.title).toBe('バックアップ完了');
+      expect(result.description).toBe(
         t('owner.backup.complete', 'ja', { filename: 'b.db', size: 2 })
       );
     });
 
     it.each([
-      ['the reported error', 'SQLITE_BUSY', 'SQLITE_BUSY', 'en'],
+      [
+        'the reported error',
+        'SQLITE_BUSY',
+        'SQLITE_BUSY',
+        'en',
+        'Backup Failed',
+      ],
       [
         'a fallback when none is given',
         undefined,
         'Unknown error occurred',
         'en',
+        'Backup Failed',
       ],
-      ['the reported error in Japanese', 'SQLITE_BUSY', 'SQLITE_BUSY', 'ja'],
+      [
+        'the reported error in Japanese',
+        'SQLITE_BUSY',
+        'SQLITE_BUSY',
+        'ja',
+        'バックアップ失敗',
+      ],
     ] as const)(
       'reports a failed backup with %s',
-      async (_case, error, shown, locale) => {
+      async (_case, error, shown, locale, title) => {
         vi.mocked(backupService.runBackup).mockResolvedValue({
           success: false,
           filename: '',
@@ -564,6 +626,7 @@ describe('executeOwnerCommand', () => {
 
         const result = lastEdit(editReply);
         expect(result.content).toBe('');
+        expect(embedAt(result).title).toBe(title);
         expect(embedAt(result).description).toBe(
           t('owner.backup.failed', locale, { error: shown })
         );

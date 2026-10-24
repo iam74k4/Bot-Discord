@@ -14,6 +14,7 @@ import {
   embedAt,
   flagsAt,
   lastEmbed,
+  mentioning,
   voiceChannel,
   voiceMember,
   type VoiceMemberStub,
@@ -131,6 +132,37 @@ describe('executeRouletteCommand', () => {
       expect(deferReply).not.toHaveBeenCalled();
     });
 
+    it('refuses, rather than crashing, for a raw member of an uncached guild', async () => {
+      // discord.js only wraps the member as a GuildMember (with .voice) when
+      // the guild is cached; otherwise it is the bare API payload.
+      const { interaction, reply, deferReply } = commandInteraction({
+        subcommand,
+        values,
+        hasGuild: false,
+        rawMember: { user: { id: 'user-1' }, roles: [], permissions: '0' },
+      });
+
+      await expect(run(interaction)).resolves.toBeUndefined();
+
+      expect(flagsAt(reply)).toBe(MessageFlags.Ephemeral);
+      expect(embedAt(reply).description).toBe(t('common.guildOnly', 'en'));
+      expect(deferReply).not.toHaveBeenCalled();
+    });
+
+    it('accepts a stage channel as a voice channel', async () => {
+      const { interaction, reply, deferReply, editReply } = commandInteraction({
+        subcommand,
+        values,
+        voice: voiceChannel(humans(3), { type: ChannelType.GuildStageVoice }),
+      });
+
+      await run(interaction);
+
+      expect(reply).not.toHaveBeenCalled();
+      expect(deferReply).toHaveBeenCalledTimes(1);
+      expect(lastEmbed(editReply).color).toBe(COLORS.SUCCESS);
+    });
+
     it('tells a member who is not in voice to join one', async () => {
       const { interaction, reply, deferReply } = commandInteraction({
         subcommand,
@@ -218,17 +250,19 @@ describe('executeRouletteCommand', () => {
       expect(editReply).not.toHaveBeenCalled();
     });
 
-    it('accepts a stage channel as a voice channel', async () => {
+    it('announces the lone human in the resolved locale', async () => {
+      resolveLocale.mockReturnValue('ja');
       const { interaction, reply } = commandInteraction({
         subcommand: 'member',
-        voice: voiceChannel([voiceMember('speaker')], {
-          type: ChannelType.GuildStageVoice,
-        }),
+        voice: voiceChannel([voiceMember('solo')]),
       });
 
       await run(interaction);
 
-      expect(embedAt(reply).description).toContain('<@speaker>');
+      expect(embedAt(reply)).toMatchObject({
+        title: t('roulette.member.result', 'ja'),
+        description: t('roulette.member.onlyOne', 'ja', { member: '<@solo>' }),
+      });
     });
 
     it('counts down, lists the humans, then reveals the pick', async () => {
@@ -281,8 +315,45 @@ describe('executeRouletteCommand', () => {
       });
       expect(lastEmbed(editReply).timestamp).toBeDefined();
       expect(logger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Alice selected from 3 members by user-1#0001')
+        mentioning('Alice', /\b3\b/, 'user-1#0001')
       );
+    });
+
+    it('plays the animation and reveals the pick in the resolved locale', async () => {
+      resolveLocale.mockReturnValue('ja');
+      vi.spyOn(Math, 'random').mockReturnValue(0.999);
+      const { interaction, editReply } = commandInteraction({
+        subcommand: 'member',
+        voice: voiceChannel(
+          [
+            voiceMember('a', { displayName: 'Alice' }),
+            voiceMember('b', { displayName: 'Bob' }),
+          ],
+          { name: 'Lounge' }
+        ),
+      });
+
+      await run(interaction);
+
+      expect([0, 1, 2, 3].map((i) => embedAt(editReply, i).title)).toEqual(
+        Array(4).fill(t('roulette.member.title', 'ja'))
+      );
+      expect(embedAt(editReply, 0).description).toBe(
+        `**${t('roulette.member.countdown', 'ja', { count: 3 })}**`
+      );
+      expect(embedAt(editReply, 3).description).toBe(
+        t('roulette.member.selecting', 'ja', { candidates: 'Alice, Bob' })
+      );
+      expect(lastEmbed(editReply)).toMatchObject({
+        title: t('roulette.member.result', 'ja'),
+        description: '<@b>',
+        footer: {
+          text: t('roulette.member.footer', 'ja', {
+            count: 2,
+            channel: 'Lounge',
+          }),
+        },
+      });
     });
 
     it.each([
@@ -379,18 +450,6 @@ describe('executeRouletteCommand', () => {
         }),
       });
       expect(deferReply).not.toHaveBeenCalled();
-    });
-
-    it('reads the team count as a required option', async () => {
-      const { interaction, getInteger } = commandInteraction({
-        subcommand: 'team',
-        values: { count: 2 },
-        voice: voiceChannel(humans(2)),
-      });
-
-      await run(interaction);
-
-      expect(getInteger).toHaveBeenCalledWith('count', true);
     });
 
     it('splits evenly with one member per team at the boundary', async () => {
@@ -529,7 +588,14 @@ describe('executeRouletteCommand', () => {
           (count) => `**${t('roulette.member.countdown', 'en', { count })}**`
         )
       );
-      expect(embedAt(editReply, 0).title).toBe(t('roulette.team.title', 'en'));
+      for (const i of [0, 1, 2, 3]) {
+        expect(embedAt(editReply, i)).toMatchObject({
+          title: t('roulette.team.title', 'en'),
+          color: COLORS.WARNING,
+        });
+        // Animation frames carry no timestamp; only the final result does.
+        expect(embedAt(editReply, i).timestamp).toBeUndefined();
+      }
       expect(embedAt(editReply, 3).description).toBe(
         t('roulette.team.shuffling', 'en', {
           count: 4,
@@ -546,9 +612,42 @@ describe('executeRouletteCommand', () => {
         color: COLORS.SUCCESS,
         footer: { text: t('roulette.team.footer', 'en', { channel: 'Arena' }) },
       });
+      expect(lastEmbed(editReply).timestamp).toBeDefined();
       expect(logger.info).toHaveBeenCalledWith(
-        expect.stringContaining('4 members divided into 2 teams by user-1#0001')
+        mentioning(/\b4\b/, /\b2\b/, 'user-1#0001')
       );
+    });
+
+    it('announces the teams in the resolved locale', async () => {
+      resolveLocale.mockReturnValue('ja');
+      const { interaction, editReply } = commandInteraction({
+        subcommand: 'team',
+        values: { count: 2 },
+        voice: voiceChannel(humans(3), { name: 'Arena' }),
+      });
+
+      await run(interaction);
+
+      expect(embedAt(editReply, 0).title).toBe(t('roulette.team.title', 'ja'));
+      expect(embedAt(editReply, 3).description).toBe(
+        t('roulette.team.shuffling', 'ja', {
+          count: 3,
+          teams: 2,
+          candidates: 'Name-u1, Name-u2, Name-u3',
+        })
+      );
+      expect(lastEmbed(editReply)).toMatchObject({
+        title: t('roulette.team.result', 'ja'),
+        description: t('roulette.team.resultDesc', 'ja', {
+          count: 3,
+          teams: 2,
+        }),
+        footer: { text: t('roulette.team.footer', 'ja', { channel: 'Arena' }) },
+      });
+      expect(lastEmbed(editReply).fields?.map((f) => f.name)).toEqual([
+        t('roulette.team.teamName', 'ja', { number: 1, count: 2 }),
+        t('roulette.team.teamName', 'ja', { number: 2, count: 1 }),
+      ]);
     });
 
     it('holds the teams back until the animation has played', async () => {

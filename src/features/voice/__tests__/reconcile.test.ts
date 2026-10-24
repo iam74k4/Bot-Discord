@@ -400,6 +400,33 @@ describe('reconcileOccupiedVoiceChannels', () => {
     expect(isAutoJoinEnabled).not.toHaveBeenCalledWith('guild-2');
   });
 
+  it('does not resume the scan when a slot frees up after the limit was hit', async () => {
+    const first = makeGuild('guild-1', [
+      makeVoiceChannel('ch-1', 'One', [makeMember('u1')]),
+    ]);
+    const second = makeGuild('guild-2', [
+      makeVoiceChannel('ch-2', 'Two', [makeMember('u2')]),
+    ]);
+    const third = makeGuild('guild-3', [
+      makeVoiceChannel('ch-3', 'Three', [makeMember('u3')]),
+    ]);
+    // Full on reaching guild-2; a connection drops before guild-3.
+    isAtLimit
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+
+    await reconcile(makeClient([first, second, third]));
+
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(connect.mock.calls[0][0]).toBe(first);
+    expect(isAtLimit).toHaveBeenCalledTimes(2);
+    const limitWarnings = logger.warn.mock.calls.filter(([message]) =>
+      String(message).includes('Connection limit reached')
+    );
+    expect(limitWarnings).toHaveLength(1);
+  });
+
   it('does nothing without any guilds', async () => {
     await reconcile(makeClient([]));
 

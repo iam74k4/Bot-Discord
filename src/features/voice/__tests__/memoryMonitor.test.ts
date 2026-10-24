@@ -3,7 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const disconnectOldest = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const getAllConnections = vi.hoisted(() => vi.fn());
 const getTotalMixBufferSizeMB = vi.hoisted(() => vi.fn().mockReturnValue(86));
-const sendAlert = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+/**
+ * `sendAlert` is split in two on purpose. `calls` records the arguments but
+ * returns nothing; `result` is a plain function that builds the promise the
+ * monitor gets back. A vi.fn returning the promise itself would subscribe to
+ * it to track results, which marks a rejection as handled and hides a missing
+ * `.catch` in the monitor.
+ */
+const alert = vi.hoisted(() => ({
+  calls: vi.fn(),
+  result: (): Promise<void> => Promise.resolve(),
+}));
+const sendAlert = alert.calls;
 const logger = vi.hoisted(() => ({
   error: vi.fn(),
   warn: vi.fn(),
@@ -19,7 +30,12 @@ vi.mock('../recording/channelMixRing.js', () => ({
   channelMixRingManager: { getTotalMixBufferSizeMB },
 }));
 
-vi.mock('../../../shared/utils/alert.js', () => ({ sendAlert }));
+vi.mock('../../../shared/utils/alert.js', () => ({
+  sendAlert: (...args: unknown[]) => {
+    alert.calls(...args);
+    return alert.result();
+  },
+}));
 
 vi.mock('../../../shared/utils/logger.js', () => ({
   logger,
@@ -53,12 +69,21 @@ function mockMemory(rssMB: number) {
   } as NodeJS.MemoryUsage);
 }
 
+/**
+ * Run one memory check now. The only place that reaches into the private
+ * method, so renaming it touches one line; scheduling itself is covered
+ * through start() and fake timers below.
+ */
+function check(monitor: InstanceType<typeof MemoryMonitor>): Promise<void> {
+  return monitor['checkMemoryUsage']();
+}
+
 describe('MemoryMonitor', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getAllConnections.mockReturnValue(connections(3));
     getTotalMixBufferSizeMB.mockReturnValue(86);
-    sendAlert.mockResolvedValue(undefined);
+    alert.result = () => Promise.resolve();
     disconnectOldest.mockResolvedValue(undefined);
   });
 
@@ -82,7 +107,7 @@ describe('MemoryMonitor', () => {
     mockMemory(900); // 90% of the 1000MB budget
     const monitor = new MemoryMonitor(config);
 
-    await monitor['checkMemoryUsage']();
+    await check(monitor);
 
     expect(sendAlert).toHaveBeenCalled();
     expect(disconnectOldest).toHaveBeenCalledWith(1);
@@ -92,7 +117,7 @@ describe('MemoryMonitor', () => {
     mockMemory(750); // 75%: above warn (70%), below critical (85%)
     const monitor = new MemoryMonitor(config);
 
-    await monitor['checkMemoryUsage']();
+    await check(monitor);
 
     expect(disconnectOldest).not.toHaveBeenCalled();
     expect(sendAlert).not.toHaveBeenCalled();
@@ -102,7 +127,7 @@ describe('MemoryMonitor', () => {
     mockMemory(300);
     const monitor = new MemoryMonitor(config);
 
-    await monitor['checkMemoryUsage']();
+    await check(monitor);
 
     expect(disconnectOldest).not.toHaveBeenCalled();
   });
@@ -118,8 +143,8 @@ describe('MemoryMonitor', () => {
     );
 
     const monitor = new MemoryMonitor(config);
-    const first = monitor['checkMemoryUsage']();
-    await monitor['checkMemoryUsage']();
+    const first = check(monitor);
+    await check(monitor);
 
     expect(disconnectOldest).toHaveBeenCalledTimes(1);
 
@@ -131,8 +156,8 @@ describe('MemoryMonitor', () => {
     mockMemory(950);
     const monitor = new MemoryMonitor(config);
 
-    await monitor['checkMemoryUsage']();
-    await monitor['checkMemoryUsage']();
+    await check(monitor);
+    await check(monitor);
 
     expect(disconnectOldest).toHaveBeenCalledTimes(2);
   });
@@ -140,14 +165,14 @@ describe('MemoryMonitor', () => {
   describe('thresholds', () => {
     it('treats exactly the critical threshold as critical', async () => {
       mockMemory(850); // round(1000 * 0.85)
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(disconnectOldest).toHaveBeenCalledTimes(1);
     });
 
     it('treats just under the critical threshold as a warning only', async () => {
       mockMemory(849.9);
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(disconnectOldest).not.toHaveBeenCalled();
       expect(logger.warn).toHaveBeenCalledWith(
@@ -157,7 +182,7 @@ describe('MemoryMonitor', () => {
 
     it('treats exactly the warning threshold as a warning', async () => {
       mockMemory(700); // round(1000 * 0.7)
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining('>= 700MB')
@@ -166,7 +191,7 @@ describe('MemoryMonitor', () => {
 
     it('stays silent just under the warning threshold', async () => {
       mockMemory(699.9);
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(logger.warn).not.toHaveBeenCalled();
       expect(logger.error).not.toHaveBeenCalled();
@@ -175,7 +200,7 @@ describe('MemoryMonitor', () => {
     it('rounds thresholds derived from an uneven limit', async () => {
       // 333 * 0.85 = 283.05 -> 283
       mockMemory(283);
-      await new MemoryMonitor({ MEMORY_LIMIT_MB: 333 })['checkMemoryUsage']();
+      await check(new MemoryMonitor({ MEMORY_LIMIT_MB: 333 }));
 
       expect(disconnectOldest).toHaveBeenCalledTimes(1);
     });
@@ -184,7 +209,7 @@ describe('MemoryMonitor', () => {
   describe('critical response', () => {
     it('alerts with the context an operator needs', async () => {
       mockMemory(900);
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(sendAlert).toHaveBeenCalledWith(
         'Critical Memory Threshold Exceeded',
@@ -201,7 +226,7 @@ describe('MemoryMonitor', () => {
       mockMemory(900);
       getAllConnections.mockReturnValue(connections(9));
 
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(disconnectOldest).toHaveBeenCalledWith(3);
     });
@@ -210,16 +235,35 @@ describe('MemoryMonitor', () => {
       mockMemory(900);
       getAllConnections.mockReturnValue(connections(2));
 
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(disconnectOldest).toHaveBeenCalledWith(1);
     });
+
+    // Counts where rounding up and rounding down disagree: shedding more than
+    // a third would cut off people the monitor did not need to drop.
+    it.each([
+      [4, 1],
+      [5, 1],
+      [7, 2],
+      [8, 2],
+    ])(
+      'rounds a third of %i connections down to %i',
+      async (count, expected) => {
+        mockMemory(900);
+        getAllConnections.mockReturnValue(connections(count));
+
+        await check(new MemoryMonitor(config));
+
+        expect(disconnectOldest).toHaveBeenCalledWith(expected);
+      }
+    );
 
     it('alerts but has nothing to shed with no connections', async () => {
       mockMemory(900);
       getAllConnections.mockReturnValue(connections(0));
 
-      await new MemoryMonitor(config)['checkMemoryUsage']();
+      await check(new MemoryMonitor(config));
 
       expect(sendAlert).toHaveBeenCalled();
       expect(disconnectOldest).not.toHaveBeenCalled();
@@ -227,12 +271,30 @@ describe('MemoryMonitor', () => {
 
     it('still sheds when the alert webhook fails', async () => {
       mockMemory(900);
-      sendAlert.mockRejectedValueOnce(new Error('webhook down'));
+      alert.result = () => Promise.reject(new Error('webhook down'));
 
-      await expect(
-        new MemoryMonitor(config)['checkMemoryUsage']()
-      ).resolves.toBeUndefined();
+      await expect(check(new MemoryMonitor(config))).resolves.toBeUndefined();
       expect(disconnectOldest).toHaveBeenCalledWith(1);
+    });
+
+    it('swallows a failed alert instead of leaving an unhandled rejection', async () => {
+      // An unhandled rejection can take the whole bot process down.
+      mockMemory(900);
+      alert.result = () => Promise.reject(new Error('webhook down'));
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandled);
+
+      try {
+        await check(new MemoryMonitor(config));
+        // Node reports unhandled rejections once the microtask queue drains.
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+
+      expect(sendAlert).toHaveBeenCalledTimes(1);
+      expect(unhandled).toEqual([]);
     });
   });
 

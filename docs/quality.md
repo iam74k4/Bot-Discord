@@ -60,6 +60,27 @@ This document describes the quality standards and practices for this Discord bot
 - Shared and infrastructure code may also colocate tests under their own `__tests__/` directories.
 - Use `getErrorMessage` pattern in mocks.
 - Integration tests for backup, admin commands.
+- **Every command is covered automatically.** `src/__tests__/integration/commands/commandPayload.test.ts`
+  checks every slash command against Discord's registration limits, and
+  `allCommands.smoke.test.ts` executes every command and subcommand path and
+  asserts it is acknowledged exactly once. A new command is picked up with no
+  extra test code; give it a dedicated test for its behaviour.
+- **Coverage is enforced in CI.** CI runs `npm run test:coverage`, which fails
+  below the floors in `vitest.config.ts`. Raise the floors when coverage grows;
+  do not lower them to make a change pass.
+- **Tests are type-checked.** `npm run type-check` also runs
+  `tsc -p tsconfig.test.json`, which includes the `__tests__` directories that
+  the build config excludes.
+- **Known bugs are pinned with `it.fails`.** A test that describes the correct
+  behaviour of a reported, not-yet-fixed bug is marked `it.fails` with a
+  comment naming the bug. It flips to failing the moment the bug is fixed,
+  which is the signal to change it to `it`.
+- **Assert behaviour, not wiring.** The suite was hardened with mutation
+  testing (deliberately breaking conditions, calls and boundaries in the
+  source and checking a test fails); prefer assertions that would catch such a
+  change over call-count or call-order checks.
+- Database tests use an in-memory SQLite (`new Database(':memory:')`) with the
+  real migrations, never `data/*.db`; time-based tests use fake timers.
 
 ## Localization
 

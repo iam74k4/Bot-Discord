@@ -146,6 +146,15 @@ describe('loadFeatures', () => {
       'Skipping feature directory without index: voice'
     );
     expect(logger.info).toHaveBeenCalledWith('Loaded 1 features');
+    // `_drafts` has an index on disk, so the only thing keeping it out is the
+    // underscore filter: it must not even be looked at, let alone imported
+    // (a failed import would be caught and logged, hiding the leak).
+    const checked = fsMock.existsSync.mock.calls.map((c) =>
+      String(c[0]).replace(/\\/g, '/')
+    );
+    expect(checked.some((path) => path.includes('/_drafts/'))).toBe(false);
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 
   it.each(['ts', 'js', 'both'] as const)(

@@ -115,9 +115,32 @@ describe('/general ping', () => {
     ]);
   });
 
+  it('ignores the local clock when Discord returns the created message', async () => {
+    // Local clock an hour behind Discord: both timestamps are Discord's own.
+    vi.setSystemTime(NOW - 60 * 60 * 1000);
+
+    const { editReply } = await ping({
+      createdTimestamp: NOW - 150,
+      deferReply: deferredAt(NOW - 30),
+    });
+
+    expect(embedAt(editReply).fields?.[0].value).toBe('120ms');
+  });
+
+  // Only the fallback reads the local clock, so a clock behind Discord's
+  // yields a negative round trip. Not specified anywhere; characterized so a
+  // change to it is deliberate.
+  it('reports the raw, negative difference when the fallback clock lags Discord', async () => {
+    const { editReply } = await ping({
+      createdTimestamp: NOW + 40,
+      deferReply: vi.fn().mockResolvedValue({ resource: null }),
+    });
+
+    expect(embedAt(editReply).fields?.[0].value).toBe('-40ms');
+  });
+
   // discord.js reports -1 until the first heartbeat is acknowledged. The
-  // command must still answer; how -1 should read is a reported bug, so only
-  // the presence of the API field is pinned here.
+  // command must still answer, and must not pass -1 off as a measurement.
   it('still replies before the first gateway heartbeat (ws ping -1)', async () => {
     const { editReply } = await ping({
       createdTimestamp: NOW - 10,
@@ -130,7 +153,20 @@ describe('/general ping', () => {
     expect(fields).toHaveLength(2);
     expect(fields[0].value).toBe('10ms');
     expect(fields[1].name).toBe(t('ping.apiLatency', 'en'));
-    expect(fields[1].value.length).toBeGreaterThan(0);
+    // Whatever placeholder a fix picks, it must not read like a real figure
+    // such as "1ms" or "0ms".
+    expect(fields[1].value).not.toMatch(/^\d+ms$/);
+  });
+
+  // BUG (reported, ping.ts:31): the raw -1 is shown as "-1ms". Characterized
+  // until fixed; replace with the chosen placeholder then.
+  it('currently shows the raw -1 before the first heartbeat', async () => {
+    const { editReply } = await ping({
+      deferReply: deferredAt(NOW),
+      wsPing: -1,
+    });
+
+    expect(embedAt(editReply).fields?.[1].value).toBe('-1ms');
   });
 
   it('propagates a failed defer without editing the reply', async () => {

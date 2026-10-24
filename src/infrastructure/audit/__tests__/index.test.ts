@@ -260,6 +260,70 @@ describe('audit', () => {
         expect(logger.error).not.toHaveBeenCalled();
       });
 
+      it('keeps the actor tag when only the target lookup fails', async () => {
+        discord.fetchUser.mockImplementation(async (id: string) => {
+          if (id === ACTOR_ID) return KNOWN_USERS[ACTOR_ID];
+          throw new Error('Unknown User');
+        });
+
+        await logAuditAction(
+          discord.client,
+          GUILD_ID,
+          ACTOR_ID,
+          'ROLE_REMOVE',
+          TARGET_ID
+        );
+
+        expect(sentEmbed().fields).toEqual([
+          { name: 'User', value: `Actor#0001 (<@${ACTOR_ID}>)`, inline: true },
+          { name: 'Target', value: `<@${TARGET_ID}>`, inline: true },
+        ]);
+        expect(logger.error).not.toHaveBeenCalled();
+      });
+
+      it('keeps the target tag when only the actor lookup fails', async () => {
+        discord.fetchUser.mockImplementation(async (id: string) => {
+          if (id === TARGET_ID) return KNOWN_USERS[TARGET_ID];
+          throw new Error('Unknown User');
+        });
+
+        await logAuditAction(
+          discord.client,
+          GUILD_ID,
+          ACTOR_ID,
+          'ROLE_ADD',
+          TARGET_ID
+        );
+
+        expect(sentEmbed().fields).toEqual([
+          { name: 'User', value: ACTOR_ID, inline: true },
+          {
+            name: 'Target',
+            value: `Target#0002 (<@${TARGET_ID}>)`,
+            inline: true,
+          },
+        ]);
+      });
+
+      it('accepts details right at the 1024-character field limit', async () => {
+        const details = 'x'.repeat(1024);
+
+        await logAuditAction(
+          discord.client,
+          GUILD_ID,
+          ACTOR_ID,
+          'SETTINGS_CHANGE',
+          undefined,
+          details
+        );
+
+        expect(sentEmbed().fields).toContainEqual({
+          name: 'Details',
+          value: details,
+          inline: false,
+        });
+      });
+
       it('shows an AUDIT_SETUP target as a channel without looking it up as a user', async () => {
         await logAuditAction(
           discord.client,
@@ -360,6 +424,33 @@ describe('audit', () => {
           missingPermissions
         );
         expect(auditRepository.getLogsCount(GUILD_ID)).toBe(1);
+      });
+
+      it('records but does not post details longer than an embed field allows', async () => {
+        const details = 'x'.repeat(1025);
+
+        await expect(
+          logAuditAction(
+            discord.client,
+            GUILD_ID,
+            ACTOR_ID,
+            'SETTINGS_CHANGE',
+            undefined,
+            details
+          )
+        ).resolves.toBeUndefined();
+
+        // The full text is kept in the database even though Discord would
+        // reject it, and the embed failure is logged rather than rethrown.
+        expect(auditRepository.getLogs(GUILD_ID)).toEqual([
+          expect.objectContaining({ action: 'SETTINGS_CHANGE', details }),
+        ]);
+        expect(discord.send).not.toHaveBeenCalled();
+        expect(logger.error).toHaveBeenCalledTimes(1);
+        expect(logger.error).toHaveBeenCalledWith(
+          'Failed to send audit log:',
+          expect.any(Error)
+        );
       });
 
       it('retries a transient network failure and then delivers', async () => {

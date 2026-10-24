@@ -128,6 +128,47 @@ describe('discoverFeatureCommands', () => {
     expect(logger.error).not.toHaveBeenCalled();
   });
 
+  describe('compiled output (`npm run build` with declaration: true)', () => {
+    /** What tsc emits next to each compiled command in dist/. */
+    function compiledTree(): string {
+      return featuresTree({
+        'general/commands/ping.js': validDefault('ping'),
+        'general/commands/ping.js.map': '{}',
+        'general/commands/ping.d.ts': [
+          "import type { Command } from '../../../shared/types/index.js';",
+          'export declare const command: Command;',
+        ].join('\n'),
+        'general/commands/ping.d.ts.map': '{}',
+      });
+    }
+
+    it('loads each command from its .js file and ignores source maps', async () => {
+      const dir = compiledTree();
+
+      const discovered = await discoverFeatureCommands(dir);
+
+      expect(names(discovered)).toEqual(['ping']);
+      expect(discovered[0].filePath).toBe(
+        join(dir, 'general', 'commands', 'ping.js')
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    // KNOWN BUG (commandRegistry.ts, the `.ts || .js` filter): `ping.d.ts`
+    // ends in `.ts`, so it is imported, exports nothing at runtime, and logs
+    // "Invalid command file" for every command on every boot. Once the filter
+    // skips `.d.ts`, this test starts failing: change `it.fails` to `it`.
+    it.fails('does not treat .d.ts declaration files as commands', async () => {
+      const dir = compiledTree();
+
+      const discovered = await discoverFeatureCommands(dir);
+
+      expect(names(discovered)).toEqual(['ping']);
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+  });
+
   it.each([
     ['no execute', "export default { data: { name: 'x' } };"],
     [

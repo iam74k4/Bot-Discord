@@ -4,6 +4,7 @@ import {
   ComponentType,
   MessageFlags,
   PermissionFlagsBits,
+  PermissionsBitField,
   SlashCommandBuilder,
   type APIEmbed,
 } from 'discord.js';
@@ -603,6 +604,10 @@ describe('/general help command:<name>', () => {
 
       const { reply } = await runHelp({ commandOption: 'nope' });
 
+      // Answered in the open, like every other help reply, with no panel.
+      expect(reply).toHaveBeenCalledTimes(1);
+      expect(payloadAt(reply).flags).toBeUndefined();
+      expect(payloadAt(reply).components).toBeUndefined();
       expect(embedAt(reply)).toMatchObject({
         title: t('help.commandNotFound', locale),
         description: t('help.commandNotFoundDesc', locale, {
@@ -620,7 +625,13 @@ describe('/general help command:<name>', () => {
       userId: OWNER_ID,
     });
 
-    expect(embedAt(asMember.reply).title).toBe(t('help.commandNotFound', 'en'));
+    // Indistinguishable from an unknown command, down to the reply flags.
+    expect(embedAt(asMember.reply)).toMatchObject({
+      title: t('help.commandNotFound', 'en'),
+      description: t('help.commandNotFoundDesc', 'en', { command: 'secret' }),
+      color: COLORS.WARNING,
+    });
+    expect(payloadAt(asMember.reply).flags).toBeUndefined();
     expect(embedAt(asOwner.reply).title).toBe('/secret');
   });
 
@@ -742,6 +753,106 @@ describe('/general help autocomplete', () => {
     expect(await suggest({ focused: 'zzz' })).toEqual([]);
   });
 
+  it.each([['one'], ['grp'], ['un'], ['pha']])(
+    'matches from the start of an entry name only, not text %s inside it',
+    async (focused) => {
+      expect(await suggest({ focused })).toEqual([]);
+    }
+  );
+
+  it('hides guild-permission entries when the member object is missing', async () => {
+    const choices = await suggest({ focused: '', permissions: null });
+
+    expect(choices.map((c) => c.value)).toEqual([
+      'alpha one',
+      'alpha grp',
+      'fun',
+    ]);
+  });
+
+  it('offers guild-permission entries to a member holding the permission', async () => {
+    const choices = await suggest({
+      focused: '',
+      permissions: PermissionFlagsBits.ManageGuild,
+    });
+
+    expect(choices.map((c) => c.value)).toEqual([
+      'alpha one',
+      'alpha grp',
+      'fun',
+      'mod',
+      'roles',
+    ]);
+  });
+
+  it('offers a bot owner in DMs the owner entries but no guild-permission ones', async () => {
+    const choices = await suggest({
+      focused: '',
+      userId: OWNER_ID,
+      inGuild: false,
+    });
+
+    expect(choices.map((c) => c.value)).toEqual([
+      'alpha one',
+      'alpha grp',
+      'fun',
+      'secret',
+    ]);
+  });
+
+  it('ignores guild permissions on a member outside a guild', async () => {
+    const choices = await suggest({
+      focused: '',
+      inGuild: false,
+      rawMember: { permissions: new PermissionsBitField(MANAGE_BOTH) },
+    });
+
+    expect(choices.map((c) => c.value)).toEqual([
+      'alpha one',
+      'alpha grp',
+      'fun',
+    ]);
+  });
+
+  it('does not trust raw API permission strings in suggestions', async () => {
+    const choices = await suggest({
+      focused: '',
+      rawMember: { permissions: String(MANAGE_BOTH) },
+    });
+
+    expect(choices.map((c) => c.value)).toEqual([
+      'alpha one',
+      'alpha grp',
+      'fun',
+    ]);
+  });
+
+  // BUG (reported, help.ts:145): only the description is capped, so with the
+  // longest names Discord allows (32 + 32 characters) a choice name reaches
+  // 130 characters, past Discord's 100-character limit, and respond() would
+  // be rejected. Characterized until fixed; the value is never shortened.
+  it('currently caps only the description part of a suggestion label', async () => {
+    const commandName = 'c'.repeat(32);
+    const subcommandName = 's'.repeat(32);
+    const longest = helpCommand(
+      new SlashCommandBuilder()
+        .setName(commandName)
+        .setDescription('d')
+        .addSubcommand((sub) =>
+          sub.setName(subcommandName).setDescription('D'.repeat(100))
+        ),
+      { category: GENERAL }
+    );
+
+    const choices = await suggest({ commands: [longest], focused: 'c' });
+
+    const entryName = `${commandName} ${subcommandName}`;
+    expect(choices).toEqual([
+      { name: `${entryName} - ${'D'.repeat(59)}...`, value: entryName },
+    ]);
+    expect(choices[0].name).toHaveLength(130);
+  });
+
   it('shortens descriptions longer than 60 characters', async () => {
     const long = 'L'.repeat(61);
     const exact = 'E'.repeat(60);
@@ -804,10 +915,23 @@ describe('/general help with the real command definitions', () => {
   let entries: CommandInfo[];
 
   beforeAll(async () => {
+    // Start clean whatever ran before (e.g. the config warning logged when
+    // this file loads), so the check below sees only discovery.
+    vi.mocked(logger.warn).mockClear();
+    vi.mocked(logger.error).mockClear();
+
     const discovered = await discoverFeatureCommands(FEATURES_PATH);
-    // A command module that fails to import would silently drop out of help.
-    expect(logger.error).not.toHaveBeenCalled();
-    expect(logger.warn).not.toHaveBeenCalled();
+
+    // A command module that fails to import, or exports no valid command,
+    // would silently drop out of help. Other import-time logging from the
+    // features is not this suite's concern.
+    const registryProblems = [
+      ...vi.mocked(logger.error).mock.calls,
+      ...vi.mocked(logger.warn).mock.calls,
+    ].filter(([message]) =>
+      /Failed to load command|Invalid command file/.test(String(message))
+    );
+    expect(registryProblems).toEqual([]);
 
     commands = discovered.map((item) => item.command);
     catalog = buildHelpCatalog(commands);

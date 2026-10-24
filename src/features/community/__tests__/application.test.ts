@@ -14,6 +14,7 @@ import {
   embedAt,
   flagsAt,
   lastEmbed,
+  mentioning,
 } from './community.helpers.js';
 
 /**
@@ -102,7 +103,8 @@ function textChannel(fetch: ReturnType<typeof vi.fn>) {
 
 function pollMessage(
   options: {
-    question?: string;
+    /** discord.js types the question text as `string | null`. */
+    question?: string | null;
     resultsFinalized?: boolean;
     end?: ReturnType<typeof vi.fn>;
   } = {}
@@ -110,7 +112,9 @@ function pollMessage(
   return {
     id: 'poll-msg-1',
     poll: {
-      question: { text: options.question ?? 'Lunch?' },
+      question: {
+        text: options.question === undefined ? 'Lunch?' : options.question,
+      },
       resultsFinalized: options.resultsFinalized ?? false,
       end: options.end ?? vi.fn().mockResolvedValue(undefined),
     },
@@ -134,6 +138,9 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
   vi.clearAllMocks();
+  // clearAllMocks keeps implementations; without a reset, one test's answer
+  // to the confirmation dialog would leak into the next.
+  awaitConfirmation.mockReset();
   resolveLocale.mockReturnValue('en');
   db.exec('DROP TABLE IF EXISTS polls');
   nativePolls();
@@ -185,7 +192,7 @@ describe('/community poll create', () => {
       },
     ]);
     expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining('"Lunch?" with 2 answers by user-1#0001')
+      mentioning('Lunch?', /\b2\b/, 'user-1#0001')
     );
   });
 
@@ -303,9 +310,7 @@ describe('/community poll create', () => {
 
     await executePollCommand(interaction);
 
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining('no message')
-    );
+    expect(logger.error).toHaveBeenCalledTimes(1);
     expect(storedPolls()).toEqual([]);
   });
 
@@ -316,12 +321,9 @@ describe('/community poll create', () => {
     await expect(executePollCommand(interaction)).resolves.toBeUndefined();
 
     expect(reply).toHaveBeenCalledTimes(1);
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to record poll message')
-    );
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining('Poll created')
-    );
+    expect(pollPayload(reply).question.text).toBe('Lunch?');
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith(mentioning('Lunch?'));
   });
 
   it('stores an empty guild id for a poll created outside a guild', async () => {
@@ -522,21 +524,27 @@ describe('/community poll end', () => {
     });
   });
 
-  it('falls back to a generic label when the poll has no question text', async () => {
-    seedPoll();
-    awaitConfirmation.mockResolvedValue(false);
-    const { interaction } = endInteraction(
-      vi.fn().mockResolvedValue(pollMessage({ question: '' }))
-    );
+  it.each([
+    ['empty', ''],
+    ['null', null],
+  ])(
+    'falls back to a generic label when the question text is %s',
+    async (_, question) => {
+      seedPoll();
+      awaitConfirmation.mockResolvedValue(false);
+      const { interaction } = endInteraction(
+        vi.fn().mockResolvedValue(pollMessage({ question }))
+      );
 
-    await executePollCommand(interaction);
+      await executePollCommand(interaction);
 
-    expect(awaitConfirmation).toHaveBeenCalledWith(
-      interaction,
-      t('poll.ended', 'en'),
-      { ephemeral: true }
-    );
-  });
+      expect(awaitConfirmation).toHaveBeenCalledWith(
+        interaction,
+        t('poll.ended', 'en'),
+        { ephemeral: true }
+      );
+    }
+  );
 
   it('leaves the poll running when the user cancels', async () => {
     seedPoll();
@@ -592,7 +600,7 @@ describe('/community poll end', () => {
     await executePollCommand(interaction);
 
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to end poll poll-msg-1'),
+      mentioning('poll-msg-1'),
       expect.any(Error)
     );
     expect(editReply.mock.calls[0][0]).toMatchObject({ components: [] });
@@ -601,6 +609,42 @@ describe('/community poll end', () => {
       description: t('poll.errors.pollEndedDesc', 'en'),
       color: COLORS.ERROR,
     });
+    expect(storedPolls()).toEqual([]);
+  });
+
+  it('keeps the poll and its pointer when the confirmation cannot be shown', async () => {
+    seedPoll();
+    awaitConfirmation.mockRejectedValue(new Error('Unknown interaction'));
+    const message = pollMessage();
+    const { interaction, editReply } = endInteraction(
+      vi.fn().mockResolvedValue(message)
+    );
+
+    await expect(executePollCommand(interaction)).rejects.toThrow(
+      'Unknown interaction'
+    );
+
+    expect(message.poll.end).not.toHaveBeenCalled();
+    expect(editReply).not.toHaveBeenCalled();
+    expect(storedPolls()).toHaveLength(1);
+  });
+
+  it('still forgets an ended poll when the closing reply cannot be sent', async () => {
+    seedPoll();
+    awaitConfirmation.mockResolvedValue(true);
+    const message = pollMessage();
+    const { interaction, editReply } = endInteraction(
+      vi.fn().mockResolvedValue(message)
+    );
+    editReply.mockRejectedValue(new Error('Unknown Webhook'));
+
+    await expect(executePollCommand(interaction)).rejects.toThrow(
+      'Unknown Webhook'
+    );
+
+    // The poll really is closed, so a stale pointer would only mislead the
+    // next `/community poll end` into a "poll ended" error.
+    expect(message.poll.end).toHaveBeenCalledTimes(1);
     expect(storedPolls()).toEqual([]);
   });
 

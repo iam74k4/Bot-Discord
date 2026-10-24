@@ -11,22 +11,31 @@ import {
 /**
  * Runs every slash command path the registry discovers against the real
  * application code, so a command added under `src/features/<f>/commands/`
- * is smoke-tested with no change to this file.
+ * is smoke-tested with no change to this file (beyond declaring who may use
+ * it in `COMMAND_POLICY`, which one test insists on).
  *
  * Only true externals are replaced: the database is in-memory SQLite brought
  * up by the real migration runner, voice connections and the recorder are
  * fakes, and backups never touch the disk. Everything between the
  * interaction and those seams - option parsing (discord.js's own resolver),
- * permission checks, repositories, panels, confirmations, audit logging -
- * is the production code.
+ * middleware, permission checks, repositories, panels, confirmations, audit
+ * logging - is the production code.
  *
  * For each path the invariants are the ones Discord and users care about:
  * the command resolves, acknowledges the interaction exactly once, never
  * edits before acknowledging, logs no error, reads only options it
  * declares, sends nothing Discord would reject, and shows no raw translation
  * key or unfilled `{placeholder}`. In a fully set-up server it must also
- * reach a non-error response. A path that only succeeds with some prior
- * state (something to remove, a poll to end) gets it from `SCENARIOS`.
+ * reach a non-error response, with ordinary values and at the limits of every
+ * option. On top of that:
+ * - who is served or refused follows the declared policy, not whatever the
+ *   code currently enforces (and `/general help` shows exactly that);
+ * - every path either proves it did its work (`REACHES`) or proves it
+ *   changed nothing (`READ_ONLY`);
+ * - cooldowns refuse a repeat for exactly as long as declared;
+ * - a Discord failure mid-command is answered privately by the router.
+ * A path that only succeeds with some prior state (something to remove, a
+ * poll to end) gets it from `SCENARIOS`.
  */
 
 const { db } = await vi.hoisted(async () => {
@@ -121,10 +130,11 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  InteractionContextType,
   MessageFlags,
+  PermissionFlagsBits,
   type APIEmbed,
   type ChatInputCommandInteraction,
+  type PermissionsBitField,
 } from 'discord.js';
 import type { Mock } from 'vitest';
 import { awaitConfirmation } from '../../../shared/utils/confirm.js';
@@ -132,6 +142,7 @@ import {
   buildHelpCatalog,
   type PermissionLevel,
 } from '../../../shared/help/catalog.js';
+import { canUserSeeCommandWithContext } from '../../../features/general/application/help.js';
 import { initializeDatabase } from '../../../infrastructure/database/migrations/index.js';
 import { buildCommandCollection } from '../../../app/interactions/commandRegistry.js';
 import { routeInteraction } from '../../../app/interactions/interactionRouter.js';
@@ -140,6 +151,7 @@ import { metrics } from '../../../infrastructure/metrics/index.js';
 import { env } from '../../../config/index.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { guildSettingsRepository } from '../../../infrastructure/guildSettings/index.js';
+import { t } from '../../../locales/index.js';
 import { en } from '../../../locales/en.js';
 import { ja } from '../../../locales/ja.js';
 import { notificationChannelRepository } from '../../../features/notification/repositories/notificationChannelRepository.js';
@@ -147,19 +159,30 @@ import { voiceSessionRepository } from '../../../features/notification/repositor
 import { pollRepository } from '../../../features/community/poll/index.js';
 import { voiceSettingsRepository } from '../../../features/voice/repositories/voiceSettingsRepository.js';
 import {
+  COMMAND_POLICY,
+  DISCORD_OPTION_BOUNDS,
+  INJECTED_FAILURE,
+  KNOWN_HELP_OVERREACH,
   autocompleteFor,
   commandPaths,
   createWorld,
+  declaredAccess,
+  effectiveCooldown,
   embedsOf,
   featuresWithCommandFiles,
+  helpEntryOf,
   invalidSlashReferences,
   invokeCommand,
   leafKeys,
   loadCommands,
   messageLimitProblems,
   pathPrefixes,
+  reachableFromBotDM,
+  sampleOption,
+  textOfLength,
   textsOf,
   translationProblems,
+  type AccessLevel,
   type CommandPath,
   type Invocation,
   type LoadedCommand,
@@ -235,6 +258,10 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
       world.textChannel.id
     );
   },
+  'voice autojoin enable': (world) => {
+    // Auto-join defaults to on; start from off so enabling has work to do.
+    voiceSettingsRepository.setAutoJoinEnabled(world.guild.id, false);
+  },
   'voice autojoin include': (world) => {
     voiceSettingsRepository.addExclusion(world.guild.id, world.voiceChannel.id);
   },
@@ -269,6 +296,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Routed tests put the invoking user on cooldown; never let it leak.
+  for (const command of commands) {
+    clearCooldown(command.json.name, world.actor.id);
+  }
   vi.useRealTimers();
 });
 
@@ -345,19 +376,74 @@ function expectWellBehaved(run: Invocation, error: unknown): void {
   ).toEqual([]);
 }
 
+function isEphemeral(payload: unknown): boolean {
+  const flags = (payload as { flags?: unknown } | undefined)?.flags;
+  return typeof flags === 'number' && (flags & MessageFlags.Ephemeral) !== 0;
+}
+
+/**
+ * A refusal: one private error, sent either as a reply or as a private
+ * deferral followed by an edit.
+ */
+function expectRefusal(run: Invocation): void {
+  expect([['reply'], ['deferReply', 'editReply']]).toContainEqual(
+    run.sent.map((entry) => entry.via)
+  );
+  expect(isEphemeral(run.sent[0]!.payload), 'the refusal is private').toBe(
+    true
+  );
+  expect(errorEmbeds(run)).toHaveLength(1);
+}
+
+/** Row-for-row contents of every table, to prove a run changed nothing. */
+function snapshotTables(): Record<string, unknown[]> {
+  const tables = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )
+    .all() as Array<{ name: string }>;
+  return Object.fromEntries(
+    tables.map(({ name }) => [
+      name,
+      db.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    ])
+  );
+}
+
+/** Nothing outside the reply happened: no rows, posts, roles or audio. */
+function expectNoSideEffects(before: Record<string, unknown[]>): void {
+  expect(snapshotTables()).toEqual(before);
+  expect(world.target.roles.add).not.toHaveBeenCalled();
+  expect(world.target.roles.remove).not.toHaveBeenCalled();
+  expect(world.textChannel.send).not.toHaveBeenCalled();
+  expect(voice.manager.disconnect).not.toHaveBeenCalled();
+  expect(voice.recordAudio).not.toHaveBeenCalled();
+  expect(backup.runBackup).not.toHaveBeenCalled();
+}
+
+const executions = (name: string) =>
+  metrics.getSnapshot().commands.byName[name] ?? 0;
+const failures = (name: string) =>
+  metrics.getSnapshot().commands.byName[`${name}:error`] ?? 0;
+
 interface Case {
   path: CommandPath;
   fill: OptionFill;
   locale: 'en-US' | 'ja';
 }
 
-/** Each path with required options only, then with every option, in both languages. */
+/**
+ * Each path with required options only, with every option in both
+ * languages, and with every option at its upper and lower limits.
+ */
 const SERVER_CASES: Array<[string, Case]> = paths.flatMap((path) =>
   (
     [
       { path, fill: 'required', locale: 'en-US' },
       { path, fill: 'all', locale: 'en-US' },
       { path, fill: 'all', locale: 'ja' },
+      { path, fill: 'max', locale: 'en-US' },
+      { path, fill: 'min', locale: 'en-US' },
     ] satisfies Case[]
   ).map((c): [string, Case] => [
     `/${path.label} (${c.fill} options, ${c.locale})`,
@@ -365,11 +451,15 @@ const SERVER_CASES: Array<[string, Case]> = paths.flatMap((path) =>
   ])
 );
 
-/** Paths Discord can deliver from a DM with the bot (BotDM context). */
-const DM_PATHS = paths.filter(
-  ({ entry }) =>
-    !entry.json.contexts ||
-    entry.json.contexts.includes(InteractionContextType.BotDM)
+/**
+ * Paths Discord can deliver from a DM with the bot, by the declared policy
+ * (the payload test holds the registered contexts to the same policy), so a
+ * command losing its DM context cannot quietly drop out of this run.
+ */
+const DM_PATHS = paths.filter(({ entry }) =>
+  reachableFromBotDM(
+    COMMAND_POLICY[entry.json.name]?.contexts ?? entry.json.contexts
+  )
 );
 
 describe('command discovery for the smoke run', () => {
@@ -386,12 +476,24 @@ describe('command discovery for the smoke run', () => {
       []
     );
   });
+
+  it('runs the DM cases for exactly the commands registered for DMs', () => {
+    const registered = commands
+      .filter((entry) => reachableFromBotDM(entry.json.contexts))
+      .map((entry) => entry.json.name);
+
+    expect(DM_PATHS.length).toBeGreaterThan(0);
+    expect([...new Set(DM_PATHS.map(({ entry }) => entry.json.name))]).toEqual(
+      registered
+    );
+  });
 });
 
 describe('every command path in a fully set-up server', () => {
   it.each(SERVER_CASES)('%s', async (_title, { path, fill, locale }) => {
     SCENARIOS[path.label]?.(world);
-    const suggestions = fill === 'all' ? await suggestionsFor(path) : undefined;
+    const suggestions =
+      fill === 'required' ? undefined : await suggestionsFor(path);
     const run = invokeCommand(world, path, {
       fill,
       locale,
@@ -428,12 +530,6 @@ describe('every command path reachable from a DM', () => {
 });
 
 describe('every command path routed like production', () => {
-  afterEach(() => {
-    for (const command of commands) {
-      clearCooldown(command.json.name, OWNER_ID);
-    }
-  });
-
   it.each(paths.map((path) => [`/${path.label}`, path] as const))(
     '%s passes its middleware and is counted as executed',
     async (_title, path) => {
@@ -445,7 +541,7 @@ describe('every command path routed like production', () => {
         suggestions: await suggestionsFor(path),
       });
       const name = path.entry.json.name;
-      const before = metrics.getSnapshot().commands.byName[name] ?? 0;
+      const before = executions(name);
 
       const error = await settle(
         routeInteraction(world.client, run.interaction)
@@ -453,30 +549,10 @@ describe('every command path routed like production', () => {
 
       expectWellBehaved(run, error);
       expect(errorEmbeds(run)).toEqual([]);
-      expect(metrics.getSnapshot().commands.byName[name] ?? 0).toBe(before + 1);
+      expect(executions(name)).toBe(before + 1);
     }
   );
 });
-
-/** Row-for-row contents of every table, to prove a refusal changed nothing. */
-function snapshotTables(): Record<string, unknown[]> {
-  const tables = db
-    .prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    )
-    .all() as Array<{ name: string }>;
-  return Object.fromEntries(
-    tables.map(({ name }) => [
-      name,
-      db.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
-    ])
-  );
-}
-
-function isEphemeral(payload: unknown): boolean {
-  const flags = (payload as { flags?: unknown } | undefined)?.flags;
-  return typeof flags === 'number' && (flags & MessageFlags.Ephemeral) !== 0;
-}
 
 const HELP_ENTRIES = new Map(
   buildHelpCatalog(commands.map((entry) => entry.command))
@@ -486,57 +562,342 @@ const HELP_ENTRIES = new Map(
 
 /** Who `/general help` says may use a path (its subcommand / group entry). */
 function advertisedLevels(path: CommandPath): PermissionLevel[] {
-  const entry =
-    HELP_ENTRIES.get(path.label.split(' ').slice(0, 2).join(' ')) ??
-    HELP_ENTRIES.get(path.entry.json.name);
+  const entry = HELP_ENTRIES.get(helpEntryOf(path));
   return [entry?.requiredPermission ?? 'everyone'].flat();
 }
 
-describe('every command path for a member without permissions', () => {
-  beforeEach(() => {
-    world = createWorld(OWNER_ID, { privileged: false });
-    world.client.commands = buildCommandCollection(commands);
-  });
+/**
+ * Members who are not bot owners, from no permissions up to each permission
+ * a command here asks for, alone. The fully privileged owner is the "fully
+ * set-up server" run above.
+ */
+const ACTORS: Array<
+  [string, { permissions: bigint[]; levels: readonly AccessLevel[] }]
+> = [
+  ['a member without permissions', { permissions: [], levels: ['everyone'] }],
+  [
+    'a member with only Manage Server',
+    {
+      permissions: [PermissionFlagsBits.ManageGuild],
+      levels: ['everyone', 'manageGuild'],
+    },
+  ],
+  [
+    'a member with only Manage Roles',
+    {
+      permissions: [PermissionFlagsBits.ManageRoles],
+      levels: ['everyone', 'manageRoles'],
+    },
+  ],
+];
 
-  afterEach(() => {
-    for (const command of commands) {
-      clearCooldown(command.json.name, world.actor.id);
+describe.each(ACTORS)(
+  'every command path for %s',
+  (_actor, { permissions, levels }) => {
+    beforeEach(() => {
+      world = createWorld(OWNER_ID, { permissions, owner: false });
+      world.client.commands = buildCommandCollection(commands);
+    });
+
+    it.each(paths.map((path) => [`/${path.label}`, path] as const))(
+      '%s is served exactly when the policy allows it, and help agrees',
+      async (_title, path) => {
+        SCENARIOS[path.label]?.(world);
+        const before = snapshotTables();
+        const run = invokeCommand(world, path, {
+          fill: 'all',
+          locale: 'en-US',
+          inGuild: true,
+          suggestions: await suggestionsFor(path),
+        });
+        // A command without a declared policy fails the policy test; until
+        // then, hold it to what help advertises.
+        const access = declaredAccess(path);
+        const allowed = access
+          ? levels.includes(access)
+          : advertisedLevels(path).some((level) => levels.includes(level));
+
+        const error = await settle(
+          routeInteraction(world.client, run.interaction)
+        );
+
+        expectWellBehaved(run, error);
+        if (allowed) {
+          expect(errorEmbeds(run), 'served without an error').toEqual([]);
+        } else {
+          expectRefusal(run);
+          expectNoSideEffects(before);
+        }
+
+        const entry = helpEntryOf(path);
+        const info = HELP_ENTRIES.get(entry);
+        expect(info, `"${entry}" is listed in /general help`).toBeDefined();
+        const overreach = KNOWN_HELP_OVERREACH[entry] ?? [];
+        const visible = canUserSeeCommandWithContext(info!, {
+          userId: world.actor.id,
+          guild: world.guild,
+          member: world.actor as { permissions: PermissionsBitField },
+        });
+        expect(visible, `/general help lists "${entry}" to this member`).toBe(
+          allowed || levels.some((level) => overreach.includes(level))
+        );
+      }
+    );
+  }
+);
+
+/**
+ * Drive a routed command until it resolves, moving the clock forward in small
+ * steps (so a cooldown is not skipped over the way `runAllTimers` would) and
+ * failing once `budgetMs` of command time has passed.
+ */
+async function runWithin(
+  work: Promise<unknown>,
+  budgetMs: number
+): Promise<unknown> {
+  let settled = false;
+  const outcome = work
+    .then(
+      () => undefined,
+      (error: unknown) => error ?? new Error('rejected without a reason')
+    )
+    .finally(() => {
+      settled = true;
+    });
+  // A refused command answers without waiting on any timer.
+  for (let i = 0; i < 200 && !settled; i++) await Promise.resolve();
+  for (let waited = 0; !settled; waited += 50) {
+    if (waited >= budgetMs) {
+      throw new Error(`the command was still running after ${budgetMs}ms`);
     }
+    await vi.advanceTimersByTimeAsync(50);
+  }
+  return outcome;
+}
+
+const COOLDOWN_CASES = paths.flatMap((path) => {
+  const cooldownMs = COMMAND_POLICY[path.entry.json.name]?.cooldownMs;
+  return cooldownMs
+    ? [[`/${path.label} (${cooldownMs}ms)`, { path, cooldownMs }] as const]
+    : [];
+});
+
+describe('every command path with a declared cooldown', () => {
+  it.each(COOLDOWN_CASES)(
+    '%s refuses a repeat by the same user until the cooldown has passed',
+    async (_title, { path, cooldownMs }) => {
+      SCENARIOS[path.label]?.(world);
+      const name = path.entry.json.name;
+      const suggestions = await suggestionsFor(path);
+      const start = Date.now();
+      const invoke = async () => {
+        const run = invokeCommand(world, path, {
+          fill: 'all',
+          locale: 'en-US',
+          inGuild: true,
+          suggestions,
+        });
+        const before = executions(name);
+        const error = await runWithin(
+          routeInteraction(world.client, run.interaction),
+          cooldownMs
+        );
+        return { run, error, executed: executions(name) - before };
+      };
+      const expectBlocked = ({
+        run,
+        error,
+        executed,
+      }: Awaited<ReturnType<typeof invoke>>) => {
+        expect(error).toBeUndefined();
+        expect(executed, 'execute() ran despite the cooldown').toBe(0);
+        expectRefusal(run);
+        expect(errorEmbeds(run)[0]!.title).toBe(
+          t('common.commandBlocked', 'en')
+        );
+      };
+
+      const first = await invoke();
+      expect(first.executed).toBe(1);
+      expect(
+        Date.now() - start,
+        'the cooldown must outlast the command itself'
+      ).toBeLessThan(cooldownMs);
+
+      expectBlocked(await invoke());
+
+      await vi.advanceTimersByTimeAsync(start + cooldownMs - 1 - Date.now());
+      expectBlocked(await invoke());
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await invoke()).executed, 'served once the cooldown ends').toBe(
+        1
+      );
+    }
+  );
+
+  it('covers every command whose middleware enforces a cooldown', () => {
+    const enforced = commands
+      .filter((entry) => effectiveCooldown(entry.command) !== null)
+      .map((entry) => entry.json.name);
+
+    expect(COOLDOWN_CASES.length).toBeGreaterThan(0);
+    expect([
+      ...new Set(COOLDOWN_CASES.map(([, { path }]) => path.entry.json.name)),
+    ]).toEqual(enforced);
+  });
+});
+
+/**
+ * Paths that catch a failed response themselves instead of leaving it to the
+ * router, with what they had already done by then. Production bug: role.ts
+ * wraps the confirmation reply in the same `try` as the role change, so a
+ * lost confirmation is reported as "Failed to modify role." although the
+ * change went through (and was audited). A retry then says the member
+ * already has the role.
+ */
+const HANDLES_OWN_FAILURE: Record<string, (world: SmokeWorld) => void> = {
+  'admin role add': (w) =>
+    expect(w.target.roles.add).toHaveBeenCalledWith(w.role.id),
+  'admin role remove': (w) =>
+    expect(w.target.roles.remove).toHaveBeenCalledWith(w.role.id),
+};
+
+/**
+ * Paths known to defer or confirm and then edit their reply, so the router's
+ * "already acknowledged" branch is certainly exercised below.
+ */
+const KNOWN_EDITORS = new Set([
+  'community poll end',
+  'community roulette member',
+  'general ping',
+  'owner backup run',
+  'voice record',
+]);
+
+describe('every command path when Discord rejects a response', () => {
+  it('keeps its path lists attached to real paths', () => {
+    const labels = new Set(paths.map((path) => path.label));
+    expect(
+      [...Object.keys(HANDLES_OWN_FAILURE), ...KNOWN_EDITORS].filter(
+        (label) => !labels.has(label)
+      )
+    ).toEqual([]);
   });
 
   it.each(paths.map((path) => [`/${path.label}`, path] as const))(
-    '%s is refused, or served, exactly as /general help advertises',
+    '%s gets a private error when its first response fails',
     async (_title, path) => {
       SCENARIOS[path.label]?.(world);
-      const before = snapshotTables();
+      const name = path.entry.json.name;
       const run = invokeCommand(world, path, {
         fill: 'all',
         locale: 'en-US',
         inGuild: true,
         suggestions: await suggestionsFor(path),
+        failFirst: 'initialResponse',
       });
+      const before = { executed: executions(name), failed: failures(name) };
+      // Step the clock rather than run every timer, so a cooldown the
+      // failure left behind is still in force for the retry below.
+      const budget = COMMAND_POLICY[name]?.cooldownMs ?? 60_000;
+
+      const error = await runWithin(
+        routeInteraction(world.client, run.interaction),
+        budget
+      );
+
+      expect(error, 'routeInteraction() rejected').toBeUndefined();
+      // The command's own response was lost; the apology that follows is
+      // the one that acknowledges the interaction.
+      expect(run.injectedFailures).toHaveLength(1);
+      expect(run.violations).toEqual([]);
+      expect(run.initialResponses).toEqual(['reply']);
+      expect(run.sent).toHaveLength(1);
+      expect(isEphemeral(run.sent[0]!.payload)).toBe(true);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+
+      const ownHandling = HANDLES_OWN_FAILURE[path.label];
+      if (ownHandling) {
+        expect(errorEmbeds(run)).toHaveLength(1);
+        expect(executions(name)).toBe(before.executed + 1);
+        expect(failures(name)).toBe(before.failed);
+        ownHandling(world);
+        return;
+      }
+
+      expect(embedsOf(run.sent[0]!.payload)).toEqual([
+        expect.objectContaining({
+          title: t('common.error', 'en'),
+          description: t('common.unexpectedError', 'en'),
+          color: COLORS.ERROR,
+        }),
+      ]);
+      expect(executions(name)).toBe(before.executed);
+      expect(failures(name)).toBe(before.failed + 1);
+      expect(logger.error).toHaveBeenCalledWith(
+        `Error executing command ${name}:`,
+        INJECTED_FAILURE
+      );
+
+      // A failed run must not leave the user locked out by a cooldown.
+      const retry = invokeCommand(world, path, {
+        fill: 'all',
+        locale: 'en-US',
+        inGuild: true,
+        suggestions: await suggestionsFor(path),
+      });
+      await runWithin(
+        routeInteraction(world.client, retry.interaction),
+        budget
+      );
+      expect(executions(name), 'an immediate retry is served').toBe(
+        before.executed + 1
+      );
+    }
+  );
+
+  it.each(paths.map((path) => [`/${path.label}`, path] as const))(
+    '%s edits the error into an acknowledged reply when a later edit fails',
+    async (_title, path) => {
+      SCENARIOS[path.label]?.(world);
+      const name = path.entry.json.name;
+      const run = invokeCommand(world, path, {
+        fill: 'all',
+        locale: 'en-US',
+        inGuild: true,
+        suggestions: await suggestionsFor(path),
+        failFirst: 'editReply',
+      });
+      const failedBefore = failures(name);
 
       const error = await settle(
         routeInteraction(world.client, run.interaction)
       );
 
-      expectWellBehaved(run, error);
-      if (advertisedLevels(path).includes('everyone')) {
+      expect(error, 'routeInteraction() rejected').toBeUndefined();
+      expect(run.violations).toEqual([]);
+      expect(run.initialResponses).toHaveLength(1);
+      if (KNOWN_EDITORS.has(path.label)) {
+        expect(run.injectedFailures, 'this path edits its reply').toEqual([
+          'editReply',
+        ]);
+      }
+      if (run.injectedFailures.length === 0) {
+        // This path never edits its reply; it ran normally.
         expect(errorEmbeds(run)).toEqual([]);
         return;
       }
 
-      // Restricted: one private error, and nothing touched.
-      expect(run.sent.map((entry) => entry.via)).toEqual(['reply']);
-      expect(isEphemeral(run.sent[0]!.payload)).toBe(true);
-      expect(errorEmbeds(run)).toHaveLength(1);
-      expect(snapshotTables()).toEqual(before);
-      expect(world.target.roles.add).not.toHaveBeenCalled();
-      expect(world.target.roles.remove).not.toHaveBeenCalled();
-      expect(world.textChannel.send).not.toHaveBeenCalled();
-      expect(voice.manager.disconnect).not.toHaveBeenCalled();
-      expect(voice.recordAudio).not.toHaveBeenCalled();
-      expect(backup.runBackup).not.toHaveBeenCalled();
+      const last = run.sent.at(-1)!;
+      expect(last.via).toBe('editReply');
+      expect(embedsOf(last.payload)).toEqual([
+        expect.objectContaining({
+          description: t('common.unexpectedError', 'en'),
+          color: COLORS.ERROR,
+        }),
+      ]);
+      expect(failures(name)).toBe(failedBefore + 1);
     }
   );
 });
@@ -586,10 +947,109 @@ describe('every autocomplete option', () => {
     }
   );
 
+  it('covers every autocomplete option the policy declares', () => {
+    expect(
+      AUTOCOMPLETE_CASES.map(
+        ([, { path, option }]) => `${path.label} ${option.name}`
+      ).sort()
+    ).toEqual(
+      Object.values(COMMAND_POLICY)
+        .flatMap((policy) => policy.autocomplete)
+        .sort()
+    );
+  });
+
   it('suggests something for an empty query, which the server runs use', async () => {
+    expect(AUTOCOMPLETE_CASES.length).toBeGreaterThan(0);
     for (const [, { path }] of AUTOCOMPLETE_CASES) {
       expect((await suggestionsFor(path)).size).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('interactions the router answers itself', () => {
+  it.each(commands.map((entry) => [`/${entry.json.name}`, entry] as const))(
+    '%s, still registered at Discord but gone from this build, gets a private "not found"',
+    async (_title, entry) => {
+      const name = entry.json.name;
+      const path = paths.find((candidate) => candidate.entry === entry)!;
+      world.client.commands.delete(name);
+      const run = invokeCommand(world, path, {
+        fill: 'required',
+        locale: 'ja',
+        inGuild: true,
+      });
+      const before = executions(name);
+
+      const error = await settle(
+        routeInteraction(world.client, run.interaction)
+      );
+
+      expect(error).toBeUndefined();
+      expect(run.sent.map((sent) => sent.via)).toEqual(['reply']);
+      expect(isEphemeral(run.sent[0]!.payload)).toBe(true);
+      expect(embedsOf(run.sent[0]!.payload)).toEqual([
+        expect.objectContaining({
+          title: t('help.commandNotFound', 'ja'),
+          description: t('help.commandNotFoundDesc', 'ja', { command: name }),
+          color: COLORS.ERROR,
+        }),
+      ]);
+      expect(logger.warn).toHaveBeenCalledWith(`Unknown command: ${name}`);
+      expect(executions(name)).toBe(before);
+    }
+  );
+
+  const WITHOUT_HANDLER = paths
+    .filter((path) => !path.entry.command.autocomplete)
+    .flatMap((path) =>
+      path.options
+        .slice(0, 1)
+        .map(
+          (option) =>
+            [`/${path.label} ${option.name}:`, { path, option }] as const
+        )
+    );
+
+  it.each(WITHOUT_HANDLER)(
+    '%s autocomplete, with no handler, gets an empty list',
+    async (_title, { path, option }) => {
+      const { interaction, respond } = autocompleteFor(
+        world,
+        path,
+        option,
+        'x'
+      );
+
+      await routeInteraction(world.client, interaction);
+
+      expect(respond).toHaveBeenCalledTimes(1);
+      expect(respond).toHaveBeenCalledWith([]);
+      expect(logger.error).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(AUTOCOMPLETE_CASES)(
+    '%s autocomplete falls back to an empty list when Discord rejects the suggestions',
+    async (_title, { path, option }) => {
+      const { interaction, respond } = autocompleteFor(world, path, option, '');
+      respond.mockRejectedValueOnce(new Error(INJECTED_FAILURE));
+
+      await expect(
+        routeInteraction(world.client, interaction)
+      ).resolves.toBeUndefined();
+
+      expect(respond).toHaveBeenCalledTimes(2);
+      expect(respond).toHaveBeenLastCalledWith([]);
+      expect(logger.error).toHaveBeenCalledWith(
+        `Autocomplete error for ${path.entry.json.name}:`,
+        INJECTED_FAILURE
+      );
+    }
+  );
+
+  it('keeps a command without an autocomplete handler in the run above', () => {
+    expect(WITHOUT_HANDLER.length).toBeGreaterThan(0);
   });
 });
 
@@ -635,11 +1095,14 @@ describe('translations the replies are built from', () => {
 
 /**
  * A smoke run that silently stops at a guard (no guild, no permission, bot
- * not in voice) still "acknowledges once". These anchors prove the world is
- * rich enough to reach the work each feature exists to do.
+ * not in voice) or runs the wrong handler still "acknowledges once". These
+ * anchors prove each path that changes something did its own work - the
+ * right row, the right member, the right channel - and nothing a sibling
+ * path does.
  */
 const REACHES: Array<{
   label: string;
+  fill?: OptionFill;
   reached: (world: SmokeWorld) => void;
 }> = [
   {
@@ -650,9 +1113,35 @@ const REACHES: Array<{
       ),
   },
   {
+    label: 'voice autojoin enable',
+    reached: (w) => {
+      expect(voiceSettingsRepository.isAutoJoinEnabled(w.guild.id)).toBe(true);
+      expect(voice.manager.disconnect).not.toHaveBeenCalled();
+    },
+  },
+  {
     label: 'voice autojoin disable',
-    reached: (w) =>
-      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id),
+    reached: (w) => {
+      expect(voiceSettingsRepository.isAutoJoinEnabled(w.guild.id)).toBe(false);
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+    },
+  },
+  {
+    label: 'voice autojoin exclude',
+    reached: (w) => {
+      expect(voiceSettingsRepository.listExclusions(w.guild.id)).toEqual([
+        w.voiceChannel.id,
+      ]);
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+      expect(voiceSettingsRepository.isAutoJoinEnabled(w.guild.id)).toBe(true);
+    },
+  },
+  {
+    label: 'voice autojoin include',
+    reached: (w) => {
+      expect(voiceSettingsRepository.listExclusions(w.guild.id)).toEqual([]);
+      expect(voice.manager.disconnect).not.toHaveBeenCalled();
+    },
   },
   {
     label: 'owner backup run',
@@ -681,7 +1170,18 @@ const REACHES: Array<{
   },
   {
     label: 'admin role add',
-    reached: (w) => expect(w.target.roles.add).toHaveBeenCalledWith(w.role.id),
+    reached: (w) => {
+      expect(w.target.roles.add).toHaveBeenCalledWith(w.role.id);
+      expect(w.target.roles.remove).not.toHaveBeenCalled();
+    },
+  },
+  {
+    label: 'admin role remove',
+    reached: (w) => {
+      expect(w.target.roles.remove).toHaveBeenCalledWith(w.role.id);
+      expect(w.target.roles.add).not.toHaveBeenCalled();
+      expect(w.target.roles.cache.has(w.role.id)).toBe(false);
+    },
   },
   {
     label: 'admin settings language',
@@ -689,32 +1189,145 @@ const REACHES: Array<{
       expect(guildSettingsRepository.getLanguage(w.guild.id)).toBe('en'),
   },
   {
+    label: 'admin settings audit',
+    fill: 'all',
+    reached: (w) => {
+      expect(guildSettingsRepository.getAuditChannel(w.guild.id)).toBe(
+        w.textChannel.id
+      );
+      expect(guildSettingsRepository.getAnnouncementChannel(w.guild.id)).toBe(
+        null
+      );
+    },
+  },
+  {
+    label: 'admin settings announcements',
+    fill: 'all',
+    reached: (w) => {
+      expect(guildSettingsRepository.getAnnouncementChannel(w.guild.id)).toBe(
+        w.textChannel.id
+      );
+      expect(guildSettingsRepository.getAuditChannel(w.guild.id)).toBe(null);
+    },
+  },
+  {
     label: 'notification voice set',
+    reached: (w) => {
+      expect(
+        notificationChannelRepository.getEnabled(w.guild.id, 'voice')
+      ).toBe(w.textChannel.id);
+      expect(
+        notificationChannelRepository.getEnabled(w.guild.id, 'member_join')
+      ).toBeNull();
+    },
+  },
+  {
+    label: 'notification voice disable',
     reached: (w) =>
       expect(
         notificationChannelRepository.getEnabled(w.guild.id, 'voice')
-      ).toBe(w.textChannel.id),
+      ).toBeNull(),
+  },
+  {
+    label: 'notification welcome set',
+    reached: (w) => {
+      expect(
+        notificationChannelRepository.getEnabled(w.guild.id, 'member_join')
+      ).toBe(w.textChannel.id);
+      expect(
+        notificationChannelRepository.getEnabled(w.guild.id, 'voice')
+      ).toBeNull();
+    },
+  },
+  {
+    label: 'notification welcome disable',
+    reached: (w) =>
+      expect(
+        notificationChannelRepository.getEnabled(w.guild.id, 'member_join')
+      ).toBeNull(),
   },
 ];
 
+/**
+ * Paths that only show something. Each one is run below and must leave the
+ * database, the channel, roles, voice and backups exactly as it found them.
+ */
+const READ_ONLY = new Set([
+  'admin settings view',
+  'admin settings logs',
+  'community roulette member',
+  'community roulette team',
+  'general help',
+  'general ping',
+  'general about',
+  'notification status',
+  'notification stats',
+  'owner system stats',
+  'owner system db',
+  'owner system guilds',
+  'owner system health',
+  'owner system metrics',
+  'owner backup list',
+  'voice status',
+]);
+
 describe('the smoke world reaches the real work', () => {
+  it('accounts for every path as either doing work or read-only', () => {
+    const reaching = new Set(REACHES.map((r) => r.label));
+    const labels = paths.map((path) => path.label);
+
+    expect(
+      labels.filter((label) => !reaching.has(label) && !READ_ONLY.has(label)),
+      'add a REACHES anchor (or a READ_ONLY entry) for these paths'
+    ).toEqual([]);
+    expect(
+      labels.filter((label) => reaching.has(label) && READ_ONLY.has(label))
+    ).toEqual([]);
+    expect(
+      [...reaching, ...READ_ONLY].filter((label) => !labels.includes(label)),
+      'stale entries'
+    ).toEqual([]);
+  });
+
   it.each(REACHES.map((r) => [`/${r.label}`, r] as const))(
     '%s',
-    async (_title, { label, reached }) => {
+    async (_title, { label, fill = 'required', reached }) => {
       const path = paths.find((candidate) => candidate.label === label);
       expect(path, `no command path "/${label}"`).toBeDefined();
       SCENARIOS[label]?.(world);
       const run = invokeCommand(world, path!, {
-        fill: 'required',
+        fill,
         locale: 'en-US',
         inGuild: true,
       });
 
-      await settle(path!.entry.command.execute(run.interaction));
+      const error = await settle(path!.entry.command.execute(run.interaction));
 
+      expect(error).toBeUndefined();
+      expect(errorEmbeds(run)).toEqual([]);
       reached(world);
     }
   );
+
+  it.each(
+    paths
+      .filter((path) => READ_ONLY.has(path.label))
+      .map((path) => [`/${path.label}`, path] as const)
+  )('%s changes nothing', async (_title, path) => {
+    SCENARIOS[path.label]?.(world);
+    const before = snapshotTables();
+    const run = invokeCommand(world, path, {
+      fill: 'all',
+      locale: 'en-US',
+      inGuild: true,
+      suggestions: await suggestionsFor(path),
+    });
+
+    const error = await settle(path.entry.command.execute(run.interaction));
+
+    expectWellBehaved(run, error);
+    expectNoSideEffects(before);
+  });
 });
 
 describe('the smoke harness itself', () => {
@@ -738,11 +1351,15 @@ describe('the smoke harness itself', () => {
     return { label: 'fake', entry, group: null, subcommand: null, options };
   }
 
-  async function runFake(path: CommandPath) {
+  async function runFake(
+    path: CommandPath,
+    extra: { fill?: OptionFill; failFirst?: 'initialResponse' } = {}
+  ) {
     const run = invokeCommand(world, path, {
-      fill: 'required',
+      fill: extra.fill ?? 'required',
       locale: 'en-US',
       inGuild: true,
+      failFirst: extra.failFirst,
     });
     const error = await settle(path.entry.command.execute(run.interaction));
     return { run, error };
@@ -779,6 +1396,24 @@ describe('the smoke harness itself', () => {
       ]);
     }
   );
+
+  it('fails only the first response when asked to, without acknowledging', async () => {
+    const outcomes: string[] = [];
+    const { run } = await runFake(
+      fakePath(async (interaction) => {
+        await interaction.reply('lost').catch((e: Error) => {
+          outcomes.push(e.message);
+        });
+        await interaction.reply('delivered');
+      }),
+      { failFirst: 'initialResponse' }
+    );
+
+    expect(outcomes).toEqual([INJECTED_FAILURE]);
+    expect(run.injectedFailures).toEqual(['reply']);
+    expect(run.violations).toEqual([]);
+    expect(run.sent).toEqual([{ via: 'reply', payload: 'delivered' }]);
+  });
 
   it('records option names a command reads without declaring them', async () => {
     const { run } = await runFake(
@@ -835,6 +1470,55 @@ describe('the smoke harness itself', () => {
     expect(seen).toEqual(['b', null]);
   });
 
+  describe('boundary fills', () => {
+    const option = (extra: Partial<LooseOption>): LooseOption => ({
+      ...TEXT,
+      ...extra,
+    });
+    const valueOf = (o: LooseOption, fill: OptionFill) =>
+      sampleOption(world, o, true, undefined, fill).value;
+
+    it('fills strings to their declared length limits, or Discord’s', () => {
+      expect(valueOf(option({ max_length: 300 }), 'max')).toHaveLength(300);
+      expect(valueOf(option({}), 'max')).toHaveLength(
+        DISCORD_OPTION_BOUNDS.maxStringLength
+      );
+      expect(valueOf(option({ min_length: 4 }), 'min')).toHaveLength(4);
+      expect(valueOf(option({}), 'min')).toHaveLength(1);
+    });
+
+    it('keeps sibling strings at the same length distinct', () => {
+      expect(textOfLength('option1', 55)).not.toBe(textOfLength('option2', 55));
+      expect(textOfLength('option1', 55)).toHaveLength(55);
+      expect(textOfLength('a-very-long-label', 3)).toHaveLength(3);
+    });
+
+    it('fills numbers to their bounds and picks the last choice for max', () => {
+      const integer = (extra: Partial<LooseOption>) =>
+        option({ type: ApplicationCommandOptionType.Integer, ...extra });
+
+      expect(valueOf(integer({ min_value: 2, max_value: 9 }), 'max')).toBe(9);
+      expect(valueOf(integer({ min_value: 2, max_value: 9 }), 'min')).toBe(2);
+      expect(valueOf(integer({}), 'max')).toBe(
+        DISCORD_OPTION_BOUNDS.maxInteger
+      );
+      expect(valueOf(integer({}), 'min')).toBe(
+        DISCORD_OPTION_BOUNDS.minInteger
+      );
+      expect(
+        valueOf(
+          integer({
+            choices: [
+              { name: 'two', value: 2 },
+              { name: 'six', value: 6 },
+            ],
+          }),
+          'max'
+        )
+      ).toBe(6);
+    });
+  });
+
   it('presses the confirm button of a real confirmation prompt', async () => {
     let confirmed: boolean | undefined;
     const { run } = await runFake(
@@ -848,6 +1532,26 @@ describe('the smoke harness itself', () => {
       'reply',
       'component.update',
     ]);
+  });
+
+  it('builds the world each actor needs', () => {
+    const plain = createWorld(OWNER_ID, {
+      permissions: [PermissionFlagsBits.ManageRoles],
+      owner: false,
+    });
+
+    expect(plain.actor.id).not.toBe(OWNER_ID);
+    expect(plain.actor.permissions.has(PermissionFlagsBits.ManageRoles)).toBe(
+      true
+    );
+    expect(plain.actor.permissions.has(PermissionFlagsBits.ManageGuild)).toBe(
+      false
+    );
+    expect(world.actor.id).toBe(OWNER_ID);
+    // Enough people for the largest team split a command offers.
+    expect(
+      world.voiceChannel.members.filter((member) => !member.user.bot).size
+    ).toBe(6);
   });
 
   it('flags payloads Discord would reject', () => {
@@ -888,10 +1592,20 @@ describe('the smoke harness itself', () => {
 
   it('flags raw translation keys and unfilled placeholders', () => {
     expect(
-      translationProblems(['common.error', 'Hello {name}', 'All good'])
+      translationProblems([
+        'common.error',
+        'Hello {name}',
+        'All good',
+        // What t() returns for a key that no longer exists in en.ts.
+        'record.errors.removedKey',
+        'Failed:\nnotification.voice.gone',
+        'See example.com or v1.2 for details',
+      ])
     ).toEqual([
       'raw translation key "common.error" in: common.error',
       'unfilled placeholder in: Hello {name}',
+      'raw translation key "record.errors.removedKey" in: record.errors.removedKey',
+      'raw translation key "notification.voice.gone" in: Failed:\nnotification.voice.gone',
     ]);
   });
 

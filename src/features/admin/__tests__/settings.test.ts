@@ -335,6 +335,31 @@ describe('executeSettingsCommand', () => {
         }`
       );
     });
+
+    /**
+     * KNOWN BUG (settings.ts handleChannelSetting, the `if (!channel)` branch):
+     * clearing writes NULL and replies, but never calls `logAuditAction`,
+     * while the settings panel's "clear" button does audit the same change.
+     * A Manage Server holder can switch audit logging (or announcements) off
+     * from the slash command without leaving a trace. `it.fails` keeps the
+     * suite green until the fix lands; then this starts failing and should
+     * become a plain `it`.
+     */
+    it.fails('audit-logs who cleared the channel', async () => {
+      guildSettingsRepository.update(GUILD_ID, { [c.column]: c.channel.id });
+      const { interaction } = setup({
+        subcommand: c.subcommand,
+        channel: null,
+      });
+
+      await executeSettingsCommand(interaction);
+
+      // Loose on purpose: any audit row by the actor, with the same action
+      // the set path records, is a valid fix.
+      expect(auditRows(db)).toEqual([
+        expect.objectContaining({ action: c.action, user_id: USER_ID }),
+      ]);
+    });
   });
 
   describe('panels', () => {

@@ -38,6 +38,7 @@ vi.mock('../../../shared/utils/logger.js', () => ({
     error instanceof Error ? error.message : String(error),
 }));
 
+import { loadConfig } from '../../../config/index.js';
 import {
   buildCommandCollection,
   toDeploymentPayload,
@@ -51,26 +52,35 @@ import type { Command } from '../../../shared/types/index.js';
 import { en } from '../../../locales/en.js';
 import { ja } from '../../../locales/ja.js';
 import {
+  COMMAND_POLICY,
+  KNOWN_HELP_OVERREACH,
   commandPaths,
+  effectiveCooldown,
   featuresWithCommandFiles,
+  helpEntryOf,
   invalidSlashReferences,
   leafKeys,
   loadCommands,
   pathPrefixes,
   type CommandJSON,
+  type LoadedCommand,
   type Localizations,
   type LooseOption,
 } from './command-smoke.helpers.js';
 
-const commands = await loadCommands();
 /**
- * What discovery logged. Config warnings are left out: importing the backup
- * service reads (and validates) the environment eagerly - see the bug noted
- * in the test report - and under Vitest `NODE_ENV=test` always warns.
+ * Load the configuration first and forget what it reported: its warnings
+ * describe the environment (under Vitest, `NODE_ENV=test` always warns), and
+ * importing the backup service would otherwise trigger them mid-discovery -
+ * see the eager-config bug in the test report. After this, anything logged
+ * is discovery's own.
  */
-const discoveryWarnings = logger.warn.mock.calls.filter(
-  ([message]) => !String(message).startsWith('Config: ')
-);
+loadConfig();
+logger.warn.mockClear();
+logger.error.mockClear();
+
+const commands = await loadCommands();
+const discoveryWarnings = [...logger.warn.mock.calls];
 const discoveryErrors = [...logger.error.mock.calls];
 
 const COMMAND_CASES = commands.map(
@@ -699,6 +709,74 @@ describe('the rule checks themselves', () => {
   });
 });
 
+/** The leaf options that autocomplete, as `<path> <option>`. */
+function autocompleteOptions(entry: LoadedCommand): string[] {
+  return commandPaths([entry]).flatMap((path) =>
+    path.options
+      .filter((option) => option.autocomplete)
+      .map((option) => `${path.label} ${option.name}`)
+  );
+}
+
+/** Help entry names of one command, in catalog order. */
+function helpEntryNames(entry: LoadedCommand): string[] {
+  return [...new Set(commandPaths([entry]).map(helpEntryOf))];
+}
+
+describe('each command matches its declared policy', () => {
+  it('declares a policy for exactly the commands that exist', () => {
+    const names = commands.map((entry) => entry.json.name);
+
+    expect(
+      names.filter((name) => !COMMAND_POLICY[name]),
+      'declare who may use these commands in COMMAND_POLICY (command-smoke.helpers.ts)'
+    ).toEqual([]);
+    expect(
+      Object.keys(COMMAND_POLICY).filter((name) => !names.includes(name)),
+      'stale COMMAND_POLICY entries'
+    ).toEqual([]);
+  });
+
+  it.each(COMMAND_CASES)('%s', (_title, entry) => {
+    const policy = COMMAND_POLICY[entry.json.name];
+    if (!policy) return; // reported by the test above
+
+    expect(
+      Object.keys(policy.access),
+      'access declared per /general help entry'
+    ).toEqual(helpEntryNames(entry));
+    expect(
+      entry.json.default_member_permissions ?? null,
+      'default_member_permissions (who Discord shows it to)'
+    ).toBe(
+      policy.defaultMemberPermissions === null
+        ? null
+        : String(policy.defaultMemberPermissions)
+    );
+    expect(entry.json.contexts ?? null, 'contexts').toEqual(policy.contexts);
+    expect(effectiveCooldown(entry.command), 'cooldown (ms)').toBe(
+      policy.cooldownMs
+    );
+    expect(autocompleteOptions(entry), 'autocomplete options').toEqual(
+      policy.autocomplete
+    );
+  });
+});
+
+describe('autocomplete wiring', () => {
+  it.each(COMMAND_CASES)(
+    '%s has a handler exactly when an option autocompletes',
+    (_title, entry) => {
+      // An option flagged autocomplete without a handler gets no
+      // suggestions; a handler without a flagged option is dead code and
+      // means the flag was lost (users must then type values blind).
+      expect(typeof entry.command.autocomplete === 'function').toBe(
+        autocompleteOptions(entry).length > 0
+      );
+    }
+  );
+});
+
 describe('the help catalog built from these commands', () => {
   const catalog = buildHelpCatalog(commands.map((entry) => entry.command));
   const entries = catalog.flatMap((category) => category.commands);
@@ -758,6 +836,25 @@ describe('the help catalog built from these commands', () => {
 
     expect(usage).toEqual(runnable);
   });
+
+  it.each(COMMAND_CASES)(
+    '%s is advertised to exactly who the policy lets run it',
+    (_title, entry) => {
+      const policy = COMMAND_POLICY[entry.json.name];
+      if (!policy) return; // reported by the policy test
+
+      const advertised = helpEntryNames(entry).map((name) => [
+        name,
+        [...levels(byName.get(name)!)].sort(),
+      ]);
+      const expected = helpEntryNames(entry).map((name) => [
+        name,
+        [policy.access[name], ...(KNOWN_HELP_OVERREACH[name] ?? [])].sort(),
+      ]);
+
+      expect(advertised).toEqual(expected);
+    }
+  );
 
   it('never advertises a Manage Server command to everyone', () => {
     const leaks = commands.flatMap((entry) => {

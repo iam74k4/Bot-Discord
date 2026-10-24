@@ -227,6 +227,35 @@ describe('showAdminSystemPanel', () => {
       expect(lines?.[19]).toBe(`20. **Guild 5** (${(50).toLocaleString()})`);
     });
 
+    /**
+     * KNOWN BUG (systemPanel.ts buildGuildsEmbed): `Collection#sort` sorts
+     * in place (@discordjs/collection clears and re-inserts the entries), and
+     * it is called on the live `client.guilds.cache`. Opening the guilds tab
+     * therefore permanently reorders the client's guild cache, including the
+     * order a later `/owner system broadcast` walks. The non-mutating
+     * `.sorted(...)` exists on this version (`toSorted` does not). `it.fails`
+     * keeps the suite green until the fix lands; then this starts failing and
+     * should become a plain `it`.
+     */
+    it.fails(
+      'guilds: leaves the client guild cache in its original order',
+      async () => {
+        const { interaction } = setup([
+          guildStub({ id: 'small', memberCount: 1 }),
+          guildStub({ id: 'big', memberCount: 100 }),
+          guildStub({ id: 'mid', memberCount: 50 }),
+        ]);
+
+        await showAdminSystemPanel(interaction, 'en', 'guilds');
+
+        expect([...interaction.client.guilds.cache.keys()]).toEqual([
+          'small',
+          'big',
+          'mid',
+        ]);
+      }
+    );
+
     it('guilds: shows an empty state when the bot is in no guild', async () => {
       const { interaction, harness } = setup([]);
 

@@ -155,6 +155,39 @@ describe('catalog entries', () => {
     ]);
   });
 
+  it('contributes nothing to the usage line for an empty nested group', () => {
+    const sparse = rawCommand({
+      name: 'sparse',
+      options: [
+        {
+          type: ApplicationCommandOptionType.SubcommandGroup,
+          name: 'outer',
+          description: 'Outer',
+          options: [
+            // A nested group with no options array at all.
+            {
+              type: ApplicationCommandOptionType.SubcommandGroup,
+              name: 'void',
+              description: 'Void',
+            },
+            {
+              type: ApplicationCommandOptionType.Subcommand,
+              name: 'run',
+              description: 'Run',
+            },
+          ],
+        },
+      ] as CommandJSON['options'],
+    });
+
+    expect(entriesOf(sparse)).toEqual([
+      expect.objectContaining({
+        name: 'sparse outer',
+        usage: '/sparse outer run',
+      }),
+    ]);
+  });
+
   it('gives a group without subcommands an empty usage', () => {
     const empty = rawCommand({
       name: 'hollow',
@@ -194,6 +227,21 @@ describe('catalog permissions', () => {
     expect(entriesOf(both)[0].requiredPermission).toBe('manageGuild');
   });
 
+  it('derives Manage Roles from either declaration', () => {
+    const viaMiddleware = helpCommand(
+      base(),
+      { category: DEMO },
+      { options: { permissions: [PermissionFlagsBits.ManageRoles] } }
+    );
+    const viaDefault = helpCommand(
+      base().setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles),
+      { category: DEMO }
+    );
+
+    expect(entriesOf(viaMiddleware)[0].requiredPermission).toBe('manageRoles');
+    expect(entriesOf(viaDefault)[0].requiredPermission).toBe('manageRoles');
+  });
+
   it('combines middleware and default member permissions', () => {
     const combined = helpCommand(
       base().setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
@@ -212,6 +260,21 @@ describe('catalog permissions', () => {
     );
 
     expect(entriesOf(kick)[0].requiredPermission).toBe('everyone');
+  });
+
+  // BUG (reported, catalog.ts:150): Discord reads a default permission of "0"
+  // as administrators only, but "0" sets no bit, so help lists the command to
+  // every member. Characterized until fixed; a fix should make this entry
+  // invisible to a member without permissions.
+  it('currently treats default permission 0 (administrators only) as open to everyone', () => {
+    const adminOnly = helpCommand(base().setDefaultMemberPermissions(0), {
+      category: DEMO,
+    });
+
+    expect(
+      (adminOnly.data.toJSON() as CommandJSON).default_member_permissions
+    ).toBe('0');
+    expect(entriesOf(adminOnly)[0].requiredPermission).toBe('everyone');
   });
 
   it('lets an explicit permission override the derived one', () => {

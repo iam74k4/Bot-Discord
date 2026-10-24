@@ -1,17 +1,37 @@
-import { describe, it, expect, vi } from 'vitest';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockInstance,
+} from 'vitest';
 import type { Client } from 'discord.js';
+import type { HealthStatus } from '../index.js';
 
 vi.mock('../../database/connection.js', () => ({
   getTableCount: vi.fn().mockReturnValue(5),
 }));
 
-import {
-  setServiceStatus,
-  getHealthStatus,
-  formatHealthStatus,
-  type HealthStatus,
-} from '../index.js';
-import { getTableCount } from '../../database/connection.js';
+const MB = 1024 * 1024;
+const NOW = new Date('2026-04-01T00:00:00Z').getTime();
+
+/**
+ * Low, fixed heap figures so status checks never depend on where the real V8
+ * heap happens to be (it can sit above 90% just before a GC).
+ */
+const CALM_MEMORY: NodeJS.MemoryUsage = {
+  heapUsed: 40 * MB,
+  heapTotal: 100 * MB,
+  rss: 200 * MB,
+  external: 0,
+  arrayBuffers: 0,
+};
+
+let health: typeof import('../index.js');
+let getTableCount: ReturnType<typeof vi.fn>;
+let memoryUsage: MockInstance<typeof process.memoryUsage>;
 
 function createMockClient(
   overrides: {
@@ -26,58 +46,84 @@ function createMockClient(
 }
 
 describe('health service', () => {
+  beforeEach(async () => {
+    // A fresh module per test: the tracked-services map is module state.
+    vi.resetModules();
+    health = await import('../index.js');
+    const connection = await import('../../database/connection.js');
+    getTableCount = vi.mocked(connection.getTableCount);
+
+    memoryUsage = vi
+      .spyOn(process, 'memoryUsage')
+      .mockReturnValue({ ...CALM_MEMORY });
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
   describe('setServiceStatus', () => {
     it('updates service tracking and getHealthStatus reflects it', () => {
-      setServiceStatus('testService', true);
-      const health = getHealthStatus(createMockClient());
-      expect(health.services).toHaveProperty('testService', true);
+      health.setServiceStatus('testService', true);
+      const status = health.getHealthStatus(createMockClient());
+      expect(status.services).toEqual({ testService: true });
 
-      setServiceStatus('testService', false);
-      const healthAfter = getHealthStatus(createMockClient());
-      expect(healthAfter.services).toHaveProperty('testService', false);
+      health.setServiceStatus('testService', false);
+      const statusAfter = health.getHealthStatus(createMockClient());
+      expect(statusAfter.services).toEqual({ testService: false });
     });
 
     it('tracks multiple services independently', () => {
-      setServiceStatus('voice', true);
-      setServiceStatus('notification', false);
-      const health = getHealthStatus(createMockClient());
+      health.setServiceStatus('voice', true);
+      health.setServiceStatus('notification', false);
+      const status = health.getHealthStatus(createMockClient());
 
-      expect(health.services).toHaveProperty('voice', true);
-      expect(health.services).toHaveProperty('notification', false);
+      expect(status.services).toEqual({ voice: true, notification: false });
+    });
+
+    it('reports no services until one registers', () => {
+      expect(health.getHealthStatus(createMockClient()).services).toEqual({});
+    });
+
+    it('does not let a stopped service change the overall status', () => {
+      health.setServiceStatus('voice', false);
+
+      expect(health.getHealthStatus(createMockClient()).status).toBe('healthy');
     });
   });
 
   describe('getHealthStatus', () => {
-    it('returns proper structure with all fields', () => {
-      const mockClient = createMockClient();
-      const health = getHealthStatus(mockClient);
+    it('reports every figure it gathered', () => {
+      vi.spyOn(process, 'uptime').mockReturnValue(1234.5);
 
-      expect(health).toMatchObject({
-        status: expect.any(String),
-        uptime: expect.any(Number),
-        memory: {
-          used: expect.any(Number),
-          total: expect.any(Number),
-          percentage: expect.any(Number),
-          rss: expect.any(Number),
-        },
-        database: {
-          connected: true,
-          tables: 5,
-        },
-        discord: {
-          connected: true,
-          ping: 50,
-        },
-        services: expect.any(Object),
-        timestamp: expect.any(Number),
+      expect(health.getHealthStatus(createMockClient())).toEqual({
+        status: 'healthy',
+        uptime: 1234.5,
+        memory: { used: 40, total: 100, percentage: 40, rss: 200 },
+        database: { connected: true, tables: 5 },
+        discord: { connected: true, ping: 50 },
+        services: {},
+        timestamp: NOW,
+      });
+    });
+
+    it('rounds memory figures to whole megabytes and percent', () => {
+      memoryUsage.mockReturnValue({
+        ...CALM_MEMORY,
+        heapUsed: 33.4 * MB,
+        heapTotal: 99.6 * MB,
+        rss: 512.5 * MB,
       });
 
-      expect(['healthy', 'degraded', 'unhealthy']).toContain(health.status);
-      expect(health.uptime).toBeGreaterThanOrEqual(0);
-      expect(health.memory.percentage).toBeGreaterThanOrEqual(0);
-      expect(health.memory.percentage).toBeLessThanOrEqual(100);
-      expect(health.timestamp).toBeGreaterThan(0);
+      expect(health.getHealthStatus(createMockClient()).memory).toEqual({
+        used: 33,
+        total: 100,
+        percentage: 33,
+        rss: 513,
+      });
     });
   });
 
@@ -93,7 +139,7 @@ describe('health service', () => {
     };
 
     it('returns formatted string with expected sections', () => {
-      const formatted = formatHealthStatus(baseHealth);
+      const formatted = health.formatHealthStatus(baseHealth);
 
       expect(formatted).toContain('**Status:**');
       expect(formatted).toContain('**Uptime:**');
@@ -104,7 +150,7 @@ describe('health service', () => {
     });
 
     it('includes status emoji for healthy', () => {
-      const formatted = formatHealthStatus({
+      const formatted = health.formatHealthStatus({
         ...baseHealth,
         status: 'healthy',
       });
@@ -113,7 +159,7 @@ describe('health service', () => {
     });
 
     it('includes status emoji for degraded', () => {
-      const formatted = formatHealthStatus({
+      const formatted = health.formatHealthStatus({
         ...baseHealth,
         status: 'degraded',
       });
@@ -122,7 +168,7 @@ describe('health service', () => {
     });
 
     it('includes status emoji for unhealthy', () => {
-      const formatted = formatHealthStatus({
+      const formatted = health.formatHealthStatus({
         ...baseHealth,
         status: 'unhealthy',
       });
@@ -131,15 +177,21 @@ describe('health service', () => {
     });
 
     it('formats uptime as days, hours, minutes', () => {
-      const formatted = formatHealthStatus({
+      const formatted = health.formatHealthStatus({
         ...baseHealth,
         uptime: 90061, // 1d 1h 1m 1s
       });
       expect(formatted).toContain('1d 1h 1m');
     });
 
+    it('formats an uptime under a day with zero days', () => {
+      expect(health.formatHealthStatus(baseHealth)).toContain(
+        '**Uptime:** 0d 1h 1m'
+      );
+    });
+
     it('formats memory section with heap figures and RSS', () => {
-      const formatted = formatHealthStatus(baseHealth);
+      const formatted = health.formatHealthStatus(baseHealth);
       expect(formatted).toContain('Heap used: 50 MB');
       expect(formatted).toContain('Heap total: 128 MB');
       expect(formatted).toContain('Heap usage: 39%');
@@ -148,96 +200,147 @@ describe('health service', () => {
     });
 
     it('formats Discord section with connection status and ping', () => {
-      const formatted = formatHealthStatus(baseHealth);
+      const formatted = health.formatHealthStatus(baseHealth);
       expect(formatted).toContain('Connected: ✅');
       expect(formatted).toContain('Ping: 50ms');
     });
 
     it('formats Database section with connection status and tables', () => {
-      const formatted = formatHealthStatus(baseHealth);
+      const formatted = health.formatHealthStatus(baseHealth);
       expect(formatted).toContain('Connected: ✅');
       expect(formatted).toContain('Tables: 5');
     });
 
+    it('marks a disconnected gateway and database with a cross', () => {
+      const lines = health
+        .formatHealthStatus({
+          ...baseHealth,
+          status: 'unhealthy',
+          discord: { connected: false, ping: -1 },
+          database: { connected: false, tables: 0 },
+        })
+        .split('\n');
+
+      const after = (heading: string) => lines[lines.indexOf(heading) + 1];
+      expect(after('**Discord**')).toBe('├ Connected: ❌');
+      expect(after('**Database**')).toBe('├ Connected: ❌');
+    });
+
     it('shows "No tracked services" when services object is empty', () => {
-      const formatted = formatHealthStatus(baseHealth);
+      const formatted = health.formatHealthStatus(baseHealth);
       expect(formatted).toContain('└ No tracked services');
     });
 
     it('formats tracked services with labels and status', () => {
-      const formatted = formatHealthStatus({
+      const formatted = health.formatHealthStatus({
         ...baseHealth,
         services: { voiceManager: true, notificationService: false },
       });
       expect(formatted).toContain('Voice Manager: ✅');
       expect(formatted).toContain('Notification Service: ❌');
     });
+
+    it('lists services alphabetically and closes the tree on the last one', () => {
+      const lines = health
+        .formatHealthStatus({
+          ...baseHealth,
+          services: { voiceManager: true, backup: false, audit: true },
+        })
+        .split('\n');
+
+      expect(lines.slice(lines.indexOf('**Services**') + 1)).toEqual([
+        '├ Audit: ✅',
+        '├ Backup: ❌',
+        '└ Voice Manager: ✅',
+      ]);
+    });
   });
 
   describe('determineStatus logic (via getHealthStatus)', () => {
     it('returns healthy when all OK (discord connected, db connected, low memory, low ping)', () => {
       const mockClient = createMockClient({ isReady: true, ping: 50 });
-      const health = getHealthStatus(mockClient);
+      const status = health.getHealthStatus(mockClient);
 
-      expect(health.status).toBe('healthy');
-      expect(health.database.connected).toBe(true);
-      expect(health.discord.connected).toBe(true);
+      expect(status.status).toBe('healthy');
+      expect(status.database.connected).toBe(true);
+      expect(status.discord.connected).toBe(true);
     });
 
     it('returns unhealthy when Discord is disconnected', () => {
       const mockClient = createMockClient({ isReady: false, ping: 50 });
-      const health = getHealthStatus(mockClient);
+      const status = health.getHealthStatus(mockClient);
 
-      expect(health.status).toBe('unhealthy');
-      expect(health.discord.connected).toBe(false);
+      expect(status.status).toBe('unhealthy');
+      expect(status.discord.connected).toBe(false);
     });
 
     it('returns degraded when ping is high (> 500)', () => {
       const mockClient = createMockClient({ isReady: true, ping: 501 });
-      const health = getHealthStatus(mockClient);
+      const status = health.getHealthStatus(mockClient);
 
-      expect(health.status).toBe('degraded');
-      expect(health.discord.ping).toBe(501);
+      expect(status.status).toBe('degraded');
+      expect(status.discord.ping).toBe(501);
     });
 
-    it('returns degraded when ping is exactly 500 (boundary: > 500)', () => {
+    it('stays healthy when ping is exactly 500 (boundary: > 500)', () => {
       const mockClient = createMockClient({ isReady: true, ping: 500 });
-      const health = getHealthStatus(mockClient);
+      const status = health.getHealthStatus(mockClient);
 
-      expect(health.status).toBe('healthy');
+      expect(status.status).toBe('healthy');
     });
 
     it('returns unhealthy when database throws', () => {
-      vi.mocked(getTableCount).mockImplementationOnce(() => {
+      getTableCount.mockImplementationOnce(() => {
         throw new Error('DB connection failed');
       });
 
       const mockClient = createMockClient();
-      const health = getHealthStatus(mockClient);
+      const status = health.getHealthStatus(mockClient);
 
-      expect(health.database.connected).toBe(false);
-      expect(health.database.tables).toBe(0);
-      expect(health.status).toBe('unhealthy');
+      expect(status.database.connected).toBe(false);
+      expect(status.database.tables).toBe(0);
+      expect(status.status).toBe('unhealthy');
+    });
+
+    it('prefers unhealthy over degraded when a critical service is down', () => {
+      memoryUsage.mockReturnValue({
+        ...CALM_MEMORY,
+        heapUsed: 95 * MB,
+        heapTotal: 100 * MB,
+      });
+
+      const status = health.getHealthStatus(
+        createMockClient({ isReady: false, ping: 900 })
+      );
+
+      expect(status.status).toBe('unhealthy');
     });
 
     it('returns degraded when memory percentage > 90%', () => {
-      const memoryUsage = vi.spyOn(process, 'memoryUsage').mockReturnValue({
-        heapUsed: 950 * 1024 * 1024,
-        heapTotal: 1000 * 1024 * 1024,
-        rss: 0,
-        external: 0,
-        arrayBuffers: 0,
+      memoryUsage.mockReturnValue({
+        ...CALM_MEMORY,
+        heapUsed: 950 * MB,
+        heapTotal: 1000 * MB,
       });
 
-      try {
-        const mockClient = createMockClient({ isReady: true, ping: 50 });
-        const health = getHealthStatus(mockClient);
+      const mockClient = createMockClient({ isReady: true, ping: 50 });
+      const status = health.getHealthStatus(mockClient);
 
-        expect(health.memory.percentage).toBeGreaterThan(90);
-        expect(health.status).toBe('degraded');
-      } finally {
-        memoryUsage.mockRestore();
-      }
+      expect(status.memory.percentage).toBe(95);
+      expect(status.status).toBe('degraded');
+    });
+
+    it('stays healthy when memory percentage is exactly 90% (boundary: > 90)', () => {
+      memoryUsage.mockReturnValue({
+        ...CALM_MEMORY,
+        heapUsed: 90 * MB,
+        heapTotal: 100 * MB,
+      });
+
+      const status = health.getHealthStatus(createMockClient());
+
+      expect(status.memory.percentage).toBe(90);
+      expect(status.status).toBe('healthy');
     });
   });
 });

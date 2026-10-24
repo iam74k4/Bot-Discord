@@ -124,6 +124,26 @@ describe('discord utils', () => {
       ).toBe(false);
     });
 
+    it('denies outside a cached guild even if the member carries the permission', () => {
+      // Without a guild there is no server context to grant anything in, so a
+      // resolved bitfield on the member must not be trusted on its own.
+      const interaction = {
+        guild: null,
+        member: {
+          permissions: new PermissionsBitField([
+            PermissionFlagsBits.ManageGuild,
+          ]),
+        },
+      } as unknown as ChatInputCommandInteraction;
+
+      expect(
+        interactionHasGuildPermission(
+          interaction,
+          PermissionFlagsBits.ManageGuild
+        )
+      ).toBe(false);
+    });
+
     it('denies when the guild is known but the member is missing', () => {
       const interaction = {
         guild: { id: 'guild-1' },

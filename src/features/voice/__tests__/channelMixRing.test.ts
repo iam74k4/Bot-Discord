@@ -23,41 +23,37 @@ describe('ChannelMixRing', () => {
   });
 
   it('sums two speakers at the same global sample', () => {
-    const ring = new ChannelMixRing(10, epoch);
-
-    const frameSamples = 960;
-    const pcmA = Buffer.alloc(frameSamples * 2);
-    const pcmB = Buffer.alloc(frameSamples * 2);
-    pcmA.writeInt16LE(3000, 0);
-    pcmB.writeInt16LE(4000, 0);
-
     const endMs = epoch + 20;
-    ring.addMonoPcmInt16(pcmA, endMs);
-    ring.addMonoPcmInt16(pcmB, endMs);
+    const ring = new ChannelMixRing(10, epoch);
+    ring.addMonoPcmInt16(constantPcm(960, 3000), endMs);
+    ring.addMonoPcmInt16(constantPcm(960, 4000), endMs);
 
     const out = ring.extractLastSeconds(0.02, endMs);
-    expect(out.length).toBe(frameSamples * 2);
-    expect(Math.abs(out.readInt16LE(0))).toBeGreaterThan(5000);
+
+    expect(out.length).toBe(960 * 2);
+    // Same output as one speaker at 3000 + 4000, and louder than either.
+    expect(out.equals(singleSpeaker(7000))).toBe(true);
+    expect(out.readInt16LE(0)).toBeGreaterThan(
+      singleSpeaker(4000).readInt16LE(0)
+    );
   });
 
   it('overwrites ring slot when global sample wraps past buffer length', () => {
+    // One lap is 20ms (960 samples). The late frame lands on exactly the
+    // slots the early frame used one lap before.
     const ring = new ChannelMixRing(0.02, epoch);
-    const frameBytes = 960 * 2;
-    const pcmEarly = Buffer.alloc(frameBytes);
-    pcmEarly.writeInt16LE(5000, 0);
-    const pcmLate = Buffer.alloc(frameBytes);
-    pcmLate.writeInt16LE(7000, 0);
+    ring.addMonoPcmInt16(constantPcm(960, 5000), epoch + 20);
+    ring.addMonoPcmInt16(constantPcm(960, 7000), epoch + 40);
 
-    const earlyEnd = epoch + 25;
-    ring.addMonoPcmInt16(pcmEarly, earlyEnd);
+    const out = ring.extractLastSeconds(0.02, epoch + 40);
 
-    const lateEnd = earlyEnd + 25;
-    ring.addMonoPcmInt16(pcmLate, lateEnd);
-
-    const out = ring.extractLastSeconds(0.05, lateEnd);
-    expect(out.length).toBeGreaterThan(0);
-    const peak = maxAbsInt16(out);
-    expect(peak).toBeGreaterThan(4000);
+    // Only the late frame is heard: the early one is replaced, not summed.
+    const lateOnly = new ChannelMixRing(0.02, epoch);
+    lateOnly.addMonoPcmInt16(constantPcm(960, 7000), epoch + 40);
+    expect(out.equals(lateOnly.extractLastSeconds(0.02, epoch + 40))).toBe(
+      true
+    );
+    expect(out.readInt16LE(0)).toBeGreaterThan(0);
   });
 
   it('does not replay a slot written a full lap earlier', () => {
@@ -170,6 +166,15 @@ describe('ChannelMixRing', () => {
     expect(alone).toBeGreaterThan(0);
   });
 
+  it('soft-limits with a tanh curve whose knee is at 24000', () => {
+    // round(tanh(v / 24000) * 32767), pinned so loudness cannot drift.
+    expect(singleSpeaker(0).readInt16LE(0)).toBe(0);
+    expect(singleSpeaker(2400).readInt16LE(0)).toBe(3266);
+    expect(singleSpeaker(12000).readInt16LE(0)).toBe(15142);
+    expect(singleSpeaker(24000).readInt16LE(0)).toBe(24955);
+    expect(singleSpeaker(-12000).readInt16LE(0)).toBe(-15142);
+  });
+
   it('keeps the sign and symmetry of negative samples', () => {
     const pos = new ChannelMixRing(1, epoch);
     const neg = new ChannelMixRing(1, epoch);
@@ -200,17 +205,34 @@ describe('ChannelMixRing', () => {
   });
 
   it('extractLastSeconds returns silence before epoch', () => {
-    const ring = new ChannelMixRing(5, epoch + 5000);
+    const ringEpoch = epoch + 5000;
+    const ring = new ChannelMixRing(5, ringEpoch);
+    // 50ms of audio ending 10ms after the epoch: 40ms of it predates the ring.
+    ring.addMonoPcmInt16(constantPcm(2400, 8000), ringEpoch + 10);
 
-    const pcm = Buffer.alloc(4800);
-    pcm.writeInt16LE(8000, 0);
-    ring.addMonoPcmInt16(pcm, epoch + 5010);
+    // 100ms window ending 20ms after the epoch: 80ms before, 20ms after.
+    const out = ring.extractLastSeconds(0.1, ringEpoch + 20);
+    const samples = (fromMs: number, toMs: number) =>
+      out.subarray(fromMs * 48 * 2, toMs * 48 * 2);
 
-    const out = ring.extractLastSeconds(0.1, epoch + 5020);
-    const mid = out.length >> 1;
-    expect(Math.abs(out.readInt16LE(mid))).toBeLessThan(100);
+    expect(out.length).toBe(4800 * 2);
+    // Before the epoch: silent, even though the chunk started there.
+    expect(maxAbsInt16(samples(0, 80))).toBe(0);
+    // First 10ms after the epoch: the in-epoch part of the chunk.
+    expect(samples(80, 90).equals(singleSpeaker(8000).subarray(0, 960))).toBe(
+      true
+    );
+    // After the chunk ended: silent again.
+    expect(maxAbsInt16(samples(90, 100))).toBe(0);
   });
 });
+
+/** The 20ms read-back of a ring holding one speaker at a constant level. */
+function singleSpeaker(value: number): Buffer {
+  const ring = new ChannelMixRing(1, 0);
+  ring.addMonoPcmInt16(constantPcm(960, value), 20);
+  return ring.extractLastSeconds(0.02, 20);
+}
 
 function constantPcm(samples: number, value: number): Buffer {
   const buf = Buffer.alloc(samples * 2);
@@ -247,8 +269,13 @@ describe('ChannelMixRingManager', () => {
     const mgr = new ChannelMixRingManager();
 
     const a = mgr.getOrCreate('a');
+    const b = mgr.getOrCreate('b');
     expect(mgr.getOrCreate('a')).toBe(a);
-    expect(mgr.getOrCreate('b')).not.toBe(a);
+    expect(mgr.getOrCreate('b')).toBe(b);
+    // Plain identity check on purpose: `expect(b).not.toBe(a)` makes Vitest
+    // deep-compare two multi-megabyte rings for its hint message, which takes
+    // tens of seconds whenever both were created in the same millisecond.
+    expect(b === a).toBe(false);
   });
 
   it('sizes rings from AUDIO_BUFFER_DURATION and sums them', () => {

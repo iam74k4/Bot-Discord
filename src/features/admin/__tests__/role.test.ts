@@ -60,7 +60,7 @@ interface Scenario {
   bot?: number | null;
   actor?: number;
   target?: number;
-  role?: { id: string; name: string; position: number };
+  role?: { id: string; name: string; position: number; managed?: boolean };
   /** Whether the role is in the guild's role cache. */
   roleCached?: boolean;
   targetId?: string;
@@ -410,6 +410,72 @@ describe('executeRoleCommand', () => {
     });
   });
 
+  /**
+   * KNOWN BUG (role.ts checkActorCanManageRole / checkActorCanManageMember):
+   * the guild owner passes the Manage Roles check (Discord resolves the owner
+   * as having every permission) but is then held to the actor hierarchy
+   * checks, which compare role positions with no `executor.id ===
+   * guild.ownerId` shortcut. An owner whose highest role is low gets refused
+   * for roles and members Discord itself lets them manage. Over-restrictive,
+   * not a privilege escalation. `it.fails` keeps the suite green until the
+   * fix lands; then these start failing and should become a plain `it`.
+   */
+  describe('guild owner as actor', () => {
+    it.fails.each([
+      ['a role above their own highest role', { actor: 0, target: 0 }],
+      ['a role to a member ranked above them', { actor: 10, target: 15 }],
+    ])('may grant %s', async (_case, positions) => {
+      const { interaction, rolesAdd } = setup({
+        ownerId: ACTOR_ID,
+        ...positions,
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
+    });
+  });
+
+  /**
+   * KNOWN BUG (role.ts executeRoleCommand): nothing checks `role.managed`
+   * (bot/integration/booster roles Discord never lets anyone assign) or stops
+   * removing @everyone (id = guild id, which discord.js always reports as
+   * held). Both reach `member.roles.add/remove`, Discord rejects them, and the
+   * moderator gets the generic "failed" reply plus an error log instead of a
+   * clear refusal. `it.fails` keeps the suite green until the fix lands; then
+   * these start failing and should become a plain `it`.
+   */
+  describe('roles Discord never lets anyone assign', () => {
+    it.fails.each(['add', 'remove'] as const)(
+      'refuses to %s a managed role before calling Discord',
+      async (subcommand) => {
+        const { interaction, rolesAdd, rolesRemove } = setup({
+          subcommand,
+          role: { ...ROLE, managed: true },
+          targetHasRole: subcommand === 'remove',
+        });
+
+        await executeRoleCommand(interaction);
+
+        expect(rolesAdd).not.toHaveBeenCalled();
+        expect(rolesRemove).not.toHaveBeenCalled();
+      }
+    );
+
+    it.fails('refuses to remove @everyone before calling Discord', async () => {
+      const everyone = { id: GUILD_ID, name: '@everyone', position: 0 };
+      const { interaction, rolesRemove } = setup({
+        subcommand: 'remove',
+        role: everyone,
+        targetHasRole: true,
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(rolesRemove).not.toHaveBeenCalled();
+    });
+  });
+
   describe('add', () => {
     it('adds the role, confirms, and audit-logs the grant', async () => {
       const { interaction, reply, rolesAdd } = setup({ subcommand: 'add' });
@@ -555,6 +621,18 @@ describe('executeRoleCommand', () => {
       expect(
         embedAt(payloadOf<{ embeds: unknown[] }>(editReply)).description
       ).toBe(t('admin.role.errors.failed', 'en'));
+    });
+
+    it('does not throw when editing the error into an answered reply fails', async () => {
+      const { interaction, editReply } = setup({
+        rolesAdd: vi.fn().mockRejectedValue(apiError),
+        replied: true,
+      });
+      editReply.mockRejectedValue(new Error('Unknown Message'));
+
+      await expect(executeRoleCommand(interaction)).resolves.toBeUndefined();
+
+      expect(editReply).toHaveBeenCalledTimes(1);
     });
 
     it('does not throw when the success reply itself fails', async () => {

@@ -192,6 +192,23 @@ describe('secret masking', () => {
     expect(bodyOf(log)).toBe('guild 123456789012345678 joined');
   });
 
+  it('leaves current 19-digit Discord snowflakes readable', () => {
+    logger.info('user 1234567890123456789 joined');
+
+    expect(bodyOf(log)).toBe('user 1234567890123456789 joined');
+  });
+
+  // KNOWN BUG (logger.ts, the Steam ID pattern `\b(\d{17})\b`): it matches any
+  // standalone 17-digit number, so snowflakes from 2015-2016 accounts, guilds
+  // and channels come out as "8138***2384". Steam64 IDs always start with
+  // 7656119; once the pattern is anchored on that prefix, this test starts
+  // failing: change `it.fails` to `it`.
+  it.fails('leaves a 17-digit Discord snowflake readable', () => {
+    logger.info('user 81384788765712384 joined');
+
+    expect(bodyOf(log)).toBe('user 81384788765712384 joined');
+  });
+
   it('masks string arguments too', () => {
     logger.error('failed:', `token ${discordToken}`);
 

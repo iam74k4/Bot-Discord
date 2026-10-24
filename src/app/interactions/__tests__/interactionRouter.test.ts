@@ -41,6 +41,9 @@ import { COLORS } from '../../../shared/utils/constants/index.js';
  * "a failed command does not cost the user a cooldown" contract is exercised
  * end to end. Interactions are built on discord.js prototypes so the router's
  * `isAutocomplete()` / `isChatInputCommand()` checks are the library's own.
+ * Those checks read the `type` / `commandType` fields set below (true as of
+ * discord.js 14.26); the "test fixtures" block fails first if an upgrade
+ * changes which fields they read.
  */
 
 const logger = vi.hoisted(() => ({
@@ -167,6 +170,14 @@ function embedOf(mock: Mock, call = 0) {
   return payload.embeds[0].toJSON();
 }
 
+/**
+ * Let every promise continuation that is already queued run. Enough rounds
+ * that an un-awaited handler would have long finished, without real time.
+ */
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+}
+
 function responsesSent(stub: ChatInputStub): number {
   return (
     stub.reply.mock.calls.length +
@@ -185,6 +196,20 @@ beforeEach(() => {
 afterEach(() => {
   cooldownStore.clearAll();
   vi.useRealTimers();
+});
+
+describe('test fixtures', () => {
+  // The stubs only work if discord.js's own type guards accept them; pin that
+  // here so a library upgrade breaks this block rather than the router tests.
+  it('builds interactions that pass the discord.js type guards', () => {
+    const slash = chatInput().interaction;
+    const auto = autocomplete('search').interaction;
+
+    expect(slash.isChatInputCommand()).toBe(true);
+    expect(slash.isAutocomplete()).toBe(false);
+    expect(auto.isAutocomplete()).toBe(true);
+    expect(auto.isChatInputCommand()).toBe(false);
+  });
 });
 
 describe('routeInteraction: slash commands', () => {
@@ -211,6 +236,33 @@ describe('routeInteraction: slash commands', () => {
 
     expect(help.execute).toHaveBeenCalledTimes(1);
     expect(ping.execute).not.toHaveBeenCalled();
+  });
+
+  it('does not settle until the command has finished executing', async () => {
+    let finish!: () => void;
+    const ping = command();
+    ping.execute.mockReturnValue(
+      new Promise<void>((resolve) => (finish = resolve))
+    );
+    let settled = false;
+
+    const routing = routeInteraction(
+      clientWith(ping),
+      chatInput().interaction
+    ).then(() => {
+      settled = true;
+    });
+    await flushMicrotasks();
+
+    expect(ping.execute).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+    expect(metrics.getSnapshot().commands.executed).toBe(0);
+
+    finish();
+    await routing;
+
+    expect(settled).toBe(true);
+    expect(metrics.getSnapshot().commands.executed).toBe(1);
   });
 
   it('records a successful execution in metrics', async () => {
@@ -530,6 +582,32 @@ describe('routeInteraction: autocomplete', () => {
     expect(runMiddleware).not.toHaveBeenCalled();
   });
 
+  it('does not settle until the autocomplete handler has answered', async () => {
+    let answer!: () => void;
+    const handler = vi.fn(
+      () => new Promise<void>((resolve) => (answer = resolve))
+    );
+    const search = command({ name: 'search', autocomplete: handler });
+    const { interaction, respond } = autocomplete('search');
+    let settled = false;
+
+    const routing = routeInteraction(clientWith(search), interaction).then(
+      () => {
+        settled = true;
+      }
+    );
+    await flushMicrotasks();
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+
+    answer();
+    await routing;
+
+    expect(settled).toBe(true);
+    expect(respond).not.toHaveBeenCalled();
+  });
+
   it('responds with no choices when the command is unknown', async () => {
     const { interaction, respond } = autocomplete('ghost');
 
@@ -537,6 +615,7 @@ describe('routeInteraction: autocomplete', () => {
 
     expect(respond).toHaveBeenCalledTimes(1);
     expect(respond).toHaveBeenCalledWith([]);
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it('responds with no choices when the command has no autocomplete handler', async () => {
@@ -545,8 +624,13 @@ describe('routeInteraction: autocomplete', () => {
 
     await routeInteraction(clientWith(search), interaction);
 
+    expect(respond).toHaveBeenCalledTimes(1);
     expect(respond).toHaveBeenCalledWith([]);
     expect(search.execute).not.toHaveBeenCalled();
+    // A missing handler is normal, not a crash: calling `undefined` and
+    // catching the TypeError would answer the same but log an error on every
+    // keystroke.
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it('falls back to no choices when the handler throws', async () => {

@@ -9,6 +9,7 @@ import {
   CommandInteractionOptionResolver,
   ComponentType,
   GuildMember,
+  InteractionContextType,
   PermissionFlagsBits,
   PermissionsBitField,
   TextChannel,
@@ -198,6 +199,158 @@ export function commandPaths(
 }
 
 // ---------------------------------------------------------------------------
+// Policy: who may use what, declared by hand
+// ---------------------------------------------------------------------------
+
+/** Who may run a help entry; `owner` means a configured bot owner. */
+export type AccessLevel = 'everyone' | 'manageGuild' | 'manageRoles' | 'owner';
+
+export interface CommandPolicy {
+  /** Discord's `default_member_permissions`: who sees it in the picker. */
+  defaultMemberPermissions: bigint | null;
+  /** Where Discord offers it, or null for Discord's default (everywhere). */
+  contexts: readonly InteractionContextType[] | null;
+  /** Per-user cooldown the middleware enforces, or null for none. */
+  cooldownMs: number | null;
+  /** Options that autocomplete, as `<path> <option>`. */
+  autocomplete: readonly string[];
+  /** Who may run each `/general help` entry (subcommand or group). */
+  access: Readonly<Record<string, AccessLevel>>;
+}
+
+/**
+ * The intended access and deployment policy of every command, written down
+ * separately from the code that implements it.
+ *
+ * The help catalog derives its permission levels from the same
+ * `options.permissions` the middleware enforces, so a test that only checks
+ * "behaviour matches help" stays green when a requirement is dropped from
+ * both at once (anyone could then record other people's audio). Tests check
+ * the code, the help catalog and the observed behaviour against this table
+ * instead. It is deliberately exhaustive: a new command fails the policy test
+ * until someone states, on purpose, who may use it.
+ */
+export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
+  admin: {
+    defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
+    contexts: null,
+    cooldownMs: null,
+    autocomplete: [],
+    access: {
+      'admin settings': 'manageGuild',
+      'admin role': 'manageRoles',
+    },
+  },
+  community: {
+    defaultMemberPermissions: null,
+    contexts: null,
+    // Guards the roulette animation against spam.
+    cooldownMs: 10_000,
+    autocomplete: [],
+    access: {
+      'community poll': 'everyone',
+      'community roulette': 'everyone',
+    },
+  },
+  general: {
+    defaultMemberPermissions: null,
+    contexts: null,
+    cooldownMs: 3_000,
+    autocomplete: ['general help command'],
+    access: {
+      'general help': 'everyone',
+      'general ping': 'everyone',
+      'general about': 'everyone',
+    },
+  },
+  notification: {
+    defaultMemberPermissions: null,
+    contexts: [InteractionContextType.Guild],
+    cooldownMs: null,
+    autocomplete: [],
+    access: {
+      'notification voice': 'manageGuild',
+      'notification welcome': 'manageGuild',
+      'notification status': 'manageGuild',
+      'notification stats': 'everyone',
+    },
+  },
+  owner: {
+    defaultMemberPermissions: null,
+    // Owners run it from a DM with the bot too.
+    contexts: [
+      InteractionContextType.Guild,
+      InteractionContextType.BotDM,
+      InteractionContextType.PrivateChannel,
+    ],
+    cooldownMs: null,
+    autocomplete: [],
+    access: {
+      'owner system': 'owner',
+      'owner backup': 'owner',
+    },
+  },
+  voice: {
+    defaultMemberPermissions: null,
+    contexts: null,
+    cooldownMs: 10_000,
+    autocomplete: [],
+    // Recording captures other people's voices: never open to everyone.
+    access: {
+      'voice record': 'manageGuild',
+      'voice status': 'manageGuild',
+      'voice autojoin': 'manageGuild',
+    },
+  },
+};
+
+/**
+ * Levels `/general help` shows an entry to beyond its `access`, keyed by
+ * entry. Production bug: `/admin` declares one help permission,
+ * `['manageGuild', 'manageRoles']`, for both of its groups, but `settings`
+ * needs Manage Server and `role` needs Manage Roles, so help lists each group
+ * to members it then refuses. Delete an entry once help is precise
+ * (`subcommandPermissions` per group).
+ */
+export const KNOWN_HELP_OVERREACH: Readonly<
+  Record<string, readonly AccessLevel[]>
+> = {
+  'admin settings': ['manageRoles'],
+  'admin role': ['manageGuild'],
+};
+
+/** The `/general help` entry a path is listed under. */
+export function helpEntryOf(path: {
+  label: string;
+  subcommand: string | null;
+}): string {
+  const tokens = path.label.split(' ');
+  return path.subcommand === null ? tokens[0]! : tokens.slice(0, 2).join(' ');
+}
+
+/** The declared access level of a path, if its command has a policy. */
+export function declaredAccess(path: CommandPath): AccessLevel | undefined {
+  return COMMAND_POLICY[path.entry.json.name]?.access[helpEntryOf(path)];
+}
+
+/** The cooldown middleware's default when a command declares none. */
+export const DEFAULT_COOLDOWN_MS = 3_000;
+
+/** The cooldown a command actually gets from its middleware, if any. */
+export function effectiveCooldown(command: Command): number | null {
+  if (!command.middleware?.includes('cooldown')) return null;
+  const cooldown = command.options?.cooldown ?? DEFAULT_COOLDOWN_MS;
+  return cooldown > 0 ? cooldown : null;
+}
+
+/** Whether Discord delivers the command from a DM with the bot. */
+export function reachableFromBotDM(
+  contexts: readonly number[] | null | undefined
+): boolean {
+  return !contexts || contexts.includes(InteractionContextType.BotDM);
+}
+
+// ---------------------------------------------------------------------------
 // A small, consistent guild for commands to run in
 // ---------------------------------------------------------------------------
 
@@ -207,6 +360,9 @@ export const IDS = {
   target: '300000000000000003',
   friendA: '300000000000000004',
   friendB: '300000000000000005',
+  friendC: '300000000000000012',
+  friendD: '300000000000000013',
+  friendE: '300000000000000014',
   bot: '300000000000000006',
   role: '300000000000000007',
   text: '300000000000000008',
@@ -335,27 +491,47 @@ const TEXT_CHANNEL_PERMISSIONS = [
   PermissionFlagsBits.ReadMessageHistory,
 ];
 
+export interface WorldOptions {
+  /**
+   * Guild permissions of the invoking member. Defaults to Manage Server and
+   * Manage Roles, everything a command in this bot asks for.
+   */
+  permissions?: readonly bigint[];
+  /** Whether the invoking user is a configured bot owner (default: yes). */
+  owner?: boolean;
+  /** `false` is shorthand for no permissions and not an owner. */
+  privileged?: boolean;
+}
+
 /**
  * A guild where every command has what it needs to reach its main flow: the
- * invoking member can manage the server and roles and sits in an occupied
- * voice channel the bot is buffering; the bot outranks everyone involved and
- * can post in the text channel; one other member (`target`) is available
- * for user options and sits below the invoking member in the hierarchy.
+ * invoking member can manage the server and roles and sits in a voice channel
+ * the bot is buffering, with five other people (enough for the largest team
+ * split a command offers); the bot outranks everyone involved and can post in
+ * the text channel; one other member (`target`) is available for user options
+ * and sits below the invoking member in the hierarchy.
  *
- * The invoking user is a configured bot owner so `/owner` runs too. With
- * `privileged: false` it is instead a plain member - same voice channel,
- * no permissions, not an owner - for checking that commands refuse cleanly.
+ * The invoking user is a configured bot owner so `/owner` runs too. Options
+ * narrow that down - a plain member, or one holding a single permission - for
+ * checking that commands refuse cleanly. A non-owner invokes with a different
+ * user id, so cooldowns and records never leak between the two.
  */
 export function createWorld(
   ownerId: string,
-  options: { privileged?: boolean } = {}
+  options: WorldOptions = {}
 ): SmokeWorld {
   const privileged = options.privileged ?? true;
+  const isOwner = options.owner ?? privileged;
+  const permissions =
+    options.permissions ??
+    (privileged
+      ? [PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles]
+      : []);
   const guild = {
     id: IDS.guild,
     name: 'Smoke Test Guild',
     ownerId: IDS.guildOwner,
-    memberCount: 5,
+    memberCount: 8,
     preferredLocale: 'en-US',
     available: true,
     toString: () => 'Smoke Test Guild',
@@ -369,29 +545,31 @@ export function createWorld(
   };
 
   const users = {
-    actor: privileged
+    actor: isOwner
       ? userStub(ownerId, 'smoke-owner')
       : userStub(IDS.member, 'smoke-member'),
     target: userStub(IDS.target, 'smoke-target'),
     friendA: userStub(IDS.friendA, 'smoke-friend-a'),
     friendB: userStub(IDS.friendB, 'smoke-friend-b'),
+    friendC: userStub(IDS.friendC, 'smoke-friend-c'),
+    friendD: userStub(IDS.friendD, 'smoke-friend-d'),
+    friendE: userStub(IDS.friendE, 'smoke-friend-e'),
     bot: userStub(IDS.bot, 'SmokeBot', true),
   };
 
   const botMember = memberStub(guild, users.bot, 50, PermissionsBitField.All);
-  const actor = memberStub(
-    guild,
-    users.actor,
-    10,
-    privileged
-      ? [PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles]
-      : []
-  );
+  const actor = memberStub(guild, users.actor, 10, [...permissions]);
   const target = memberStub(guild, users.target, 1, []);
-  const friendA = memberStub(guild, users.friendA, 1, []);
-  const friendB = memberStub(guild, users.friendB, 1, []);
+  const friends = [
+    users.friendA,
+    users.friendB,
+    users.friendC,
+    users.friendD,
+    users.friendE,
+  ].map((user) => memberStub(guild, user, 1, []));
+  const inVoice = [actor, ...friends, botMember];
   const members = new Collection<string, GuildMember>(
-    [actor, target, friendA, friendB, botMember].map((m) => [m.id, m])
+    [actor, target, ...friends, botMember].map((m) => [m.id, m])
   );
 
   const voiceChannel: VoiceChannelStub = {
@@ -400,9 +578,7 @@ export function createWorld(
     type: ChannelType.GuildVoice,
     guild,
     guildId: guild.id,
-    members: new Collection<string, GuildMember>(
-      [actor, friendA, friendB, botMember].map((m) => [m.id, m])
-    ),
+    members: new Collection<string, GuildMember>(inVoice.map((m) => [m.id, m])),
     permissionsFor: vi.fn(
       () => new PermissionsBitField(PermissionsBitField.All)
     ),
@@ -410,7 +586,7 @@ export function createWorld(
     isVoiceBased: () => true,
     toString: () => `<#${IDS.voice}>`,
   };
-  for (const member of [actor, friendA, friendB, botMember] as MemberStub[]) {
+  for (const member of inVoice as MemberStub[]) {
     member.voice = { channel: voiceChannel, channelId: voiceChannel.id };
   }
 
@@ -527,7 +703,27 @@ export function createWorld(
 // Option values
 // ---------------------------------------------------------------------------
 
-export type OptionFill = 'required' | 'all';
+/**
+ * Which options an invocation fills, and with what:
+ * - `required`: only required options, with ordinary values;
+ * - `all`: every option, with ordinary values;
+ * - `max`: every option at the top of what Discord lets a user send - strings
+ *   at `max_length` (Discord's 6000 when unbounded), numbers at `max_value`,
+ *   the last choice;
+ * - `min`: every option at the bottom - one-character strings (or
+ *   `min_length`), numbers at `min_value`, the first choice, `false`.
+ *
+ * The boundary fills are what catch a declared limit the code (or Discord's
+ * message limits) cannot actually take, such as a 301-char poll question.
+ */
+export type OptionFill = 'required' | 'all' | 'max' | 'min';
+
+/** Discord's own bounds when an option declares none. */
+export const DISCORD_OPTION_BOUNDS = {
+  maxStringLength: 6000,
+  minInteger: -(2 ** 53) + 1,
+  maxInteger: 2 ** 53 - 1,
+} as const;
 
 /** A string that satisfies the option's length bounds. */
 export function sampleText(minLength = 0, maxLength = 6000): string {
@@ -536,11 +732,43 @@ export function sampleText(minLength = 0, maxLength = 6000): string {
   return base.padEnd(length, '.').slice(0, length);
 }
 
-function sampleNumber(option: LooseOption): number {
+/**
+ * Exactly `length` characters, starting with `label` so that sibling options
+ * filled to the same length (poll answers, say) still differ, as a real
+ * user's would.
+ */
+export function textOfLength(label: string, length: number): string {
+  const seed = `${label} `;
+  return seed
+    .repeat(Math.ceil(length / seed.length))
+    .slice(0, length)
+    .padEnd(length, '.');
+}
+
+function sampleNumber(option: LooseOption, fill: OptionFill): number {
+  if (fill === 'max') {
+    return option.max_value ?? DISCORD_OPTION_BOUNDS.maxInteger;
+  }
+  if (fill === 'min') {
+    return option.min_value ?? DISCORD_OPTION_BOUNDS.minInteger;
+  }
   let value = 1;
   if (option.min_value !== undefined) value = Math.max(value, option.min_value);
   if (option.max_value !== undefined) value = Math.min(value, option.max_value);
   return value;
+}
+
+function sampleString(option: LooseOption, fill: OptionFill): string {
+  if (fill === 'max') {
+    return textOfLength(
+      option.name,
+      option.max_length ?? DISCORD_OPTION_BOUNDS.maxStringLength
+    );
+  }
+  if (fill === 'min') {
+    return textOfLength(option.name, Math.max(option.min_length ?? 1, 1));
+  }
+  return sampleText(option.min_length, option.max_length);
 }
 
 /** A channel from the world whose type the option accepts. */
@@ -560,17 +788,20 @@ function sampleChannel(world: SmokeWorld, option: LooseOption): unknown {
  * A plausible value for one option, already resolved the way discord.js
  * hands it to `CommandInteractionOptionResolver` (user, member, channel, …).
  *
- * The first choice wins when there are choices; an autocomplete option takes
- * the command's own first suggestion when the caller collected one.
+ * With choices, the first one wins (the last one for `max`); an autocomplete
+ * option takes the command's own first suggestion when the caller collected
+ * one, since Discord only sends what the user picked from it.
  */
 export function sampleOption(
   world: SmokeWorld,
   option: LooseOption,
   inGuild: boolean,
-  suggestions?: ReadonlyMap<string, string | number>
+  suggestions?: ReadonlyMap<string, string | number>,
+  fill: OptionFill = 'all'
 ): CommandInteractionOption {
   const base = { name: option.name, type: option.type };
-  const choice = option.choices?.[0]?.value;
+  const choices = option.choices ?? [];
+  const choice = (fill === 'max' ? choices.at(-1) : choices[0])?.value;
   const suggestion = suggestions?.get(option.name);
 
   switch (option.type) {
@@ -581,7 +812,7 @@ export function sampleOption(
           choice ??
           (typeof suggestion === 'string'
             ? suggestion
-            : sampleText(option.min_length, option.max_length)),
+            : sampleString(option, fill)),
       };
     case ApplicationCommandOptionType.Integer:
     case ApplicationCommandOptionType.Number:
@@ -589,10 +820,12 @@ export function sampleOption(
         ...base,
         value:
           choice ??
-          (typeof suggestion === 'number' ? suggestion : sampleNumber(option)),
+          (typeof suggestion === 'number'
+            ? suggestion
+            : sampleNumber(option, fill)),
       };
     case ApplicationCommandOptionType.Boolean:
-      return { ...base, value: true };
+      return { ...base, value: fill !== 'min' };
     case ApplicationCommandOptionType.User:
     case ApplicationCommandOptionType.Mentionable:
       return {
@@ -714,6 +947,8 @@ export interface Invocation {
   optionReads: Set<string>;
   /** The leaf option names the command declares. */
   declaredOptions: Set<string>;
+  /** Calls that failed because of `failFirst`. */
+  injectedFailures: ResponseKind[];
 }
 
 export interface InvokeOptions {
@@ -721,7 +956,17 @@ export interface InvokeOptions {
   locale: string;
   inGuild: boolean;
   suggestions?: ReadonlyMap<string, string | number>;
+  /**
+   * Make Discord reject one call, as a 500 or an expired token would: the
+   * first initial response (`reply` / `deferReply` / `showModal`), or the
+   * first `editReply` of an acknowledged interaction. The call after it
+   * succeeds. `injectedFailures` records whether it fired.
+   */
+  failFirst?: 'initialResponse' | 'editReply';
 }
+
+/** The error Discord's API hands back for an injected failure. */
+export const INJECTED_FAILURE = 'Injected Discord API failure';
 
 let snowflakeCounter = 0;
 function nextSnowflake(): string {
@@ -768,12 +1013,29 @@ export function invokeCommand(
   const initialResponses: ResponseKind[] = [];
   const violations: string[] = [];
   const sent: SentPayload[] = [];
+  const injectedFailures: ResponseKind[] = [];
   const state = { replied: false, deferred: false };
   let lastComponents: readonly unknown[] = [];
+  let pendingFailure = options.failFirst;
+
+  const maybeFail = (kind: ResponseKind) => {
+    const initial =
+      kind === 'reply' || kind === 'deferReply' || kind === 'showModal';
+    if (
+      (pendingFailure === 'initialResponse' && initial) ||
+      (pendingFailure === 'editReply' && kind === 'editReply')
+    ) {
+      pendingFailure = undefined;
+      injectedFailures.push(kind);
+      throw new Error(INJECTED_FAILURE);
+    }
+  };
 
   const leaf = path.options
-    .filter((option) => option.required || options.fill === 'all')
-    .map((option) => sampleOption(world, option, inGuild, options.suggestions));
+    .filter((option) => option.required || options.fill !== 'required')
+    .map((option) =>
+      sampleOption(world, option, inGuild, options.suggestions, options.fill)
+    );
   const resolver = createResolver(
     world.client,
     nestUnderPath(path, leaf),
@@ -896,18 +1158,21 @@ export function invokeCommand(
     isModalSubmit: () => false,
     toString: () => `/${path.label}`,
     reply: vi.fn(async (payload: unknown) => {
+      maybeFail('reply');
       acknowledge('reply');
       state.replied = true;
       record('reply', payload);
       return respond(payload);
     }),
     deferReply: vi.fn(async (payload?: unknown) => {
+      maybeFail('deferReply');
       acknowledge('deferReply');
       state.deferred = true;
       record('deferReply', payload ?? {});
       return respond(payload);
     }),
     showModal: vi.fn(async (payload: unknown) => {
+      maybeFail('showModal');
       acknowledge('showModal');
       state.replied = true;
       record('showModal', payload);
@@ -915,6 +1180,7 @@ export function invokeCommand(
     }),
     editReply: vi.fn(async (payload: unknown) => {
       requireAcknowledged('editReply');
+      maybeFail('editReply');
       record('editReply', payload);
       return message;
     }),
@@ -940,6 +1206,7 @@ export function invokeCommand(
     sent,
     optionReads,
     declaredOptions: new Set(path.options.map((option) => option.name)),
+    injectedFailures,
   };
 }
 
@@ -1264,6 +1531,15 @@ export function leafKeys(node: unknown, prefix = ''): string[] {
 
 const TRANSLATION_KEYS = leafKeys(en);
 const UNFILLED_PLACEHOLDER = /\{[A-Za-z]\w*\}/;
+/**
+ * A dotted key under one of the dictionary's namespaces, such as
+ * `record.errors.removed`: what `t()` returns for a key that no longer
+ * exists. Anchored to the real namespaces so prose like `example.com` is not
+ * mistaken for one.
+ */
+const KEY_SHAPED = new RegExp(
+  `(?:^|\\s)((?:${Object.keys(en).join('|')})(?:\\.[A-Za-z][A-Za-z0-9]*)+)(?=$|\\s)`
+);
 
 /**
  * Text that shows a translation went wrong: `t()` falls back to the key
@@ -1273,7 +1549,9 @@ const UNFILLED_PLACEHOLDER = /\{[A-Za-z]\w*\}/;
 export function translationProblems(texts: readonly string[]): string[] {
   const problems: string[] = [];
   for (const text of texts) {
-    const key = TRANSLATION_KEYS.find((candidate) => text.includes(candidate));
+    const key =
+      TRANSLATION_KEYS.find((candidate) => text.includes(candidate)) ??
+      KEY_SHAPED.exec(text)?.[1];
     if (key) problems.push(`raw translation key "${key}" in: ${text}`);
     if (UNFILLED_PLACEHOLDER.test(text)) {
       problems.push(`unfilled placeholder in: ${text}`);

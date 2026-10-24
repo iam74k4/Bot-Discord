@@ -72,18 +72,6 @@ describe('pollRepository', () => {
     expect(pollRepository.findActiveByCreator('user-1', 'chan-1')).toBeNull();
   });
 
-  it('returns the most recent poll when a user has several open', () => {
-    vi.useFakeTimers();
-    pollRepository.create(record({ message_id: 'older' }));
-    vi.advanceTimersByTime(1_000);
-    pollRepository.create(record({ message_id: 'newer' }));
-    vi.useRealTimers();
-
-    expect(
-      pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
-    ).toBe('newer');
-  });
-
   it('prunes only expired rows', () => {
     pollRepository.create(record({ message_id: 'live' }));
     pollRepository.create(
@@ -129,7 +117,7 @@ describe('pollRepository', () => {
     ).toBe('msg-1');
   });
 
-  describe('at the exact expiry instant', () => {
+  describe('on a frozen clock', () => {
     const NOW = new Date('2026-05-01T12:00:00Z').getTime();
 
     beforeEach(() => {
@@ -137,6 +125,7 @@ describe('pollRepository', () => {
       vi.setSystemTime(NOW);
     });
 
+    // Restores the real clock even when a test throws midway.
     afterEach(() => {
       vi.useRealTimers();
     });
@@ -149,20 +138,34 @@ describe('pollRepository', () => {
       ).toMatchObject({ created_at: NOW, expires_at: NOW + HOUR });
     });
 
-    it('no longer offers the poll and prunes it', () => {
-      pollRepository.create(record({ expires_at: NOW }));
-
-      expect(pollRepository.findActiveByCreator('user-1', 'chan-1')).toBeNull();
-      expect(pollRepository.removeExpired()).toBe(1);
-    });
-
-    it('still offers a poll one millisecond before expiry', () => {
-      pollRepository.create(record({ expires_at: NOW + 1 }));
+    it('returns the most recent poll when a user has several open', () => {
+      pollRepository.create(record({ message_id: 'older' }));
+      vi.advanceTimersByTime(1_000);
+      pollRepository.create(record({ message_id: 'newer' }));
 
       expect(
-        pollRepository.findActiveByCreator('user-1', 'chan-1')
-      ).not.toBeNull();
-      expect(pollRepository.removeExpired()).toBe(0);
+        pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
+      ).toBe('newer');
+    });
+
+    describe('at the exact expiry instant', () => {
+      it('no longer offers the poll and prunes it', () => {
+        pollRepository.create(record({ expires_at: NOW }));
+
+        expect(
+          pollRepository.findActiveByCreator('user-1', 'chan-1')
+        ).toBeNull();
+        expect(pollRepository.removeExpired()).toBe(1);
+      });
+
+      it('still offers a poll one millisecond before expiry', () => {
+        pollRepository.create(record({ expires_at: NOW + 1 }));
+
+        expect(
+          pollRepository.findActiveByCreator('user-1', 'chan-1')
+        ).not.toBeNull();
+        expect(pollRepository.removeExpired()).toBe(0);
+      });
     });
   });
 

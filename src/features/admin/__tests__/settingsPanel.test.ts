@@ -219,6 +219,26 @@ describe('showSettingsPanel', () => {
       ]);
     });
 
+    it('preselects 日本語 for a guild stored as Japanese', async () => {
+      guildSettingsRepository.setLanguage(GUILD_ID, 'ja');
+      const { interaction, harness } = setup();
+
+      await showSettingsPanel(interaction, 'en', 'language');
+
+      const payload = payloadOf<{ embeds: unknown[]; components: unknown[] }>(
+        harness.reply
+      );
+      expect(embedAt(payload).description).toContain('**日本語**');
+      const [, select] = rowsOf(payload.components);
+      expect(
+        select![0]!.options?.map((o) => [o.value, o.default ?? false])
+      ).toEqual([
+        ['en', false],
+        ['ja', true],
+        ['auto', false],
+      ]);
+    });
+
     it('persists and audit-logs a language picked from the select', async () => {
       const { interaction, harness } = setup();
       await showSettingsPanel(interaction, 'en', 'language');

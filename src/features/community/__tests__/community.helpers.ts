@@ -5,7 +5,7 @@ import {
   type ChatInputCommandInteraction,
   type EmbedBuilder,
 } from 'discord.js';
-import { vi } from 'vitest';
+import { expect, vi } from 'vitest';
 
 /**
  * Stand-ins for the slices of discord.js the community feature reads. Each
@@ -69,6 +69,8 @@ export function commandInteraction(
     voice?: VoiceChannelStub | null;
     hasGuild?: boolean;
     hasMember?: boolean;
+    /** Used as `interaction.member` verbatim, e.g. an uncached API member. */
+    rawMember?: unknown;
     userId?: string;
     guildId?: string | null;
     channelId?: string;
@@ -91,9 +93,11 @@ export function commandInteraction(
     guild: options.hasGuild === false ? null : { id: 'guild-1' },
     guildId: options.guildId === undefined ? 'guild-1' : options.guildId,
     member:
-      options.hasMember === false
-        ? null
-        : { id: userId, voice: { channel: options.voice ?? null } },
+      options.rawMember !== undefined
+        ? options.rawMember
+        : options.hasMember === false
+          ? null
+          : { id: userId, voice: { channel: options.voice ?? null } },
     user: { id: userId, tag: `${userId}#0001` },
     channelId: options.channelId ?? 'chan-1',
     channel: options.textChannel ?? null,
@@ -122,6 +126,22 @@ export function embedAt(mock: ReturnType<typeof vi.fn>, call = 0): APIEmbed {
 /** The first embed of the most recent reply/editReply call. */
 export function lastEmbed(mock: ReturnType<typeof vi.fn>): APIEmbed {
   return embedAt(mock, mock.mock.calls.length - 1);
+}
+
+/**
+ * Matches a string that mentions every part, in any order and case. Log lines
+ * are checked for the facts they carry (who, how many) rather than their exact
+ * wording, so rephrasing a log does not break a test.
+ */
+export function mentioning(...parts: Array<string | RegExp>) {
+  const lookaheads = parts.map((part) => {
+    const source =
+      typeof part === 'string'
+        ? part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        : part.source;
+    return `(?=[\\s\\S]*${source})`;
+  });
+  return expect.stringMatching(new RegExp(lookaheads.join(''), 'i'));
 }
 
 /** The flags of the payload passed in `call`, or undefined when public. */

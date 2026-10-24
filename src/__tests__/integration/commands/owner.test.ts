@@ -223,7 +223,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
-                title: 'System Health Check',
+                title: t('admin.panel.healthTitle', 'en'),
               }),
             }),
           ]),
@@ -251,7 +251,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
-                title: 'Database Backups',
+                title: t('admin.panel.backupsTitle', 'en'),
               }),
             }),
           ]),
@@ -277,6 +277,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
+                // owner.ts hard-codes this title per locale (no locale key).
                 title: 'Backup Complete',
               }),
             }),
@@ -304,7 +305,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
-                title: 'Bot Metrics',
+                title: t('admin.panel.metricsTitle', 'en'),
               }),
             }),
           ]),

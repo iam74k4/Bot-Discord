@@ -156,17 +156,18 @@ describe('009_voice_daily_stats', () => {
     ]);
   });
 
-  it('keeps separate rows per channel and one name per channel', () => {
+  it('keeps separate rows per channel and the alphabetically largest name per channel', () => {
     insertSession({
       channel: 'vc1',
-      channelName: 'Alpha',
+      channelName: 'Zulu',
       joinedAt: '2026-04-20T10:00:00Z',
       durationMs: 1_000,
     });
-    // The channel was renamed later the same day.
+    // Renamed later the same day. The backfill keeps MAX(channel_name), so
+    // the older name wins here because it sorts after the newer one.
     insertSession({
       channel: 'vc1',
-      channelName: 'Bravo',
+      channelName: 'Alpha',
       joinedAt: '2026-04-20T12:00:00Z',
       durationMs: 1_000,
     });
@@ -182,7 +183,7 @@ describe('009_voice_daily_stats', () => {
     expect(dailyStats()).toEqual([
       expect.objectContaining({
         channel_id: 'vc1',
-        channel_name: 'Bravo',
+        channel_name: 'Zulu',
         total_duration_ms: 2_000,
         session_count: 2,
       }),

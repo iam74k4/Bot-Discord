@@ -1,7 +1,7 @@
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import { readdirSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   col,
@@ -58,8 +58,10 @@ async function runMigrations(...prefixes: string[]): Promise<void> {
   for (const prefix of prefixes) {
     const file = MIGRATION_FILES.find((name) => name.startsWith(prefix));
     if (!file) throw new Error(`No migration with prefix ${prefix}`);
+    // Same file-URL import the production runner uses, so a vi.doMock of a
+    // migration applies here too.
     const mod = (await import(
-      `../migrations/${file.replace(/\.ts$/, '.js')}`
+      pathToFileURL(join(MIGRATIONS_DIR, file)).href
     )) as {
       up: () => void;
     };
@@ -217,6 +219,7 @@ describe('initializeDatabase', () => {
 
   afterEach(() => {
     vi.doUnmock('fs');
+    vi.doUnmock('../migrations/005_drop_steam.js');
     vi.doUnmock('../migrations/006_polls.js');
     vi.doUnmock('../migrations/008_announcement_channel.js');
     vi.doUnmock('../migrations/010_native_polls.js');
@@ -401,15 +404,29 @@ describe('initializeDatabase', () => {
       const schemaBefore = describeSchema(db);
       const rowsBefore = dumpRows(db);
 
+      // Fail the reboot on purpose, early enough that it does not depend on
+      // the 006 bug above: by the time 005 runs, 001/002 have recreated the
+      // five Steam tables. The stand-in also destroys data before throwing,
+      // as a half-applied migration would.
+      vi.doMock('../migrations/005_drop_steam.js', () => ({
+        up: () => {
+          db.exec('DELETE FROM guild_settings');
+          db.exec('DELETE FROM audit_logs');
+          throw new Error('SQLITE_BUSY: database is locked');
+        },
+      }));
       vi.resetModules();
       const second = await loadRunner();
-      // Whatever makes a reboot fail (today: the 006 bug above), the single
-      // transaction must leave the existing data exactly as it was.
-      await second.initializeDatabase().catch(() => undefined);
 
+      await expect(second.initializeDatabase()).rejects.toThrow(
+        'SQLITE_BUSY: database is locked'
+      );
+
+      // One transaction: the recreated Steam tables and the deletes are gone.
       expect(describeSchema(db)).toEqual(schemaBefore);
       expect(dumpRows(db)).toEqual(rowsBefore);
       expect(db.inTransaction).toBe(false);
+      expect(logger.info).toHaveBeenCalledTimes(1);
     });
   });
 
