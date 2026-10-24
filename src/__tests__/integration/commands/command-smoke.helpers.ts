@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ApplicationCommandOptionType,
+  ButtonStyle,
   ChannelType,
   Collection,
   CommandInteractionOptionResolver,
@@ -26,6 +27,7 @@ import {
   type DiscoveredCommand,
 } from '../../../app/interactions/commandRegistry.js';
 import type { Command } from '../../../shared/types/index.js';
+import type { ExtendedClient } from '../../../client.js';
 import { en } from '../../../locales/en.js';
 
 /**
@@ -149,7 +151,9 @@ function isNesting(option: LooseOption): boolean {
 }
 
 /** Every leaf path of every command, in a stable order. */
-export function commandPaths(commands: readonly LoadedCommand[]): CommandPath[] {
+export function commandPaths(
+  commands: readonly LoadedCommand[]
+): CommandPath[] {
   const paths: CommandPath[] = [];
 
   for (const entry of commands) {
@@ -208,6 +212,7 @@ export const IDS = {
   text: '300000000000000008',
   voice: '300000000000000009',
   dm: '300000000000000010',
+  member: '300000000000000011',
 } as const;
 
 export interface RoleStub {
@@ -255,7 +260,7 @@ export interface FetchableMessage {
 
 export interface SmokeWorld {
   ownerId: string;
-  client: Client & { commands: Collection<string, Command> };
+  client: ExtendedClient;
   guild: Guild;
   role: RoleStub;
   actor: GuildMember & MemberStub;
@@ -337,9 +342,15 @@ const TEXT_CHANNEL_PERMISSIONS = [
  * can post in the text channel; one other member (`target`) is available
  * for user options and sits below the invoking member in the hierarchy.
  *
- * The invoking user is a configured bot owner so `/owner` runs too.
+ * The invoking user is a configured bot owner so `/owner` runs too. With
+ * `privileged: false` it is instead a plain member - same voice channel,
+ * no permissions, not an owner - for checking that commands refuse cleanly.
  */
-export function createWorld(ownerId: string): SmokeWorld {
+export function createWorld(
+  ownerId: string,
+  options: { privileged?: boolean } = {}
+): SmokeWorld {
+  const privileged = options.privileged ?? true;
   const guild = {
     id: IDS.guild,
     name: 'Smoke Test Guild',
@@ -358,7 +369,9 @@ export function createWorld(ownerId: string): SmokeWorld {
   };
 
   const users = {
-    actor: userStub(ownerId, 'smoke-owner'),
+    actor: privileged
+      ? userStub(ownerId, 'smoke-owner')
+      : userStub(IDS.member, 'smoke-member'),
     target: userStub(IDS.target, 'smoke-target'),
     friendA: userStub(IDS.friendA, 'smoke-friend-a'),
     friendB: userStub(IDS.friendB, 'smoke-friend-b'),
@@ -366,10 +379,14 @@ export function createWorld(ownerId: string): SmokeWorld {
   };
 
   const botMember = memberStub(guild, users.bot, 50, PermissionsBitField.All);
-  const actor = memberStub(guild, users.actor, 10, [
-    PermissionFlagsBits.ManageGuild,
-    PermissionFlagsBits.ManageRoles,
-  ]);
+  const actor = memberStub(
+    guild,
+    users.actor,
+    10,
+    privileged
+      ? [PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles]
+      : []
+  );
   const target = memberStub(guild, users.target, 1, []);
   const friendA = memberStub(guild, users.friendA, 1, []);
   const friendB = memberStub(guild, users.friendB, 1, []);
@@ -386,12 +403,14 @@ export function createWorld(ownerId: string): SmokeWorld {
     members: new Collection<string, GuildMember>(
       [actor, friendA, friendB, botMember].map((m) => [m.id, m])
     ),
-    permissionsFor: vi.fn(() => new PermissionsBitField(PermissionsBitField.All)),
+    permissionsFor: vi.fn(
+      () => new PermissionsBitField(PermissionsBitField.All)
+    ),
     isTextBased: () => false,
     isVoiceBased: () => true,
     toString: () => `<#${IDS.voice}>`,
   };
-  for (const member of [actor, friendA, friendB, botMember]) {
+  for (const member of [actor, friendA, friendB, botMember] as MemberStub[]) {
     member.voice = { channel: voiceChannel, channelId: voiceChannel.id };
   }
 
@@ -475,6 +494,7 @@ export function createWorld(ownerId: string): SmokeWorld {
     uptime: 60_000,
     readyAt: new Date(0),
     isReady: () => true,
+    isFullyReady: true,
     commands: new Collection<string, Command>(),
   } as unknown as SmokeWorld['client'];
 
@@ -753,9 +773,7 @@ export function invokeCommand(
 
   const leaf = path.options
     .filter((option) => option.required || options.fill === 'all')
-    .map((option) =>
-      sampleOption(world, option, inGuild, options.suggestions)
-    );
+    .map((option) => sampleOption(world, option, inGuild, options.suggestions));
   const resolver = createResolver(
     world.client,
     nestUnderPath(path, leaf),
@@ -803,7 +821,10 @@ export function invokeCommand(
             record('component.reply', payload);
           }),
         };
-        if (collectorOptions?.filter && !(await collectorOptions.filter(press))) {
+        if (
+          collectorOptions?.filter &&
+          !(await collectorOptions.filter(press))
+        ) {
           throw new Error(
             'Collector received no interactions before ending with reason: time'
           );
@@ -985,8 +1006,10 @@ export function embedsOf(payload: unknown): APIEmbed[] {
 
 export interface LooseComponent {
   type: number;
+  style?: number;
   custom_id?: string;
   label?: string;
+  emoji?: unknown;
   placeholder?: string;
   url?: string;
   options?: Array<{ label: string; value: string; description?: string }>;
@@ -1106,6 +1129,17 @@ export function messageLimitProblems(payload: unknown): string[] {
       problems.push(`an action row has ${row.components.length} components`);
     }
     for (const component of row.components) {
+      if (component.type === ComponentType.Button) {
+        const isLink = component.style === ButtonStyle.Link;
+        if (isLink ? !component.url : component.custom_id === undefined) {
+          problems.push(
+            `button "${component.label ?? ''}" has no ${isLink ? 'url' : 'custom_id'}`
+          );
+        }
+        if (!component.label && !component.emoji) {
+          problems.push('a button has neither a label nor an emoji');
+        }
+      }
       if (component.custom_id !== undefined) {
         if (component.custom_id.length > 100) {
           problems.push(`custom_id "${component.custom_id}" exceeds 100 chars`);

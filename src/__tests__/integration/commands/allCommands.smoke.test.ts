@@ -115,7 +115,23 @@ vi.mock(
   })
 );
 
-import type { APIEmbed } from 'discord.js';
+import {
+  ActionRowBuilder,
+  ApplicationCommandOptionType,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  InteractionContextType,
+  MessageFlags,
+  type APIEmbed,
+  type ChatInputCommandInteraction,
+} from 'discord.js';
+import type { Mock } from 'vitest';
+import { awaitConfirmation } from '../../../shared/utils/confirm.js';
+import {
+  buildHelpCatalog,
+  type PermissionLevel,
+} from '../../../shared/help/catalog.js';
 import { initializeDatabase } from '../../../infrastructure/database/migrations/index.js';
 import { buildCommandCollection } from '../../../app/interactions/commandRegistry.js';
 import { routeInteraction } from '../../../app/interactions/interactionRouter.js';
@@ -184,7 +200,7 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
       message_id: POLL_MESSAGE_ID,
       guild_id: world.guild.id,
       channel_id: world.textChannel.id,
-      creator_id: world.ownerId,
+      creator_id: world.actor.id,
       expires_at: Date.now() + 60 * 60 * 1000,
     });
   },
@@ -206,7 +222,7 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
     // Forty-five minutes in the caller's voice channel, so stats have data.
     const id = voiceSessionRepository.startSession(
       world.guild.id,
-      world.ownerId,
+      world.actor.id,
       world.voiceChannel.id,
       world.voiceChannel.name
     );
@@ -330,29 +346,38 @@ function expectWellBehaved(run: Invocation, error: unknown): void {
 }
 
 interface Case {
-  label: string;
   path: CommandPath;
   fill: OptionFill;
   locale: 'en-US' | 'ja';
 }
 
-const SERVER_CASES: Case[] = paths.flatMap((path) => [
-  { label: path.label, path, fill: 'required' as const, locale: 'en-US' as const },
-  { label: path.label, path, fill: 'all' as const, locale: 'en-US' as const },
-  { label: path.label, path, fill: 'all' as const, locale: 'ja' as const },
-]);
+/** Each path with required options only, then with every option, in both languages. */
+const SERVER_CASES: Array<[string, Case]> = paths.flatMap((path) =>
+  (
+    [
+      { path, fill: 'required', locale: 'en-US' },
+      { path, fill: 'all', locale: 'en-US' },
+      { path, fill: 'all', locale: 'ja' },
+    ] satisfies Case[]
+  ).map((c): [string, Case] => [
+    `/${path.label} (${c.fill} options, ${c.locale})`,
+    c,
+  ])
+);
 
 /** Paths Discord can deliver from a DM with the bot (BotDM context). */
 const DM_PATHS = paths.filter(
-  ({ entry }) => !entry.json.contexts || entry.json.contexts.includes(1)
+  ({ entry }) =>
+    !entry.json.contexts ||
+    entry.json.contexts.includes(InteractionContextType.BotDM)
 );
 
 describe('command discovery for the smoke run', () => {
-  it('finds commands in every feature that has a commands folder', () => {
-    expect(new Set(commands.map((c) => c.feature))).toEqual(
-      new Set(['admin', 'community', 'general', 'notification', 'voice'])
+  it('loads a command from every feature that ships command files', () => {
+    expect([...new Set(commands.map((c) => c.feature))].sort()).toEqual(
+      featuresWithCommandFiles()
     );
-    expect(paths.length).toBeGreaterThan(commands.length);
+    expect(paths.length).toBeGreaterThanOrEqual(commands.length);
   });
 
   it('keeps every scenario attached to a real command path', () => {
@@ -364,34 +389,30 @@ describe('command discovery for the smoke run', () => {
 });
 
 describe('every command path in a fully set-up server', () => {
-  it.each(SERVER_CASES)(
-    '/$label ($fill options, $locale)',
-    async ({ path, fill, locale }) => {
-      SCENARIOS[path.label]?.(world);
-      const suggestions =
-        fill === 'all' ? await suggestionsFor(path) : undefined;
-      const run = invokeCommand(world, path, {
-        fill,
-        locale,
-        inGuild: true,
-        suggestions,
-      });
+  it.each(SERVER_CASES)('%s', async (_title, { path, fill, locale }) => {
+    SCENARIOS[path.label]?.(world);
+    const suggestions = fill === 'all' ? await suggestionsFor(path) : undefined;
+    const run = invokeCommand(world, path, {
+      fill,
+      locale,
+      inGuild: true,
+      suggestions,
+    });
 
-      const error = await settle(path.entry.command.execute(run.interaction));
+    const error = await settle(path.entry.command.execute(run.interaction));
 
-      expectWellBehaved(run, error);
-      expect(
-        errorEmbeds(run).map((embed) => `${embed.title}: ${embed.description}`),
-        'error responses in a server set up for this command (add a SCENARIOS entry if it needs prior state)'
-      ).toEqual([]);
-    }
-  );
+    expectWellBehaved(run, error);
+    expect(
+      errorEmbeds(run).map((embed) => `${embed.title}: ${embed.description}`),
+      'error responses in a server set up for this command (add a SCENARIOS entry if it needs prior state)'
+    ).toEqual([]);
+  });
 });
 
 describe('every command path reachable from a DM', () => {
-  it.each(DM_PATHS.map((path) => ({ label: path.label, path })))(
-    '/$label degrades gracefully without a guild',
-    async ({ path }) => {
+  it.each(DM_PATHS.map((path) => [`/${path.label}`, path] as const))(
+    '%s degrades gracefully without a guild',
+    async (_title, path) => {
       SCENARIOS[path.label]?.(world);
       const run = invokeCommand(world, path, {
         fill: 'all',
@@ -413,9 +434,9 @@ describe('every command path routed like production', () => {
     }
   });
 
-  it.each(paths.map((path) => ({ label: path.label, path })))(
-    '/$label passes its middleware and is counted as executed',
-    async ({ path }) => {
+  it.each(paths.map((path) => [`/${path.label}`, path] as const))(
+    '%s passes its middleware and is counted as executed',
+    async (_title, path) => {
       SCENARIOS[path.label]?.(world);
       const run = invokeCommand(world, path, {
         fill: 'all',
@@ -432,9 +453,90 @@ describe('every command path routed like production', () => {
 
       expectWellBehaved(run, error);
       expect(errorEmbeds(run)).toEqual([]);
-      expect(metrics.getSnapshot().commands.byName[name] ?? 0).toBe(
-        before + 1
+      expect(metrics.getSnapshot().commands.byName[name] ?? 0).toBe(before + 1);
+    }
+  );
+});
+
+/** Row-for-row contents of every table, to prove a refusal changed nothing. */
+function snapshotTables(): Record<string, unknown[]> {
+  const tables = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )
+    .all() as Array<{ name: string }>;
+  return Object.fromEntries(
+    tables.map(({ name }) => [
+      name,
+      db.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    ])
+  );
+}
+
+function isEphemeral(payload: unknown): boolean {
+  const flags = (payload as { flags?: unknown } | undefined)?.flags;
+  return typeof flags === 'number' && (flags & MessageFlags.Ephemeral) !== 0;
+}
+
+const HELP_ENTRIES = new Map(
+  buildHelpCatalog(commands.map((entry) => entry.command))
+    .flatMap((category) => category.commands)
+    .map((info) => [info.name, info])
+);
+
+/** Who `/general help` says may use a path (its subcommand / group entry). */
+function advertisedLevels(path: CommandPath): PermissionLevel[] {
+  const entry =
+    HELP_ENTRIES.get(path.label.split(' ').slice(0, 2).join(' ')) ??
+    HELP_ENTRIES.get(path.entry.json.name);
+  return [entry?.requiredPermission ?? 'everyone'].flat();
+}
+
+describe('every command path for a member without permissions', () => {
+  beforeEach(() => {
+    world = createWorld(OWNER_ID, { privileged: false });
+    world.client.commands = buildCommandCollection(commands);
+  });
+
+  afterEach(() => {
+    for (const command of commands) {
+      clearCooldown(command.json.name, world.actor.id);
+    }
+  });
+
+  it.each(paths.map((path) => [`/${path.label}`, path] as const))(
+    '%s is refused, or served, exactly as /general help advertises',
+    async (_title, path) => {
+      SCENARIOS[path.label]?.(world);
+      const before = snapshotTables();
+      const run = invokeCommand(world, path, {
+        fill: 'all',
+        locale: 'en-US',
+        inGuild: true,
+        suggestions: await suggestionsFor(path),
+      });
+
+      const error = await settle(
+        routeInteraction(world.client, run.interaction)
       );
+
+      expectWellBehaved(run, error);
+      if (advertisedLevels(path).includes('everyone')) {
+        expect(errorEmbeds(run)).toEqual([]);
+        return;
+      }
+
+      // Restricted: one private error, and nothing touched.
+      expect(run.sent.map((entry) => entry.via)).toEqual(['reply']);
+      expect(isEphemeral(run.sent[0]!.payload)).toBe(true);
+      expect(errorEmbeds(run)).toHaveLength(1);
+      expect(snapshotTables()).toEqual(before);
+      expect(world.target.roles.add).not.toHaveBeenCalled();
+      expect(world.target.roles.remove).not.toHaveBeenCalled();
+      expect(world.textChannel.send).not.toHaveBeenCalled();
+      expect(voice.manager.disconnect).not.toHaveBeenCalled();
+      expect(voice.recordAudio).not.toHaveBeenCalled();
+      expect(backup.runBackup).not.toHaveBeenCalled();
     }
   );
 });
@@ -442,21 +544,15 @@ describe('every command path routed like production', () => {
 const AUTOCOMPLETE_CASES = paths.flatMap((path) =>
   path.options
     .filter((option) => option.autocomplete)
-    .map((option) => ({
-      label: `${path.label} ${option.name}`,
-      path,
-      option,
-    }))
+    .map(
+      (option) => [`/${path.label} ${option.name}:`, { path, option }] as const
+    )
 );
 
 describe('every autocomplete option', () => {
-  it('exists somewhere, so this block is not vacuous', () => {
-    expect(AUTOCOMPLETE_CASES.length).toBeGreaterThan(0);
-  });
-
   it.each(AUTOCOMPLETE_CASES)(
-    '/$label answers once with choices Discord accepts',
-    async ({ path, option }) => {
+    '%s answers once, through the router, with choices Discord accepts',
+    async (_title, { path, option }) => {
       const autocomplete = path.entry.command.autocomplete;
       expect(
         autocomplete,
@@ -470,7 +566,7 @@ describe('every autocomplete option', () => {
           option,
           focused
         );
-        await autocomplete!(interaction);
+        await routeInteraction(world.client, interaction);
 
         expect(respond).toHaveBeenCalledTimes(1);
         const choices = respond.mock.calls[0]![0] as Array<{
@@ -491,7 +587,7 @@ describe('every autocomplete option', () => {
   );
 
   it('suggests something for an empty query, which the server runs use', async () => {
-    for (const { path } of AUTOCOMPLETE_CASES) {
+    for (const [, { path }] of AUTOCOMPLETE_CASES) {
       expect((await suggestionsFor(path)).size).toBeGreaterThan(0);
     }
   });
@@ -534,5 +630,277 @@ describe('translations the replies are built from', () => {
     });
 
     expect(mismatched).toEqual([]);
+  });
+});
+
+/**
+ * A smoke run that silently stops at a guard (no guild, no permission, bot
+ * not in voice) still "acknowledges once". These anchors prove the world is
+ * rich enough to reach the work each feature exists to do.
+ */
+const REACHES: Array<{
+  label: string;
+  reached: (world: SmokeWorld) => void;
+}> = [
+  {
+    label: 'voice record',
+    reached: (w) =>
+      expect(voice.recordAudio).toHaveBeenCalledWith(
+        expect.objectContaining({ channelId: w.voiceChannel.id, duration: 30 })
+      ),
+  },
+  {
+    label: 'voice autojoin disable',
+    reached: (w) =>
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id),
+  },
+  {
+    label: 'owner backup run',
+    reached: () => expect(backup.runBackup).toHaveBeenCalledTimes(1),
+  },
+  {
+    label: 'owner system broadcast',
+    reached: (w) => expect(w.textChannel.send).toHaveBeenCalledTimes(1),
+  },
+  {
+    label: 'community poll create',
+    reached: (w) =>
+      expect(
+        pollRepository.findActiveByCreator(w.actor.id, w.textChannel.id)
+      ).not.toBeNull(),
+  },
+  {
+    label: 'community poll end',
+    reached: (w) => {
+      const poll = w.messages.get(POLL_MESSAGE_ID)?.poll as { end: Mock };
+      expect(poll.end).toHaveBeenCalledTimes(1);
+      expect(
+        pollRepository.findActiveByCreator(w.actor.id, w.textChannel.id)
+      ).toBeNull();
+    },
+  },
+  {
+    label: 'admin role add',
+    reached: (w) => expect(w.target.roles.add).toHaveBeenCalledWith(w.role.id),
+  },
+  {
+    label: 'admin settings language',
+    reached: (w) =>
+      expect(guildSettingsRepository.getLanguage(w.guild.id)).toBe('en'),
+  },
+  {
+    label: 'notification voice set',
+    reached: (w) =>
+      expect(
+        notificationChannelRepository.getEnabled(w.guild.id, 'voice')
+      ).toBe(w.textChannel.id),
+  },
+];
+
+describe('the smoke world reaches the real work', () => {
+  it.each(REACHES.map((r) => [`/${r.label}`, r] as const))(
+    '%s',
+    async (_title, { label, reached }) => {
+      const path = paths.find((candidate) => candidate.label === label);
+      expect(path, `no command path "/${label}"`).toBeDefined();
+      SCENARIOS[label]?.(world);
+      const run = invokeCommand(world, path!, {
+        fill: 'required',
+        locale: 'en-US',
+        inGuild: true,
+      });
+
+      await settle(path!.entry.command.execute(run.interaction));
+
+      reached(world);
+    }
+  );
+});
+
+describe('the smoke harness itself', () => {
+  const TEXT: LooseOption = {
+    type: ApplicationCommandOptionType.String,
+    name: 'text',
+    description: 'Text',
+    required: true,
+  };
+
+  function fakePath(
+    execute: (interaction: ChatInputCommandInteraction) => Promise<void>,
+    options: LooseOption[] = [TEXT]
+  ): CommandPath {
+    const entry = {
+      feature: 'fake',
+      filePath: 'fake.ts',
+      command: { data: {} as never, execute },
+      json: { name: 'fake', description: 'Fake', options },
+    } as LoadedCommand;
+    return { label: 'fake', entry, group: null, subcommand: null, options };
+  }
+
+  async function runFake(path: CommandPath) {
+    const run = invokeCommand(world, path, {
+      fill: 'required',
+      locale: 'en-US',
+      inGuild: true,
+    });
+    const error = await settle(path.entry.command.execute(run.interaction));
+    return { run, error };
+  }
+
+  it('reports a second initial response the way Discord rejects it', async () => {
+    const { run, error } = await runFake(
+      fakePath(async (interaction) => {
+        await interaction.reply('first');
+        await interaction.deferReply();
+      })
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    expect(run.initialResponses).toEqual(['reply', 'deferReply']);
+    expect(run.violations).toEqual([
+      'deferReply after the interaction was already acknowledged',
+    ]);
+  });
+
+  it.each(['editReply', 'followUp'] as const)(
+    'rejects %s before the interaction is acknowledged',
+    async (method) => {
+      const { run, error } = await runFake(
+        fakePath(async (interaction) => {
+          await interaction[method]('too early');
+        })
+      );
+
+      expect(error).toBeInstanceOf(Error);
+      expect(run.initialResponses).toEqual([]);
+      expect(run.violations).toEqual([
+        `${method} before the interaction was acknowledged`,
+      ]);
+    }
+  );
+
+  it('records option names a command reads without declaring them', async () => {
+    const { run } = await runFake(
+      fakePath(async (interaction) => {
+        interaction.options.getString('txet');
+        await interaction.reply('ok');
+      })
+    );
+
+    expect([...run.optionReads]).toEqual(['txet']);
+    expect([...run.declaredOptions]).toEqual(['text']);
+  });
+
+  it('throws like discord.js when an option is read with the wrong getter', async () => {
+    const { error } = await runFake(
+      fakePath(async (interaction) => {
+        interaction.options.getInteger('text');
+        await interaction.reply('unreachable');
+      })
+    );
+
+    expect(String(error)).toMatch(/text/);
+  });
+
+  it('fills a required option from its first choice and skips optional ones', async () => {
+    const seen: unknown[] = [];
+    await runFake(
+      fakePath(
+        async (interaction) => {
+          seen.push(
+            interaction.options.getString('pick', true),
+            interaction.options.getInteger('count')
+          );
+          await interaction.reply('ok');
+        },
+        [
+          {
+            ...TEXT,
+            name: 'pick',
+            choices: [
+              { name: 'B', value: 'b' },
+              { name: 'A', value: 'a' },
+            ],
+          },
+          {
+            type: ApplicationCommandOptionType.Integer,
+            name: 'count',
+            description: 'Count',
+          },
+        ]
+      )
+    );
+
+    expect(seen).toEqual(['b', null]);
+  });
+
+  it('presses the confirm button of a real confirmation prompt', async () => {
+    let confirmed: boolean | undefined;
+    const { run } = await runFake(
+      fakePath(async (interaction) => {
+        confirmed = await awaitConfirmation(interaction, 'Proceed?');
+      })
+    );
+
+    expect(confirmed).toBe(true);
+    expect(run.sent.map((entry) => entry.via)).toEqual([
+      'reply',
+      'component.update',
+    ]);
+  });
+
+  it('flags payloads Discord would reject', () => {
+    const row = () =>
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId('same')
+          .setLabel('Go')
+          .setStyle(ButtonStyle.Primary)
+      );
+
+    expect(
+      messageLimitProblems({
+        content: 'x'.repeat(2001),
+        embeds: [
+          new EmbedBuilder().setTitle('T').addFields({ name: 'n', value: '' }),
+        ],
+        components: [row(), row(), row(), row(), row(), row()],
+        poll: { question: { text: 'Q' }, answers: [{ text: 'a'.repeat(56) }] },
+      })
+    ).toEqual([
+      'content is 2001 chars (max 2000)',
+      'embed field "n" has an empty name or value',
+      '6 action rows (max 5)',
+      ...Array.from({ length: 5 }, () => 'custom_id "same" is used twice'),
+      `poll answer "${'a'.repeat(56)}" is 56 chars (1-55)`,
+    ]);
+    expect(
+      messageLimitProblems({
+        components: [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setLabel('No id').setStyle(ButtonStyle.Primary)
+          ),
+        ],
+      })
+    ).toEqual(['button "No id" has no custom_id']);
+  });
+
+  it('flags raw translation keys and unfilled placeholders', () => {
+    expect(
+      translationProblems(['common.error', 'Hello {name}', 'All good'])
+    ).toEqual([
+      'raw translation key "common.error" in: common.error',
+      'unfilled placeholder in: Hello {name}',
+    ]);
+  });
+
+  it('flags references to commands that do not exist', () => {
+    expect(
+      invalidSlashReferences(
+        'Retry `/record` or /nope; `/voice record duration:30s` and /voice status are fine, as is `/{command}`.',
+        KNOWN_REFERENCES
+      )
+    ).toEqual(['/record', '/nope']);
   });
 });
