@@ -24,8 +24,9 @@ export function start({ client, config }: FeatureContext): void {
   }
   voiceTracker.closeAllStaleSessions();
   voiceTracker.reconcileActiveVoiceSessions(client);
-  cleanupInterval = startDailyCleanup(() =>
-    cleanupOldVoiceSessions(config.VOICE_SESSION_RETENTION_DAYS)
+  cleanupInterval = startDailyCleanup(
+    () => cleanupOldVoiceSessions(config.VOICE_SESSION_RETENTION_DAYS),
+    'Voice session retention'
   );
   logger.info('Notification feature started');
 }

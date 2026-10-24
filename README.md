@@ -276,7 +276,7 @@ See [`docs/database.md`](docs/database.md) for schema details and retention beha
 | -------------------------- | ----------------------------------------------------------------------------------- |
 | `npm run dev`              | Start with hot-reload (development)                                                 |
 | `npm run build`            | Compile TypeScript to JavaScript                                                    |
-| `npm start`                | Run compiled JavaScript (production)                                                |
+| `npm start`                | Run compiled JavaScript locally (Railway runs `node dist/index.js` directly)        |
 | `npm run lint`             | Check code with ESLint                                                              |
 | `npm run lint:fix`         | Fix ESLint errors automatically                                                     |
 | `npm run format`           | Format code with Prettier                                                           |
