@@ -44,6 +44,11 @@ vi.mock('../../../config/index.js', () => ({
   },
 }));
 
+vi.mock('../../../shared/utils/logger.js', () => ({
+  logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+  getErrorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
+}));
+
 vi.mock('../recording/channelMixRing.js', () => ({
   channelMixRingManager: {
     getOrCreate: vi.fn(() => ({ addMonoPcmInt16: vi.fn() })),
@@ -198,6 +203,50 @@ describe('VoiceConnectionManager.connect concurrency', () => {
       removesBeforeStaleCleanup
     );
     expect(connB.destroy).not.toHaveBeenCalled();
+  });
+
+  it('shares one permission check between concurrent callers for the same channel', async () => {
+    const manager = new VoiceConnectionManager();
+    const channel = makeChannel('ch-shared-check');
+    channel.permissionsFor.mockReturnValue({ has: () => false });
+
+    const results = await Promise.all([
+      manager.connect(makeGuild(channel) as never, channel as never),
+      manager.connect(makeGuild(channel) as never, channel as never),
+    ]);
+
+    expect(results).toEqual([null, null]);
+    expect(channel.permissionsFor).toHaveBeenCalledTimes(1);
+    expect(joinVoiceChannel).not.toHaveBeenCalled();
+  });
+
+  it('releases an in-flight reservation when that join fails', async () => {
+    const manager = new VoiceConnectionManager();
+    // Limit is 2: ch-1 and ch-2 reserve both slots while in flight.
+    const ch1 = makeChannel('ch-1', 'guild-a');
+    const ch2 = makeChannel('ch-2', 'guild-b');
+    const ch3 = makeChannel('ch-3', 'guild-c');
+    joinVoiceChannel
+      .mockImplementationOnce(() => makeConnectionMock())
+      .mockImplementationOnce(() => {
+        throw new Error('gateway closed');
+      });
+
+    const [r1, r2, r3] = await Promise.all([
+      manager.connect(makeGuild(ch1) as never, ch1 as never),
+      manager.connect(makeGuild(ch2) as never, ch2 as never),
+      manager.connect(makeGuild(ch3) as never, ch3 as never),
+    ]);
+    expect(r1).not.toBeNull();
+    expect(r2).toBeNull();
+    expect(r3).toBeNull();
+
+    // ch-2's failed join must not keep holding the second slot.
+    await expect(
+      manager.connect(makeGuild(ch3) as never, ch3 as never)
+    ).resolves.not.toBeNull();
+    expect(manager.getConnectionCount()).toBe(2);
+    expect(manager.isAtLimit()).toBe(true);
   });
 
   it('allocates no mix ring for a channel nobody speaks in', async () => {

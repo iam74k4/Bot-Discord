@@ -189,6 +189,178 @@ describe('voice daily stats rollup', () => {
     expect(stats.map((s) => s.channel_id).sort()).toEqual(['vc-a', 'vc-b']);
   });
 
+  it('records an open session and hands back its id', () => {
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'));
+    const first = voiceSessionRepository.startSession(
+      GUILD,
+      USER,
+      'vc-a',
+      '#vc-a'
+    );
+    const second = voiceSessionRepository.startSession(
+      GUILD,
+      'user-2',
+      'vc-a',
+      '#vc-a'
+    );
+
+    expect(second).toBeGreaterThan(first);
+    expect(
+      db.prepare('SELECT * FROM voice_sessions WHERE id = ?').get(first)
+    ).toMatchObject({
+      guild_id: GUILD,
+      user_id: USER,
+      channel_id: 'vc-a',
+      channel_name: '#vc-a',
+      joined_at: Date.now(),
+      left_at: null,
+      duration_ms: null,
+    });
+  });
+
+  it('closes a zero-length visit without adding it to the rollup', () => {
+    const id = voiceSessionRepository.startSession(GUILD, USER, 'vc-a', '#a');
+
+    // Same instant: the user bounced straight back out.
+    voiceSessionRepository.endSession(id);
+
+    expect(
+      db.prepare('SELECT left_at, duration_ms FROM voice_sessions').get()
+    ).toEqual({ left_at: Date.now(), duration_ms: 0 });
+    expect(rollupRows()).toHaveLength(0);
+  });
+
+  it('keeps the latest channel name when a channel is renamed mid-day', () => {
+    const first = voiceSessionRepository.startSession(
+      GUILD,
+      USER,
+      'vc-a',
+      'Old name'
+    );
+    vi.advanceTimersByTime(60_000);
+    voiceSessionRepository.endSession(first);
+    const second = voiceSessionRepository.startSession(
+      GUILD,
+      USER,
+      'vc-a',
+      'New name'
+    );
+    vi.advanceTimersByTime(60_000);
+    voiceSessionRepository.endSession(second);
+
+    expect(voiceSessionRepository.getUserChannelStats(GUILD, USER)).toEqual([
+      {
+        channel_id: 'vc-a',
+        channel_name: 'New name',
+        total_duration_ms: 120_000,
+        session_count: 2,
+      },
+    ]);
+  });
+
+  it('closes only the stale sessions of the guild being swept', () => {
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'));
+    const stale = voiceSessionRepository.startSession(
+      GUILD,
+      USER,
+      'vc-a',
+      '#a'
+    );
+    const otherGuild = voiceSessionRepository.startSession(
+      'guild-2',
+      USER,
+      'vc-b',
+      '#b'
+    );
+    const finished = recordSession('vc-c', 60_000);
+    vi.advanceTimersByTime(5 * 60_000);
+
+    expect(voiceSessionRepository.closeStaleSessionsForGuild(GUILD)).toBe(1);
+
+    const row = (id: number) =>
+      db
+        .prepare(
+          'SELECT joined_at, left_at, duration_ms FROM voice_sessions WHERE id = ?'
+        )
+        .get(id) as {
+        joined_at: number;
+        left_at: number | null;
+        duration_ms: number | null;
+      };
+    // No trustworthy end time: zero duration, not the whole offline window.
+    expect(row(stale).left_at).toBe(row(stale).joined_at);
+    expect(row(stale).duration_ms).toBe(0);
+    expect(row(otherGuild).left_at).toBeNull();
+    expect(row(finished).duration_ms).toBe(60_000);
+    expect(voiceSessionRepository.closeStaleSessionsForGuild(GUILD)).toBe(0);
+  });
+
+  it('reports how many stale sessions a global sweep closed', () => {
+    voiceSessionRepository.startSession(GUILD, USER, 'vc-a', '#a');
+    voiceSessionRepository.startSession('guild-2', USER, 'vc-b', '#b');
+    recordSession('vc-c', 60_000);
+
+    expect(voiceSessionRepository.closeAllStaleSessions()).toBe(2);
+    expect(voiceSessionRepository.closeAllStaleSessions()).toBe(0);
+  });
+
+  it('retains open sessions and sessions newer than the retention window', () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    closedSession('old', now - 10 * dayMs, 60_000);
+    closedSession('recent', now - 2 * dayMs, 60_000);
+    voiceSessionRepository.startSession(GUILD, USER, 'open', '#open');
+
+    expect(voiceSessionRepository.cleanupOldSessions(7)).toBe(1);
+
+    const remaining = (
+      db
+        .prepare('SELECT channel_id FROM voice_sessions ORDER BY channel_id')
+        .all() as Array<{ channel_id: string }>
+    ).map((r) => r.channel_id);
+    expect(remaining).toEqual(['open', 'recent']);
+  });
+
+  it('orders channel stats by time spent and scopes them to one user', () => {
+    recordSession('vc-short', 30_000);
+    recordSession('vc-long', 90_000);
+    recordSession('vc-short', 30_000);
+    const otherUser = voiceSessionRepository.startSession(
+      GUILD,
+      'user-2',
+      'vc-other',
+      '#vc-other'
+    );
+    vi.advanceTimersByTime(600_000);
+    voiceSessionRepository.endSession(otherUser);
+
+    expect(voiceSessionRepository.getUserChannelStats(GUILD, USER)).toEqual([
+      expect.objectContaining({
+        channel_id: 'vc-long',
+        total_duration_ms: 90_000,
+        session_count: 1,
+      }),
+      expect.objectContaining({
+        channel_id: 'vc-short',
+        total_duration_ms: 60_000,
+        session_count: 2,
+      }),
+    ]);
+    expect(voiceSessionRepository.getUserTotalDuration(GUILD, USER)).toBe(
+      150_000
+    );
+    expect(voiceSessionRepository.getUserTotalDuration('guild-2', USER)).toBe(
+      0
+    );
+  });
+
+  it('returns no channels and a zero total for a user with no history', () => {
+    expect(voiceSessionRepository.getUserChannelStats(GUILD, USER)).toEqual([]);
+    expect(
+      voiceSessionRepository.getUserTotalDuration(GUILD, USER, Date.now())
+    ).toBe(0);
+  });
+
   it('buckets a timestamp by the process timezone', () => {
     const noon = new Date(2026, 0, 15, 12, 0, 0).getTime();
     expect(dayKey(noon)).toBe('2026-01-15');

@@ -4,6 +4,12 @@ const disconnectOldest = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const getAllConnections = vi.hoisted(() => vi.fn());
 const getTotalMixBufferSizeMB = vi.hoisted(() => vi.fn().mockReturnValue(86));
 const sendAlert = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const logger = vi.hoisted(() => ({
+  error: vi.fn(),
+  warn: vi.fn(),
+  info: vi.fn(),
+  debug: vi.fn(),
+}));
 
 vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: { disconnectOldest, getAllConnections },
@@ -16,7 +22,7 @@ vi.mock('../recording/channelMixRing.js', () => ({
 vi.mock('../../../shared/utils/alert.js', () => ({ sendAlert }));
 
 vi.mock('../../../shared/utils/logger.js', () => ({
-  logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+  logger,
   getErrorMessage: (e: unknown) => String(e),
 }));
 
@@ -28,6 +34,7 @@ const { MemoryMonitor } = await import('../jobs/memoryMonitor.js');
 
 /** The monitor is built from what it is handed, not from ambient config. */
 const config = { MEMORY_LIMIT_MB: 1000 };
+const INTERVAL = 60_000;
 
 /** Fake three connected channels so shedding has something to drop. */
 function connections(count: number) {
@@ -51,10 +58,13 @@ describe('MemoryMonitor', () => {
     vi.clearAllMocks();
     getAllConnections.mockReturnValue(connections(3));
     getTotalMixBufferSizeMB.mockReturnValue(86);
+    sendAlert.mockResolvedValue(undefined);
+    disconnectOldest.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it('reports RSS, because mix rings live outside the V8 heap', async () => {
@@ -65,6 +75,7 @@ describe('MemoryMonitor', () => {
     expect(stats.heapUsedMB).toBeCloseTo(40);
     expect(stats.limitMB).toBe(1000);
     expect(stats.totalBufferSizeMB).toBe(86);
+    expect(stats.activeConnections).toBe(3);
   });
 
   it('sheds the oldest connections once RSS passes the critical ratio', async () => {
@@ -114,5 +125,196 @@ describe('MemoryMonitor', () => {
 
     release?.();
     await first;
+  });
+
+  it('checks again once the slow check has finished', async () => {
+    mockMemory(950);
+    const monitor = new MemoryMonitor(config);
+
+    await monitor['checkMemoryUsage']();
+    await monitor['checkMemoryUsage']();
+
+    expect(disconnectOldest).toHaveBeenCalledTimes(2);
+  });
+
+  describe('thresholds', () => {
+    it('treats exactly the critical threshold as critical', async () => {
+      mockMemory(850); // round(1000 * 0.85)
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(disconnectOldest).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats just under the critical threshold as a warning only', async () => {
+      mockMemory(849.9);
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(disconnectOldest).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Memory warning threshold exceeded')
+      );
+    });
+
+    it('treats exactly the warning threshold as a warning', async () => {
+      mockMemory(700); // round(1000 * 0.7)
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('>= 700MB')
+      );
+    });
+
+    it('stays silent just under the warning threshold', async () => {
+      mockMemory(699.9);
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('rounds thresholds derived from an uneven limit', async () => {
+      // 333 * 0.85 = 283.05 -> 283
+      mockMemory(283);
+      await new MemoryMonitor({ MEMORY_LIMIT_MB: 333 })['checkMemoryUsage']();
+
+      expect(disconnectOldest).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('critical response', () => {
+    it('alerts with the context an operator needs', async () => {
+      mockMemory(900);
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(sendAlert).toHaveBeenCalledWith(
+        'Critical Memory Threshold Exceeded',
+        '900.0MB RSS >= 850MB',
+        [
+          { name: 'Active Connections', value: '3' },
+          { name: 'Mix Buffers (MB)', value: '86.0' },
+          { name: 'Heap Used (MB)', value: '40.0' },
+        ]
+      );
+    });
+
+    it('sheds a third of the connections, oldest first', async () => {
+      mockMemory(900);
+      getAllConnections.mockReturnValue(connections(9));
+
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(disconnectOldest).toHaveBeenCalledWith(3);
+    });
+
+    it('always sheds at least one connection', async () => {
+      mockMemory(900);
+      getAllConnections.mockReturnValue(connections(2));
+
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(disconnectOldest).toHaveBeenCalledWith(1);
+    });
+
+    it('alerts but has nothing to shed with no connections', async () => {
+      mockMemory(900);
+      getAllConnections.mockReturnValue(connections(0));
+
+      await new MemoryMonitor(config)['checkMemoryUsage']();
+
+      expect(sendAlert).toHaveBeenCalled();
+      expect(disconnectOldest).not.toHaveBeenCalled();
+    });
+
+    it('still sheds when the alert webhook fails', async () => {
+      mockMemory(900);
+      sendAlert.mockRejectedValueOnce(new Error('webhook down'));
+
+      await expect(
+        new MemoryMonitor(config)['checkMemoryUsage']()
+      ).resolves.toBeUndefined();
+      expect(disconnectOldest).toHaveBeenCalledWith(1);
+    });
+  });
+
+  describe('scheduling', () => {
+    it('checks on every interval tick after start', async () => {
+      vi.useFakeTimers();
+      mockMemory(900);
+      const monitor = new MemoryMonitor(config);
+
+      monitor.start();
+      expect(disconnectOldest).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(INTERVAL);
+      expect(disconnectOldest).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(INTERVAL);
+      expect(disconnectOldest).toHaveBeenCalledTimes(2);
+
+      monitor.stop();
+    });
+
+    it('stops checking after stop', async () => {
+      vi.useFakeTimers();
+      mockMemory(900);
+      const monitor = new MemoryMonitor(config);
+
+      monitor.start();
+      monitor.stop();
+      await vi.advanceTimersByTimeAsync(INTERVAL * 3);
+
+      expect(disconnectOldest).not.toHaveBeenCalled();
+      expect(logger.info).toHaveBeenCalledWith('Memory monitor stopped');
+    });
+
+    it('refuses to start a second timer', async () => {
+      vi.useFakeTimers();
+      mockMemory(900);
+      const monitor = new MemoryMonitor(config);
+
+      monitor.start();
+      monitor.start();
+      await vi.advanceTimersByTimeAsync(INTERVAL);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Memory monitor is already running'
+      );
+      expect(disconnectOldest).toHaveBeenCalledTimes(1);
+
+      monitor.stop();
+    });
+
+    it('logs the limit and thresholds it was configured with', () => {
+      vi.useFakeTimers();
+      const monitor = new MemoryMonitor(config);
+
+      monitor.start();
+
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.stringMatching(/limit 1000MB.*700MB.*850MB RSS/)
+      );
+      monitor.stop();
+    });
+
+    it('treats stop without start as a no-op', () => {
+      const monitor = new MemoryMonitor(config);
+
+      expect(() => monitor.stop()).not.toThrow();
+      expect(logger.info).not.toHaveBeenCalled();
+    });
+
+    it('can be restarted after being stopped', async () => {
+      vi.useFakeTimers();
+      mockMemory(900);
+      const monitor = new MemoryMonitor(config);
+
+      monitor.start();
+      monitor.stop();
+      monitor.start();
+      await vi.advanceTimersByTimeAsync(INTERVAL);
+
+      expect(disconnectOldest).toHaveBeenCalledTimes(1);
+      monitor.stop();
+    });
   });
 });

@@ -6,9 +6,8 @@ vi.mock('../../../shared/utils/logger.js', () => ({
   getErrorMessage: (e: unknown) => String(e),
 }));
 
-vi.mock('../../../locales/guildLocale.js', () => ({
-  resolveGuildLocale: () => 'en',
-}));
+const resolveGuildLocale = vi.hoisted(() => vi.fn());
+vi.mock('../../../locales/guildLocale.js', () => ({ resolveGuildLocale }));
 
 vi.mock('../../../config/index.js', async () => {
   const actual = await vi.importActual<
@@ -19,6 +18,14 @@ vi.mock('../../../config/index.js', async () => {
 
 const { announceBuffering, forgetAnnouncement } =
   await import('../application/announce.js');
+const { t } = await import('../../../locales/index.js');
+const { COLORS } = await import('../../../shared/utils/constants/index.js');
+
+type SentPayload = {
+  embeds: Array<{
+    data: { title?: string; description?: string; color?: number };
+  }>;
+};
 
 function channelStub(
   options: { canSend?: boolean; send?: ReturnType<typeof vi.fn> } = {},
@@ -46,7 +53,9 @@ function channelStub(
 describe('announceBuffering', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resolveGuildLocale.mockReturnValue('en');
     forgetAnnouncement('voice-1');
+    forgetAnnouncement('voice-2');
   });
 
   it('posts the buffer window into the voice channel chat', async () => {
@@ -86,6 +95,79 @@ describe('announceBuffering', () => {
   it('stays quiet when it cannot post in the channel', async () => {
     const send = vi.fn().mockResolvedValue({});
     await announceBuffering(channelStub({ canSend: false, send }) as never);
+
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('builds the notice from the guild locale', async () => {
+    resolveGuildLocale.mockReturnValue('ja');
+    const send = vi.fn().mockResolvedValue({});
+
+    await announceBuffering(channelStub({ send }) as never);
+
+    // The Discord preferred locale is the fallback for the guild setting.
+    expect(resolveGuildLocale).toHaveBeenCalledWith('guild-1', 'en');
+    const embed = (send.mock.calls[0][0] as SentPayload).embeds[0].data;
+    expect(embed.title).toBe(t('record.notice.title', 'ja'));
+    expect(embed.description).toBe(
+      `${t('record.notice.body', 'ja', { minutes: 5 })}\n\n${t(
+        'record.notice.optOut',
+        'ja'
+      )}`
+    );
+    expect(embed.color).toBe(COLORS.WARNING);
+  });
+
+  it('tracks announcements per channel', async () => {
+    const send = vi.fn().mockResolvedValue({});
+
+    await announceBuffering(channelStub({ send }, 'voice-1') as never);
+    await announceBuffering(channelStub({ send }, 'voice-2') as never);
+
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['ViewChannel', PermissionFlagsBits.ViewChannel],
+    ['SendMessages', PermissionFlagsBits.SendMessages],
+  ])('stays quiet when only %s is missing', async (_label, missing) => {
+    const send = vi.fn().mockResolvedValue({});
+    const channel = channelStub({ send });
+    channel.permissionsFor.mockReturnValue({
+      has: (flag: bigint) => flag !== missing,
+    });
+
+    await announceBuffering(channel as never);
+
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('stays quiet when permissions cannot be resolved', async () => {
+    const send = vi.fn().mockResolvedValue({});
+    const channel = channelStub({ send });
+    channel.permissionsFor.mockReturnValue(null);
+
+    await announceBuffering(channel as never);
+
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('stays quiet when the bot member is not cached', async () => {
+    const send = vi.fn().mockResolvedValue({});
+    const channel = channelStub({ send });
+    (channel.guild.members as { me: unknown }).me = null;
+
+    await expect(announceBuffering(channel as never)).resolves.toBeUndefined();
+
+    expect(channel.permissionsFor).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('stays quiet in a voice channel without a text chat', async () => {
+    const send = vi.fn().mockResolvedValue({});
+    const channel = { ...channelStub({ send }), isTextBased: () => false };
+
+    await announceBuffering(channel as never);
 
     expect(send).not.toHaveBeenCalled();
   });
