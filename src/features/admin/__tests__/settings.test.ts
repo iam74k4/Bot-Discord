@@ -6,7 +6,15 @@ import {
   type ChatInputCommandInteraction,
   type Guild,
 } from 'discord.js';
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type Mock,
+} from 'vitest';
 import {
   GUILD_ID,
   USER_ID,
@@ -89,7 +97,7 @@ function setup(
   return { interaction, reply };
 }
 
-function replied(reply: ReturnType<typeof vi.fn>) {
+function replied(reply: Mock) {
   const payload = payloadOf<{ embeds: unknown[]; flags?: number }>(reply);
   return { payload, embed: embedAt(payload) };
 }
@@ -159,31 +167,28 @@ describe('executeSettingsCommand', () => {
     it.each([
       ['ja', 'ja', '日本語'],
       ['en', 'en', 'English'],
-    ])(
-      'stores %s and audit-logs the change',
-      async (lang, stored, display) => {
-        const { interaction, reply } = setup({ subcommand: 'language', lang });
+    ])('stores %s and audit-logs the change', async (lang, stored, display) => {
+      const { interaction, reply } = setup({ subcommand: 'language', lang });
 
-        await executeSettingsCommand(interaction);
+      await executeSettingsCommand(interaction);
 
-        expect(settingsRow(db)?.language).toBe(stored);
-        expect(auditRows(db)).toEqual([
-          {
-            action: 'SETTINGS_CHANGE',
-            user_id: USER_ID,
-            target_id: null,
-            details: `Language changed to: ${lang}`,
-          },
-        ]);
-        const { payload, embed } = replied(reply);
-        expect(payload.flags).toBe(MessageFlags.Ephemeral);
-        expect(embed.color).toBe(COLORS.SUCCESS);
-        expect(embed.description).toContain(
-          t('settings.language.changed', 'en', { language: display })
-        );
-        expect(embed.description).toContain('/admin settings view');
-      }
-    );
+      expect(settingsRow(db)?.language).toBe(stored);
+      expect(auditRows(db)).toEqual([
+        {
+          action: 'SETTINGS_CHANGE',
+          user_id: USER_ID,
+          target_id: null,
+          details: `Language changed to: ${lang}`,
+        },
+      ]);
+      const { payload, embed } = replied(reply);
+      expect(payload.flags).toBe(MessageFlags.Ephemeral);
+      expect(embed.color).toBe(COLORS.SUCCESS);
+      expect(embed.description).toContain(
+        t('settings.language.changed', 'en', { language: display })
+      );
+      expect(embed.description).toContain('/admin settings view');
+    });
 
     it('stores "auto" as NULL so replies follow each viewer', async () => {
       guildSettingsRepository.setLanguage(GUILD_ID, 'ja');

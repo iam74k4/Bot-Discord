@@ -55,20 +55,19 @@ describe('retry utility', () => {
       const error = new Error('network error');
       const fn = vi.fn().mockRejectedValue(error);
 
-      let caughtError: Error | null = null;
       const resultPromise = withRetry(fn, {
         maxRetries: 2,
         baseDelayMs: 100,
         shouldRetry: () => true,
-      }).catch((e) => {
-        caughtError = e;
       });
+      // Attach the expectation before advancing time so the rejection is
+      // never unhandled.
+      const rejection = expect(resultPromise).rejects.toBe(error);
 
       await vi.advanceTimersByTimeAsync(1000);
-      await resultPromise;
+      await rejection;
 
-      expect(caughtError).not.toBeNull();
-      expect(caughtError?.message).toBe('network error');
+      await expect(resultPromise).rejects.toThrow('network error');
       expect(fn).toHaveBeenCalledTimes(3);
     });
 

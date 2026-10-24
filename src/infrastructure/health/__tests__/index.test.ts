@@ -221,8 +221,7 @@ describe('health service', () => {
     });
 
     it('returns degraded when memory percentage > 90%', () => {
-      const originalMemoryUsage = process.memoryUsage;
-      process.memoryUsage = vi.fn().mockReturnValue({
+      const memoryUsage = vi.spyOn(process, 'memoryUsage').mockReturnValue({
         heapUsed: 950 * 1024 * 1024,
         heapTotal: 1000 * 1024 * 1024,
         rss: 0,
@@ -230,13 +229,15 @@ describe('health service', () => {
         arrayBuffers: 0,
       });
 
-      const mockClient = createMockClient({ isReady: true, ping: 50 });
-      const health = getHealthStatus(mockClient);
+      try {
+        const mockClient = createMockClient({ isReady: true, ping: 50 });
+        const health = getHealthStatus(mockClient);
 
-      expect(health.memory.percentage).toBeGreaterThan(90);
-      expect(health.status).toBe('degraded');
-
-      process.memoryUsage = originalMemoryUsage;
+        expect(health.memory.percentage).toBeGreaterThan(90);
+        expect(health.status).toBe('degraded');
+      } finally {
+        memoryUsage.mockRestore();
+      }
     });
   });
 });

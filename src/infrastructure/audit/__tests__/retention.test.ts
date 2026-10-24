@@ -50,6 +50,30 @@ describe('audit log retention', () => {
     expect(deleteOldLogs).toHaveBeenCalledTimes(2);
   });
 
+  it('logs how many entries a purge removed', async () => {
+    const { startAuditRetention, stopAuditRetention } =
+      await import('../retention.js');
+
+    startAuditRetention();
+
+    expect(loggerInfo).toHaveBeenCalledWith('Cleaned up 2 old audit log(s)');
+
+    stopAuditRetention();
+  });
+
+  it('stays quiet when nothing was old enough to purge', async () => {
+    deleteOldLogs.mockReturnValueOnce(0);
+    const { startAuditRetention, stopAuditRetention } =
+      await import('../retention.js');
+
+    startAuditRetention();
+
+    expect(deleteOldLogs).toHaveBeenCalledTimes(1);
+    expect(loggerInfo).not.toHaveBeenCalled();
+
+    stopAuditRetention();
+  });
+
   it('can be restarted after a stop', async () => {
     const { startAuditRetention, stopAuditRetention } =
       await import('../retention.js');

@@ -69,6 +69,7 @@ describe('BackupService', () => {
         async (filePath: string) => {
           fs.mkdirSync(path.dirname(filePath), { recursive: true });
           fs.writeFileSync(filePath, 'mock backup content');
+          return { totalPages: 1, remainingPages: 0 };
         }
       );
 

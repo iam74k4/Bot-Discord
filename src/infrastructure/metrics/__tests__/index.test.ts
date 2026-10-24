@@ -1,3 +1,4 @@
+import { beforeEach, describe, expect, it } from 'vitest';
 import { metrics } from '../index.js';
 
 describe('metrics service', () => {

@@ -80,13 +80,15 @@ vi.mock('../../../locales/guildLocale.js', async (importOriginal) => ({
 
 // The real config, loaded with a known owner (OWNER_ID in general.helpers).
 vi.mock('../../../config/env.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../../config/env.js')>();
+  const actual =
+    await importOriginal<typeof import('../../../config/env.js')>();
   actual.loadConfig({ BOT_OWNER_IDS: 'owner-1' });
   return actual;
 });
 
 const NOW = new Date('2026-05-01T12:00:00Z');
-const MANAGE_BOTH = PermissionFlagsBits.ManageGuild | PermissionFlagsBits.ManageRoles;
+const MANAGE_BOTH =
+  PermissionFlagsBits.ManageGuild | PermissionFlagsBits.ManageRoles;
 
 const GENERAL: LocalizedText = { en: 'General', ja: '一般' };
 const COMMUNITY: LocalizedText = { en: 'Community', ja: 'コミュニティ' };
@@ -349,6 +351,19 @@ describe('/general help overview', () => {
       '一般',
       'コミュニティ',
       '管理者',
+    ]);
+  });
+
+  it('does not tag commands explicitly open to everyone', async () => {
+    const open = helpCommand(
+      new SlashCommandBuilder().setName('open').setDescription('Open to all'),
+      { category: GENERAL, permission: ['everyone'] }
+    );
+
+    const { reply } = await runHelp({ commands: [open] });
+
+    expect(embedAt(reply).fields).toEqual([
+      field('General', [line('open', 'Open to all')]),
     ]);
   });
 
@@ -630,6 +645,30 @@ describe('/general help command:<name>', () => {
     expect(embedAt(reply).title).toBe(t('help.commandNotFound', 'en'));
   });
 
+  it('leaves out the usage field when an entry has no usage', async () => {
+    // A group with no subcommands has no leaves, so nothing to show.
+    const hollow = helpCommand(
+      new SlashCommandBuilder()
+        .setName('hollow')
+        .setDescription('h')
+        .addSubcommandGroup((group) =>
+          group.setName('empty').setDescription('Nothing yet')
+        ),
+      { category: GENERAL }
+    );
+
+    const { reply } = await runHelp({
+      commands: [hollow],
+      commandOption: 'hollow empty',
+    });
+
+    expect(embedAt(reply)).toMatchObject({
+      title: '/hollow empty',
+      description: 'Nothing yet',
+    });
+    expect(embedAt(reply).fields).toBeUndefined();
+  });
+
   it('matches only full entry names', async () => {
     const { reply } = await runHelp({ commandOption: 'alpha' });
 
@@ -694,7 +733,9 @@ describe('/general help autocomplete', () => {
 
     const choices = await suggest({ focused: 'alpha o' });
 
-    expect(choices).toEqual([{ name: 'alpha one - 一つ目', value: 'alpha one' }]);
+    expect(choices).toEqual([
+      { name: 'alpha one - 一つ目', value: 'alpha one' },
+    ]);
   });
 
   it('responds with no choices when nothing matches', async () => {
@@ -719,22 +760,6 @@ describe('/general help autocomplete', () => {
       { name: `wordy long - ${'L'.repeat(59)}...`, value: 'wordy long' },
       { name: `wordy exact - ${exact}`, value: 'wordy exact' },
     ]);
-  });
-
-  it('keeps every label within Discord’s 100-character choice limit', async () => {
-    const longest = helpCommand(
-      new SlashCommandBuilder()
-        .setName('a'.repeat(32))
-        .setDescription('d')
-        .addSubcommand((sub) =>
-          sub.setName('b'.repeat(32)).setDescription('x'.repeat(100))
-        ),
-      { category: GENERAL }
-    );
-
-    const [choice] = await suggest({ commands: [longest], focused: '' });
-
-    expect(choice.name.length).toBeLessThanOrEqual(100);
   });
 
   it('returns at most 25 choices', async () => {
@@ -895,6 +920,34 @@ describe('/general help with the real command definitions', () => {
     await autocompleteHelpCommand(suggestions.interaction);
     expect(suggestions.respond).toHaveBeenCalledWith([]);
   });
+
+  it.each<Locale>(['en', 'ja'])(
+    'keeps every autocomplete choice within Discord’s 100-character limit (%s)',
+    async (locale) => {
+      resolveLocale.mockReturnValue(locale);
+      const choices: Array<{ name: string; value: string }> = [];
+
+      // Query per entry: one empty query would stop at 25 choices.
+      for (const entry of entries) {
+        const stub = autocompleteInteraction({
+          commands,
+          userId: OWNER_ID,
+          permissions: MANAGE_BOTH,
+          focused: entry.name,
+        });
+        await autocompleteHelpCommand(stub.interaction);
+        choices.push(...(stub.respond.mock.calls[0][0] as typeof choices));
+      }
+
+      expect(choices.map((c) => c.value)).toEqual(
+        expect.arrayContaining(entries.map((e) => e.name))
+      );
+      for (const choice of choices) {
+        expect(choice.name.length, choice.name).toBeLessThanOrEqual(100);
+        expect(choice.value.length, choice.value).toBeLessThanOrEqual(100);
+      }
+    }
+  );
 
   it('shows /owner entries to the bot owner, tagged as owner-only', async () => {
     const { reply } = await openPanel({ commands, userId: OWNER_ID });

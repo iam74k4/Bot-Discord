@@ -1,13 +1,25 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import Database, { type Database as DatabaseType } from 'better-sqlite3';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const prepare = vi.hoisted(() => vi.fn());
+const { prepare, exec, pragma } = vi.hoisted(() => ({
+  prepare: vi.fn(),
+  exec: vi.fn(),
+  pragma: vi.fn(),
+}));
 
 vi.mock('../../database/connection.js', () => ({
-  database: { prepare },
+  database: { prepare, exec, pragma },
+}));
+
+const logger = vi.hoisted(() => ({
+  error: vi.fn(),
+  warn: vi.fn(),
+  info: vi.fn(),
+  debug: vi.fn(),
 }));
 
 vi.mock('../../../shared/utils/logger.js', () => ({
-  logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+  logger,
   getErrorMessage: (e: unknown) => String(e),
 }));
 
@@ -142,6 +154,146 @@ describe('guildSettingsRepository', () => {
     it('reports the opt-out once it is stored', () => {
       stubDatabase({ ...existingRow, voice_autojoin_enabled: 0 });
       expect(guildSettingsRepository.isVoiceAutoJoinEnabled('g1')).toBe(false);
+    });
+
+    it('skips a guild whose announcement channel cannot be read', () => {
+      prepare.mockImplementation(() => {
+        throw new Error('database disk image is malformed');
+      });
+      // A broadcast walks every guild; one bad row must not abort it.
+      expect(guildSettingsRepository.getAnnouncementChannel('g1')).toBeNull();
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.stringContaining('announcement channel for guild g1')
+      );
+    });
+  });
+
+  /**
+   * The stubs above pin the SQL each call issues; these run the same calls
+   * through real SQLite and the real migrations, so they check what a guild's
+   * row actually ends up holding.
+   */
+  describe('against SQLite', () => {
+    const NOW = new Date('2026-08-01T00:00:00Z').getTime();
+    let db: DatabaseType;
+
+    beforeEach(async () => {
+      db = new Database(':memory:');
+      prepare.mockImplementation((sql: string) => db.prepare(sql));
+      exec.mockImplementation((sql: string) => db.exec(sql));
+      pragma.mockImplementation((source: string) => db.pragma(source));
+      for (const migration of await Promise.all([
+        import('../../database/migrations/003_settings.js'),
+        import('../../database/migrations/007_voice_autojoin.js'),
+        import('../../database/migrations/008_announcement_channel.js'),
+      ])) {
+        migration.up();
+      }
+      vi.useFakeTimers();
+      vi.setSystemTime(NOW);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      db.close();
+    });
+
+    it('reports the documented defaults for a guild with no row', () => {
+      expect(guildSettingsRepository.get('g1')).toBeNull();
+      expect(guildSettingsRepository.getLanguage('g1')).toBeNull();
+      expect(guildSettingsRepository.getAuditChannel('g1')).toBeNull();
+      expect(guildSettingsRepository.getAnnouncementChannel('g1')).toBeNull();
+      expect(guildSettingsRepository.isVoiceAutoJoinEnabled('g1')).toBe(true);
+    });
+
+    it('creates a row with defaults, not the column default language', () => {
+      guildSettingsRepository.setAnnouncementChannel('g1', 'news');
+
+      // The table's DEFAULT 'ja' must not apply: an unset language means
+      // "follow each viewer", and inserting for another setting must not
+      // pin the guild to Japanese.
+      expect(guildSettingsRepository.get('g1')).toEqual({
+        guild_id: 'g1',
+        language: null,
+        audit_channel_id: null,
+        announcement_channel_id: 'news',
+        voice_autojoin_enabled: 1,
+        created_at: NOW,
+        updated_at: NOW,
+      });
+    });
+
+    it('creates an all-default row when an update names no fields', () => {
+      guildSettingsRepository.update('g1', {});
+
+      expect(guildSettingsRepository.get('g1')).toMatchObject({
+        language: null,
+        audit_channel_id: null,
+        announcement_channel_id: null,
+        voice_autojoin_enabled: 1,
+      });
+    });
+
+    it('keeps other fields and created_at on update, and bumps updated_at', () => {
+      guildSettingsRepository.setLanguage('g1', 'en');
+      vi.setSystemTime(NOW + 5_000);
+
+      guildSettingsRepository.setAuditChannel('g1', 'audit-chan');
+
+      expect(guildSettingsRepository.get('g1')).toMatchObject({
+        language: 'en',
+        audit_channel_id: 'audit-chan',
+        created_at: NOW,
+        updated_at: NOW + 5_000,
+      });
+    });
+
+    it('writes several fields in one update', () => {
+      guildSettingsRepository.setAuditChannel('g1', 'audit-chan');
+
+      guildSettingsRepository.update('g1', {
+        language: 'ja',
+        announcement_channel_id: 'news',
+        voice_autojoin_enabled: 0,
+      });
+
+      expect(guildSettingsRepository.get('g1')).toMatchObject({
+        language: 'ja',
+        audit_channel_id: 'audit-chan',
+        announcement_channel_id: 'news',
+        voice_autojoin_enabled: 0,
+      });
+    });
+
+    it('clears a setting when it is set to null', () => {
+      guildSettingsRepository.setLanguage('g1', 'en');
+      guildSettingsRepository.setAuditChannel('g1', 'audit-chan');
+      guildSettingsRepository.setAnnouncementChannel('g1', 'news');
+
+      guildSettingsRepository.setLanguage('g1', null);
+      guildSettingsRepository.setAuditChannel('g1', null);
+      guildSettingsRepository.setAnnouncementChannel('g1', null);
+
+      expect(guildSettingsRepository.getLanguage('g1')).toBeNull();
+      expect(guildSettingsRepository.getAuditChannel('g1')).toBeNull();
+      expect(guildSettingsRepository.getAnnouncementChannel('g1')).toBeNull();
+    });
+
+    it('round-trips the voice auto-join switch', () => {
+      guildSettingsRepository.setVoiceAutoJoinEnabled('g1', false);
+      expect(guildSettingsRepository.isVoiceAutoJoinEnabled('g1')).toBe(false);
+
+      guildSettingsRepository.setVoiceAutoJoinEnabled('g1', true);
+      expect(guildSettingsRepository.isVoiceAutoJoinEnabled('g1')).toBe(true);
+    });
+
+    it('keeps each guild separate', () => {
+      guildSettingsRepository.setLanguage('g1', 'en');
+      guildSettingsRepository.setVoiceAutoJoinEnabled('g1', false);
+
+      expect(guildSettingsRepository.getLanguage('g2')).toBeNull();
+      expect(guildSettingsRepository.isVoiceAutoJoinEnabled('g2')).toBe(true);
+      expect(guildSettingsRepository.get('g2')).toBeNull();
     });
   });
 });

@@ -69,6 +69,9 @@ interface Scenario {
   fetchTarget?: 'member' | 'missing' | 'plain-object';
   fetchActor?: 'member' | 'missing';
   permissions?: PermissionsBitField | string;
+  /** `null` = the interaction carries no member object. */
+  member?: null;
+  ownerId?: string;
   inGuild?: boolean;
   rolesAdd?: Mock;
   rolesRemove?: Mock;
@@ -107,7 +110,7 @@ function setup(s: Scenario = {}) {
 
   const guild: Record<string, unknown> = {
     id: GUILD_ID,
-    ownerId: OWNER_ID,
+    ownerId: s.ownerId ?? OWNER_ID,
     roles: {
       cache: new Collection(
         s.roleCached === false ? [] : [[role.id, { ...role }]]
@@ -153,11 +156,14 @@ function setup(s: Scenario = {}) {
     guildId: s.inGuild === false ? null : GUILD_ID,
     locale: 'en-US',
     user: { id: ACTOR_ID, tag: 'Mod#0001' },
-    member: {
-      permissions:
-        s.permissions ??
-        new PermissionsBitField(PermissionFlagsBits.ManageRoles),
-    },
+    member:
+      s.member === null
+        ? null
+        : {
+            permissions:
+              s.permissions ??
+              new PermissionsBitField(PermissionFlagsBits.ManageRoles),
+          },
     client: clientStub(),
     options: {
       getUser: vi.fn(() => ({ id: targetId, tag: 'Member#0001' })),
@@ -213,6 +219,16 @@ describe('executeRoleCommand', () => {
       );
       expect(fetch).not.toHaveBeenCalled();
       expect(rolesAdd).not.toHaveBeenCalled();
+    });
+
+    it('denies when the interaction carries no member', async () => {
+      const { interaction, reply } = setup({ member: null });
+
+      await executeRoleCommand(interaction);
+
+      expect(replyEmbed(reply).description).toBe(
+        t('admin.role.errors.noPermission', 'en')
+      );
     });
 
     it('denies when member permissions arrive unresolved', async () => {
@@ -374,6 +390,24 @@ describe('executeRoleCommand', () => {
         expect(rolesAdd).not.toHaveBeenCalled();
       }
     );
+  });
+
+  describe('guild owner as target', () => {
+    it('is refused by the bot even when the owner targets themselves', async () => {
+      // Nobody, the bot included, can edit the owner's roles via the API.
+      const { interaction, reply, rolesAdd } = setup({
+        ownerId: ACTOR_ID,
+        targetId: ACTOR_ID,
+        actor: 10,
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(replyEmbed(reply).description).toBe(
+        t('admin.role.errors.botTargetMemberHierarchy', 'en')
+      );
+      expect(rolesAdd).not.toHaveBeenCalled();
+    });
   });
 
   describe('add', () => {

@@ -7,7 +7,15 @@ import {
   type ChatInputCommandInteraction,
   type Guild,
 } from 'discord.js';
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type Mock,
+} from 'vitest';
 import {
   GUILD_ID,
   USER_ID,
@@ -76,7 +84,7 @@ function setup(options: { guild?: Guild | null } = {}) {
 }
 
 /** The last payload the panel re-rendered with after a component. */
-function lastUpdate(component: { update: ReturnType<typeof vi.fn> }) {
+function lastUpdate(component: { update: Mock }) {
   return payloadOf<{ embeds: unknown[]; components: unknown[] }>(
     component.update,
     component.update.mock.calls.length - 1
@@ -103,7 +111,9 @@ describe('showSettingsPanel', () => {
     );
     expect(payload.flags).toBe(MessageFlags.Ephemeral);
     expect(embedAt(payload).description).toBe(t('common.guildOnly', 'en'));
-    expect(harness.message.createMessageComponentCollector).not.toHaveBeenCalled();
+    expect(
+      harness.message.createMessageComponentCollector
+    ).not.toHaveBeenCalled();
   });
 
   describe('overview tab', () => {
@@ -163,6 +173,15 @@ describe('showSettingsPanel', () => {
       ]);
     });
 
+    it('shows a stored language code it has no name for as-is', async () => {
+      guildSettingsRepository.setLanguage(GUILD_ID, 'ko');
+      const { interaction, harness } = setup();
+
+      await showSettingsPanel(interaction, 'en');
+
+      expect(embedAt(payloadOf(harness.reply)).fields?.[0]?.value).toBe('ko');
+    });
+
     it('keeps the panel alive for two minutes', async () => {
       const { interaction, harness } = setup();
 
@@ -187,9 +206,9 @@ describe('showSettingsPanel', () => {
         `**${t('settings.language.auto', 'en')}**`
       );
       const [tabs, select] = rowsOf(payload.components);
-      expect(tabs!.find((c) => c.style === ButtonStyle.Primary)?.custom_id).toBe(
-        'settings-panel:language'
-      );
+      expect(
+        tabs!.find((c) => c.style === ButtonStyle.Primary)?.custom_id
+      ).toBe('settings-panel:language');
       expect(select![0]!.custom_id).toBe('settings-panel:language-select');
       expect(
         select![0]!.options?.map((o) => [o.value, o.default ?? false])
@@ -221,8 +240,7 @@ describe('showSettingsPanel', () => {
       const update = lastUpdate(select);
       expect(embedAt(update).description).toContain('**English**');
       expect(
-        rowsOf(update.components)[1]![0]!.options?.find((o) => o.default)
-          ?.value
+        rowsOf(update.components)[1]![0]!.options?.find((o) => o.default)?.value
       ).toBe('en');
     });
 
@@ -405,19 +423,22 @@ describe('showSettingsPanel', () => {
         targetId: 'member-9',
         baseTime: at + 60_000,
       });
-      insertAuditLogs(db, 1, { action: 'SETTINGS_CHANGE', baseTime: at + 120_000 });
+      insertAuditLogs(db, 1, {
+        action: 'SETTINGS_CHANGE',
+        baseTime: at + 120_000,
+      });
       const { interaction, harness } = setup();
 
       await showSettingsPanel(interaction, 'en', 'logs');
 
       // Newest first; channel targets render as channels, others as users.
-      expect(embedAt(payloadOf(harness.reply)).description?.split('\n')).toEqual(
-        [
-          `<t:${(at + 120_000) / 1000}:R> <@actor-0> **SETTINGS CHANGE**`,
-          `<t:${(at + 60_000) / 1000}:R> <@actor-0> **ROLE ADD** → <@member-9>`,
-          `<t:${at / 1000}:R> <@actor-0> **AUDIT SETUP** → <#chan-9>`,
-        ]
-      );
+      expect(
+        embedAt(payloadOf(harness.reply)).description?.split('\n')
+      ).toEqual([
+        `<t:${(at + 120_000) / 1000}:R> <@actor-0> **SETTINGS CHANGE**`,
+        `<t:${(at + 60_000) / 1000}:R> <@actor-0> **ROLE ADD** → <@member-9>`,
+        `<t:${at / 1000}:R> <@actor-0> **AUDIT SETUP** → <#chan-9>`,
+      ]);
     });
 
     it('pages through logs ten at a time and stops at both ends', async () => {
@@ -484,7 +505,9 @@ describe('showSettingsPanel', () => {
       const { interaction, harness } = setup();
       await showSettingsPanel(interaction, 'en', 'overview');
 
-      await harness.collect(componentStub('button', 'settings-panel:logs-next'));
+      await harness.collect(
+        componentStub('button', 'settings-panel:logs-next')
+      );
       const toLogs = componentStub('button', 'settings-panel:logs');
       await harness.collect(toLogs);
 
@@ -520,7 +543,9 @@ describe('showSettingsPanel', () => {
       const { interaction, harness } = setup();
       await showSettingsPanel(interaction, 'en', 'logs');
 
-      await harness.collect(componentStub('button', 'settings-panel:logs-next'));
+      await harness.collect(
+        componentStub('button', 'settings-panel:logs-next')
+      );
       await harness.collect(componentStub('button', 'settings-panel:overview'));
       const back = componentStub('button', 'settings-panel:logs');
       await harness.collect(back);
@@ -533,7 +558,9 @@ describe('showSettingsPanel', () => {
       const { interaction, harness } = setup();
       await showSettingsPanel(interaction, 'en', 'logs');
 
-      await harness.collect(componentStub('button', 'settings-panel:logs-next'));
+      await harness.collect(
+        componentStub('button', 'settings-panel:logs-next')
+      );
       const again = componentStub('button', 'settings-panel:logs');
       await harness.collect(again);
 

@@ -13,6 +13,7 @@ import {
   expect,
   it,
   vi,
+  type Mock,
 } from 'vitest';
 import {
   USER_ID,
@@ -68,7 +69,8 @@ const { t } = await import('../../../locales/index.js');
 const { COLORS } = await import('../../../shared/utils/constants/index.js');
 const { getHealthStatus, formatHealthStatus } =
   await import('../../../infrastructure/health/index.js');
-const { backupService } = await import('../../../infrastructure/backup/index.js');
+const { backupService } =
+  await import('../../../infrastructure/backup/index.js');
 
 const BACKUP_LIST = '`backup-1.db` 12 KB';
 
@@ -90,7 +92,7 @@ function setup(guilds: Guild[] = [], channelCount = 0) {
 
 type Payload = { embeds: unknown[]; components: unknown[]; flags?: number };
 
-function lastUpdate(component: { update: ReturnType<typeof vi.fn> }) {
+function lastUpdate(component: { update: Mock }) {
   return payloadOf<Payload>(
     component.update,
     component.update.mock.calls.length - 1
@@ -128,17 +130,18 @@ describe('showAdminSystemPanel', () => {
 
     const payload = payloadOf<Payload>(harness.reply);
     expect(payload.flags).toBe(MessageFlags.Ephemeral);
-    expect(rowsOf(payload.components).map((r) => r.map((c) => c.custom_id)))
-      .toEqual([
-        [
-          'admin-panel:stats',
-          'admin-panel:db',
-          'admin-panel:guilds',
-          'admin-panel:health',
-          'admin-panel:metrics',
-        ],
-        ['admin-panel:backups', 'admin-panel:refresh', 'admin-panel:run-backup'],
-      ]);
+    expect(
+      rowsOf(payload.components).map((r) => r.map((c) => c.custom_id))
+    ).toEqual([
+      [
+        'admin-panel:stats',
+        'admin-panel:db',
+        'admin-panel:guilds',
+        'admin-panel:health',
+        'admin-panel:metrics',
+      ],
+      ['admin-panel:backups', 'admin-panel:refresh', 'admin-panel:run-backup'],
+    ]);
     expect(activeTab(payload)).toBe('admin-panel:stats');
     expect(
       harness.message.createMessageComponentCollector
@@ -203,9 +206,9 @@ describe('showAdminSystemPanel', () => {
       await showAdminSystemPanel(interaction, 'en', 'db');
       spy.mockRestore();
 
-      expect(embedAt(payloadOf<Payload>(harness.reply)).fields?.[0]?.value).toBe(
-        t('common.noData', 'en')
-      );
+      expect(
+        embedAt(payloadOf<Payload>(harness.reply)).fields?.[0]?.value
+      ).toBe(t('common.noData', 'en'));
     });
 
     it('guilds: lists the 20 largest guilds, largest first', async () => {
@@ -216,9 +219,9 @@ describe('showAdminSystemPanel', () => {
 
       await showAdminSystemPanel(interaction, 'en', 'guilds');
 
-      const lines = embedAt(payloadOf<Payload>(harness.reply)).description?.split(
-        '\n'
-      );
+      const lines = embedAt(
+        payloadOf<Payload>(harness.reply)
+      ).description?.split('\n');
       expect(lines).toHaveLength(20);
       expect(lines?.[0]).toBe(`1. **Guild 24** (${(240).toLocaleString()})`);
       expect(lines?.[19]).toBe(`20. **Guild 5** (${(50).toLocaleString()})`);
