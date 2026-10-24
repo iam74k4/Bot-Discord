@@ -50,19 +50,73 @@ const logger = vi.hoisted(() => ({
   error: vi.fn(),
 }));
 
-/** Stand-in for the voice connection manager: one buffered channel. */
+/**
+ * Stand-in for the voice connection manager: one buffered channel, joins that
+ * are ready at once, and one audio player per connection for text-to-speech.
+ */
 const voice = vi.hoisted(() => {
   const connections = new Map<
     string,
-    { channelId: string; guildId: string; connectedAt: number }
+    {
+      channelId: string;
+      guildId: string;
+      connectedAt: number;
+      /** False for a join made only to read aloud (nothing is buffered). */
+      receiving?: boolean;
+    }
   >();
+  // Enough of an @discordjs/voice AudioPlayer for playback to start and be
+  // cut short: like the real one, stopping it reports it idle.
+  const playerListeners = new Map<string, Set<() => void>>();
+  const player = {
+    play: vi.fn(),
+    stop: vi.fn(() => {
+      for (const listener of [...(playerListeners.get('idle') ?? [])]) {
+        listener();
+      }
+      return true;
+    }),
+    on: vi.fn((event: string, listener: () => void) => {
+      const listeners = playerListeners.get(event) ?? new Set();
+      playerListeners.set(event, listeners.add(listener));
+      return player;
+    }),
+    off: vi.fn((event: string, listener: () => void) => {
+      playerListeners.get(event)?.delete(listener);
+      return player;
+    }),
+  };
   return {
     connections,
+    player,
     manager: {
       getConnection: vi.fn((channelId: string) => connections.get(channelId)),
       getAllConnections: vi.fn(() => new Map(connections)),
       getConnectionCount: vi.fn(() => connections.size),
       isAtLimit: vi.fn(() => false),
+      connect: vi.fn(
+        async (
+          guild: { id: string },
+          channel: { id: string },
+          options: { receive?: boolean } = {}
+        ) => {
+          const connection = {
+            channelId: channel.id,
+            guildId: guild.id,
+            connectedAt: Date.now(),
+            receiving: options.receive !== false,
+          };
+          connections.set(channel.id, connection);
+          return connection;
+        }
+      ),
+      waitUntilReady: vi.fn(async (channelId: string) =>
+        connections.has(channelId)
+      ),
+      getPlayer: vi.fn((channelId: string) =>
+        connections.has(channelId) ? player : undefined
+      ),
+      setSelfMute: vi.fn((channelId: string) => connections.has(channelId)),
       disconnect: vi.fn(async (channelId: string) => {
         connections.delete(channelId);
       }),
@@ -73,6 +127,28 @@ const voice = vi.hoisted(() => {
       duration: options.duration,
       isSplit: false,
     })),
+  };
+});
+
+/**
+ * Stand-in for a VOICEVOX engine that is configured and up. The ids are the
+ * engine's real ones; 1 is listed because a run without autocomplete
+ * suggestions sends the ordinary sample integer, 1, as `speaker`.
+ */
+const voicevox = vi.hoisted(() => {
+  const voices = [
+    { id: 3, character: 'ずんだもん', style: 'ノーマル' },
+    { id: 2, character: '四国めたん', style: 'ノーマル' },
+    { id: 1, character: 'ずんだもん', style: 'あまあま' },
+  ];
+  return {
+    client: {
+      isAvailable: vi.fn(async () => true),
+      listVoices: vi.fn(async () => [...voices]),
+      findVoice: vi.fn(async (id: number) => voices.find((v) => v.id === id)),
+      // 20 ms of 48 kHz stereo s16le silence.
+      synthesize: vi.fn(async () => Buffer.alloc(3840)),
+    },
   };
 });
 
@@ -124,6 +200,16 @@ vi.mock(
   })
 );
 
+vi.mock(
+  '../../../features/voice/tts/voicevoxClient.js',
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import('../../../features/voice/tts/voicevoxClient.js')
+    >()),
+    getVoicevoxClient: () => voicevox.client,
+  })
+);
+
 import {
   ActionRowBuilder,
   ApplicationCommandOptionType,
@@ -158,9 +244,12 @@ import { notificationChannelRepository } from '../../../features/notification/re
 import { voiceSessionRepository } from '../../../features/notification/repositories/voiceSessionRepository.js';
 import { pollRepository } from '../../../features/community/poll/index.js';
 import { voiceSettingsRepository } from '../../../features/voice/repositories/voiceSettingsRepository.js';
+import { ttsRepository } from '../../../features/voice/repositories/ttsRepository.js';
+import { ttsSessions } from '../../../features/voice/tts/sessionManager.js';
 import {
   COMMAND_POLICY,
   DISCORD_OPTION_BOUNDS,
+  IDS,
   INJECTED_FAILURE,
   KNOWN_HELP_OVERREACH,
   autocompleteFor,
@@ -200,6 +289,29 @@ const commands = await loadCommands();
 const paths = commandPaths(commands);
 const KNOWN_REFERENCES = pathPrefixes(paths);
 const POLL_MESSAGE_ID = '300000000000000050';
+
+/**
+ * Read the text channel aloud into the caller's voice channel, as someone
+ * else there started it: anyone in the channel may stop or skip, not only
+ * whoever started.
+ */
+function startReading(world: SmokeWorld): void {
+  ttsSessions.start({
+    guildId: world.guild.id,
+    voiceChannelId: world.voiceChannel.id,
+    textChannelId: world.textChannel.id,
+    startedBy: IDS.friendA,
+  });
+}
+
+/** The value the harness fills `option` of `label` with, unsuggested. */
+function plainValueOf(world: SmokeWorld, label: string, option: string) {
+  const declared = paths
+    .find((path) => path.label === label)
+    ?.options.find((candidate) => candidate.name === option);
+  if (!declared) throw new Error(`no option "${option}" on /${label}`);
+  return sampleOption(world, declared, true, undefined, 'required').value;
+}
 
 /**
  * Prior state for paths that cannot succeed from an empty server: you can
@@ -258,6 +370,43 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
       world.textChannel.id
     );
   },
+  'tts start': () => {
+    // The bot is in no voice channel yet, so starting has to join one.
+    voice.connections.clear();
+  },
+  'tts stop': (world) => {
+    // The bot joined only to read (nothing is buffered), so stopping also
+    // leaves the channel.
+    voice.connections.set(world.voiceChannel.id, {
+      channelId: world.voiceChannel.id,
+      guildId: world.guild.id,
+      connectedAt: Date.now(),
+      receiving: false,
+    });
+    startReading(world);
+  },
+  'tts skip': (world) => {
+    // Someone else's line, still being rendered or already playing (the
+    // queue picks it up at once, so either way there is a line to skip).
+    startReading(world);
+    ttsSessions.enqueue(world.voiceChannel.id, {
+      authorId: IDS.friendA,
+      authorName: 'smoke-friend-a',
+      text: 'スモークテスト',
+      speakerId: 3,
+      speed: 1,
+    });
+  },
+  'tts dict remove': (world) => {
+    // A word the caller added, spelled the way the harness fills `word`
+    // without a suggestion; autocomplete then suggests this same word.
+    ttsRepository.upsertDictionaryEntry(
+      world.guild.id,
+      String(plainValueOf(world, 'tts dict remove', 'word')),
+      'すもーく',
+      world.actor.id
+    );
+  },
   'voice autojoin enable': (world) => {
     // Auto-join defaults to on; start from off so enabling has work to do.
     voiceSettingsRepository.setAutoJoinEnabled(world.guild.id, false);
@@ -300,6 +449,8 @@ afterEach(() => {
   for (const command of commands) {
     clearCooldown(command.json.name, world.actor.id);
   }
+  // Nor a reading session: the next test's server starts silent.
+  ttsSessions.stopAll();
   vi.useRealTimers();
 });
 
@@ -772,6 +923,8 @@ const KNOWN_EDITORS = new Set([
   'community roulette member',
   'general ping',
   'owner backup run',
+  'tts start',
+  'tts voice',
   'voice record',
 ]);
 
@@ -961,8 +1114,13 @@ describe('every autocomplete option', () => {
 
   it('suggests something for an empty query, which the server runs use', async () => {
     expect(AUTOCOMPLETE_CASES.length).toBeGreaterThan(0);
-    for (const [, { path }] of AUTOCOMPLETE_CASES) {
-      expect((await suggestionsFor(path)).size).toBeGreaterThan(0);
+    for (const path of new Set(AUTOCOMPLETE_CASES.map(([, c]) => c.path))) {
+      // In the state the server runs give the path (a word to remove).
+      SCENARIOS[path.label]?.(world);
+      expect(
+        (await suggestionsFor(path)).size,
+        `/${path.label}`
+      ).toBeGreaterThan(0);
     }
   });
 });
@@ -1246,6 +1404,65 @@ const REACHES: Array<{
         notificationChannelRepository.getEnabled(w.guild.id, 'member_join')
       ).toBeNull(),
   },
+  {
+    label: 'tts start',
+    reached: (w) => {
+      // Joined listening, since this server lets the bot buffer audio.
+      expect(voice.manager.connect).toHaveBeenCalledWith(
+        w.guild,
+        w.voiceChannel,
+        { receive: true }
+      );
+      const session = ttsSessions.get(w.voiceChannel.id);
+      expect(session?.startedBy).toBe(w.actor.id);
+      expect([...(session?.textChannelIds ?? [])].sort()).toEqual(
+        [w.textChannel.id, w.voiceChannel.id].sort()
+      );
+    },
+  },
+  {
+    label: 'tts stop',
+    reached: (w) => {
+      expect(ttsSessions.getForGuild(w.guild.id)).toBeUndefined();
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+    },
+  },
+  {
+    label: 'tts skip',
+    reached: (w) => {
+      // The line was cut short and the session reads on.
+      expect(voice.player.stop).toHaveBeenCalledWith(true);
+      expect(ttsSessions.get(w.voiceChannel.id)).toBeDefined();
+      expect(voice.manager.disconnect).not.toHaveBeenCalled();
+    },
+  },
+  {
+    label: 'tts voice',
+    // With no option there is nothing to change.
+    fill: 'all',
+    reached: (w) =>
+      expect(ttsRepository.getUserSettings(w.actor.id)).toEqual({
+        speakerId: plainValueOf(w, 'tts voice', 'speaker'),
+        speed: plainValueOf(w, 'tts voice', 'speed'),
+      }),
+  },
+  {
+    label: 'tts dict add',
+    reached: (w) => {
+      expect(ttsRepository.listDictionary(w.guild.id)).toEqual([
+        {
+          word: plainValueOf(w, 'tts dict add', 'word'),
+          reading: plainValueOf(w, 'tts dict add', 'reading'),
+          createdBy: w.actor.id,
+        },
+      ]);
+    },
+  },
+  {
+    label: 'tts dict remove',
+    reached: (w) =>
+      expect(ttsRepository.listDictionary(w.guild.id)).toEqual([]),
+  },
 ];
 
 /**
@@ -1268,6 +1485,7 @@ const READ_ONLY = new Set([
   'owner system health',
   'owner system metrics',
   'owner backup list',
+  'tts dict list',
   'voice status',
 ]);
 
