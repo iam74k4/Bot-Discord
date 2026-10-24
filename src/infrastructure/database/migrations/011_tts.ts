@@ -6,7 +6,9 @@ import { database } from '../connection.js';
  * Voice choice follows the person rather than the server - someone who picked
  * a voice once should sound the same everywhere the bot reads for them - so it
  * is keyed by user alone. The reading dictionary is a server's own vocabulary
- * (member nicknames, in-jokes, game terms) and is keyed by guild.
+ * (member nicknames, in-jokes, game terms) and is keyed by guild. Words are
+ * case-insensitive (NOCASE), matching how they are applied to chat, so "ABC"
+ * and "abc" are one entry rather than two where only one could ever win.
  */
 export function up(): void {
   database.exec(`
@@ -21,7 +23,7 @@ export function up(): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS tts_dictionary (
       guild_id TEXT NOT NULL,
-      word TEXT NOT NULL,
+      word TEXT NOT NULL COLLATE NOCASE,
       reading TEXT NOT NULL,
       created_by TEXT NOT NULL,
       created_at INTEGER NOT NULL,

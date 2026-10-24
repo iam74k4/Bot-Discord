@@ -129,7 +129,10 @@ describe('extractPcm', () => {
     });
 
     it('a non-PCM format', () => {
-      const wav = riff(chunk('fmt ', fmtBody({ format: 3 })), chunk('data', PCM));
+      const wav = riff(
+        chunk('fmt ', fmtBody({ format: 3 })),
+        chunk('data', PCM)
+      );
       expect(() => extractPcm(wav)).toThrow('unsupported format 3');
     });
 

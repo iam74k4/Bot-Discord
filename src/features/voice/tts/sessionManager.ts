@@ -213,7 +213,9 @@ export class TtsSessionManager {
     }
     session.queue.push({ request, spoken });
 
-    void this.pump(session);
+    this.pump(session).catch((error: unknown) => {
+      logger.error('TTS queue stopped:', getErrorMessage(error));
+    });
     return true;
   }
 
@@ -263,7 +265,12 @@ export class TtsSessionManager {
           this.stop(session.info.voiceChannelId, { restoreMute: false });
           break;
         }
-        await this.deps.play(player, pcm);
+        try {
+          await this.deps.play(player, pcm);
+        } catch (error) {
+          // One clip that cannot play must not strand the lines behind it.
+          logger.warn(`TTS playback failed: ${getErrorMessage(error)}`);
+        }
       }
     } finally {
       session.playing = false;

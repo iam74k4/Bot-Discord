@@ -153,7 +153,8 @@ async function handleStart(
     return;
   }
 
-  if (!connectionManager.getConnection(voiceChannel.id)) {
+  const joinedNow = !connectionManager.getConnection(voiceChannel.id);
+  if (joinedNow) {
     // Reading never overrides a server's choice not to have audio buffered:
     // where auto-join is off, the bot joins deafened and keeps nothing.
     const receive = voiceSettingsRepository.mayAutoJoin(
@@ -184,6 +185,10 @@ async function handleStart(
       CONNECT_TIMEOUT_MS
     ))
   ) {
+    // Without a session nothing would ever remove a join made for reading.
+    if (joinedNow) {
+      await connectionManager.disconnect(voiceChannel.id);
+    }
     await replyError(
       interaction,
       t('tts.errors.cannotJoin', locale),

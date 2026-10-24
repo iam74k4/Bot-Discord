@@ -112,6 +112,7 @@ function upsertDictionaryEntry(
       `INSERT INTO tts_dictionary (guild_id, word, reading, created_by, created_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(guild_id, word) DO UPDATE SET
+         word = excluded.word,
          reading = excluded.reading,
          created_by = excluded.created_by,
          created_at = excluded.created_at`

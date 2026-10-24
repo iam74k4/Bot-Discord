@@ -90,8 +90,15 @@ describe('applyDictionary', () => {
     expect(applyDictionary('a.b a+b', [{ word: '.', reading: 'ドット' }])).toBe(
       'aドットb a+b'
     );
-    expect(applyDictionary('C++ と C', [{ word: 'C++', reading: 'しーぷら' }])).toBe(
-      'しーぷら と C'
+    expect(
+      applyDictionary('C++ と C', [{ word: 'C++', reading: 'しーぷら' }])
+    ).toBe('しーぷら と C');
+  });
+
+  it('leaves a case-insensitive match it cannot map back to a rule untouched', () => {
+    // /σ/i also matches final sigma ς, whose lower case is not σ.
+    expect(applyDictionary('ς σ', [{ word: 'σ', reading: 'しぐま' }])).toBe(
+      'ς しぐま'
     );
   });
 
