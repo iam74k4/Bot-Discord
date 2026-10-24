@@ -210,7 +210,9 @@ describe('executeRecordCommand split delivery', () => {
     const incomplete = payloads.find(
       (payload) =>
         Array.isArray(payload.embeds) &&
-        JSON.stringify(payload.embeds).includes('Delivery Incomplete')
+        JSON.stringify(payload.embeds).includes(
+          t('record.errors.deliveryIncomplete', 'en')
+        )
     );
 
     expect(incomplete).toBeDefined();
@@ -228,7 +230,9 @@ describe('executeRecordCommand split delivery', () => {
     const incomplete = payloads.find(
       (payload) =>
         Array.isArray(payload.embeds) &&
-        JSON.stringify(payload.embeds).includes('Delivery Incomplete')
+        JSON.stringify(payload.embeds).includes(
+          t('record.errors.deliveryIncomplete', 'en')
+        )
     );
 
     expect(incomplete).toBeUndefined();
@@ -298,6 +302,78 @@ describe('executeRecordCommand split delivery', () => {
       t('record.errors.deliveryIncomplete', 'en')
     );
   });
+
+  it('backs off exponentially between split-part retries', async () => {
+    vi.useFakeTimers();
+    limits.retryMax = 3;
+    let calls = 0;
+    // Call 1 is the main file; the extra part fails three times, then lands.
+    // Three retries are needed to tell 1s/2s/4s apart from 1s/2s/3s.
+    const interaction = createRecordInteraction(async () => {
+      calls += 1;
+      if (calls >= 2 && calls <= 4) throw new Error('rate limited');
+      return {};
+    });
+    const followUps = () => vi.mocked(interaction.followUp).mock.calls.length;
+
+    const run = executeRecordCommand(interaction);
+    for (const [delay, attemptsSoFar] of [
+      [1000, 2],
+      [2000, 3],
+      [4000, 4],
+    ] as const) {
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(followUps()).toBe(attemptsSoFar);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(followUps()).toBe(attemptsSoFar + 1);
+    }
+    await run;
+
+    const payloads = payloadsOf(interaction.followUp);
+    expect(payloads).toHaveLength(5);
+    expect(payloads[4].content).toBe('Part 2/2');
+    expect(JSON.stringify(payloads)).not.toContain(
+      t('record.errors.deliveryIncomplete', 'en')
+    );
+  });
+
+  it('warns about missing parts in the caller language', async () => {
+    let calls = 0;
+    const interaction = createRecordInteraction(
+      async () => {
+        calls += 1;
+        if (calls === 1) return {};
+        throw new Error('upload failed');
+      },
+      { locale: 'ja' }
+    );
+
+    await executeRecordCommand(interaction);
+
+    const payloads = payloadsOf(interaction.followUp);
+    const last = payloads[payloads.length - 1];
+    expect(last.flags).toBe(MessageFlags.Ephemeral);
+    const warning = last.embeds![0].toJSON();
+    expect(warning.title).toBe(t('record.errors.deliveryIncomplete', 'ja'));
+    expect(warning.description).toBe(
+      t('record.errors.deliveryIncompleteDesc', 'ja', { parts: '2', total: 2 })
+    );
+  });
+
+  // KNOWN BUG (locales en.ts / ja.ts record.errors.deliveryIncompleteDesc):
+  // the warning above tells users to retry `/record`, which no longer exists;
+  // recording is `/voice record`. `it.fails` keeps the suite green until the
+  // text is fixed; then these start failing and should become plain `it`.
+  for (const locale of ['en', 'ja'] as const) {
+    it.fails(`points ${locale} users at /voice record to retry`, () => {
+      expect(
+        t('record.errors.deliveryIncompleteDesc', locale, {
+          parts: '2',
+          total: 2,
+        })
+      ).toContain('`/voice record`');
+    });
+  }
 
   it('lists every part that could not be delivered', async () => {
     recordAudio.mockResolvedValue({

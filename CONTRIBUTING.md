@@ -64,7 +64,14 @@ No manual registration in `features/index.ts` is needed.
 - Shared utility tests may live under `src/shared/**/__tests__/`
 - Infrastructure tests may live under `src/infrastructure/**/__tests__/`
 - Run tests: `npm test`
-- Run with coverage: `npm run test:coverage`
+- Run with coverage: `npm run test:coverage` (CI runs this and fails below the
+  floors in `vitest.config.ts`)
+- New slash commands are exercised automatically by
+  `src/__tests__/integration/commands/`; still add a test for what the command
+  does
+- Test files are type-checked by `npm run type-check`
+- See [`docs/quality.md`](docs/quality.md#testing) for conventions such as
+  `it.fails` markers for known bugs
 
 All PRs should include tests for new functionality.
 

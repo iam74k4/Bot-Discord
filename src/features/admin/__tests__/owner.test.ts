@@ -61,7 +61,8 @@ const { t } = await import('../../../locales/index.js');
 const { COLORS } = await import('../../../shared/utils/constants/index.js');
 const { showAdminSystemPanel } = await import('../application/systemPanel.js');
 const { awaitConfirmation } = await import('../../../shared/utils/confirm.js');
-const { backupService } = await import('../../../infrastructure/backup/index.js');
+const { backupService } =
+  await import('../../../infrastructure/backup/index.js');
 const { guildSettingsRepository } =
   await import('../../../infrastructure/guildSettings/index.js');
 const { logger } = await import('../../../shared/utils/logger.js');
@@ -147,26 +148,29 @@ describe('executeOwnerCommand', () => {
       ['system', 'broadcast'],
       ['backup', 'run'],
       ['backup', 'list'],
-    ])('refuses %s %s to anyone but the bot owner', async (group, subcommand) => {
-      const { guild } = optedInGuild('g1');
-      const { interaction, reply } = setup({
-        group,
-        subcommand,
-        userId: 'someone-else',
-        guilds: [guild],
-      });
+    ])(
+      'refuses %s %s to anyone but the bot owner',
+      async (group, subcommand) => {
+        const { guild } = optedInGuild('g1');
+        const { interaction, reply } = setup({
+          group,
+          subcommand,
+          userId: 'someone-else',
+          guilds: [guild],
+        });
 
-      await executeOwnerCommand(interaction);
+        await executeOwnerCommand(interaction);
 
-      const payload = payloadOf<Payload>(reply);
-      expect(payload.flags).toBe(MessageFlags.Ephemeral);
-      expect(embedAt(payload).description).toBe(
-        t('owner.errors.ownerOnly', 'en')
-      );
-      expect(showAdminSystemPanel).not.toHaveBeenCalled();
-      expect(awaitConfirmation).not.toHaveBeenCalled();
-      expect(backupService.runBackup).not.toHaveBeenCalled();
-    });
+        const payload = payloadOf<Payload>(reply);
+        expect(payload.flags).toBe(MessageFlags.Ephemeral);
+        expect(embedAt(payload).description).toBe(
+          t('owner.errors.ownerOnly', 'en')
+        );
+        expect(showAdminSystemPanel).not.toHaveBeenCalled();
+        expect(awaitConfirmation).not.toHaveBeenCalled();
+        expect(backupService.runBackup).not.toHaveBeenCalled();
+      }
+    );
   });
 
   describe('panel routing', () => {
@@ -182,7 +186,11 @@ describe('executeOwnerCommand', () => {
 
       await executeOwnerCommand(interaction);
 
-      expect(showAdminSystemPanel).toHaveBeenCalledWith(interaction, 'ja', view);
+      expect(showAdminSystemPanel).toHaveBeenCalledWith(
+        interaction,
+        'ja',
+        view
+      );
     });
 
     it.each([
@@ -283,6 +291,8 @@ describe('executeOwnerCommand', () => {
 
       const result = lastEdit(editReply);
       expect(result.content).toBe('');
+      // The source hard-codes this title per locale rather than using a key.
+      expect(embedAt(result).title).toBe('Broadcast Complete');
       expect(embedAt(result).description).toBe(
         t('owner.broadcast.complete', 'en', {
           sent: 1,
@@ -299,6 +309,37 @@ describe('executeOwnerCommand', () => {
       expect(logger.debug).toHaveBeenCalledWith(
         'Failed to send broadcast to guild g4:',
         expect.stringContaining('Missing Access')
+      );
+    });
+
+    it('reports the result in Japanese for a Japanese client', async () => {
+      const { guild } = optedInGuild('g1');
+      const { interaction, editReply } = setup({
+        subcommand: 'broadcast',
+        locale: 'ja',
+        guilds: [guild, guildStub({ id: 'g2' })],
+      });
+
+      await executeOwnerCommand(interaction);
+
+      expect(awaitConfirmation).toHaveBeenCalledWith(
+        interaction,
+        t('owner.broadcast.confirm', 'ja', {
+          count: 1,
+          total: 2,
+          message: 'Hello servers',
+        }),
+        expect.anything()
+      );
+      const result = embedAt(lastEdit(editReply));
+      expect(result.title).toBe('一斉通知完了');
+      expect(result.description).toBe(
+        t('owner.broadcast.complete', 'ja', {
+          sent: 1,
+          failed: 0,
+          skipped: 1,
+          capNote: '',
+        })
       );
     });
 
@@ -331,7 +372,9 @@ describe('executeOwnerCommand', () => {
     });
 
     it('caps the fan-out at 250 guilds and says how many were left out', async () => {
-      const opted = Array.from({ length: 260 }, (_, i) => optedInGuild(`g${i}`));
+      const opted = Array.from({ length: 260 }, (_, i) =>
+        optedInGuild(`g${i}`)
+      );
       const { interaction, editReply } = setup({
         subcommand: 'broadcast',
         guilds: opted.map((o) => o.guild),
@@ -341,8 +384,9 @@ describe('executeOwnerCommand', () => {
 
       const sentTo = opted.filter((o) => o.channel.send.mock.calls.length > 0);
       expect(sentTo).toHaveLength(250);
-      expect(opted.slice(250).every((o) => !o.channel.send.mock.calls.length))
-        .toBe(true);
+      expect(
+        opted.slice(250).every((o) => !o.channel.send.mock.calls.length)
+      ).toBe(true);
 
       expect(awaitConfirmation).toHaveBeenCalledWith(
         interaction,
@@ -354,8 +398,7 @@ describe('executeOwnerCommand', () => {
         expect.anything()
       );
 
-      // Initial progress, one every 12 guilds (20), the final guild, result.
-      expect(editReply).toHaveBeenCalledTimes(23);
+      // Progress names the cap from the first edit to the last one.
       expect(payloadOf<Payload>(editReply, 0).content).toBe(
         t('owner.broadcast.progress', 'en', {
           processed: 0,
@@ -365,11 +408,13 @@ describe('executeOwnerCommand', () => {
           capNote: ' [250/260]',
         })
       );
-      expect(payloadOf<Payload>(editReply, 1).content).toBe(
+      expect(
+        payloadOf<Payload>(editReply, editReply.mock.calls.length - 2).content
+      ).toBe(
         t('owner.broadcast.progress', 'en', {
-          processed: 12,
+          processed: 250,
           total: 250,
-          sent: 12,
+          sent: 250,
           failed: 0,
           capNote: ' (cap 250/260 guilds)',
         })
@@ -384,6 +429,43 @@ describe('executeOwnerCommand', () => {
             total: 260,
           }),
         })
+      );
+    });
+
+    it('clears the confirmation buttons, then reports progress every 12 guilds and on the last', async () => {
+      const opted = Array.from({ length: 25 }, (_, i) =>
+        optedInGuild(`g${i}`, { canSend: i !== 5 })
+      );
+      const { interaction, editReply } = setup({
+        subcommand: 'broadcast',
+        guilds: opted.map((o) => o.guild),
+      });
+
+      await executeOwnerCommand(interaction);
+
+      const progress = (processed: number, sent: number, failed: number) =>
+        t('owner.broadcast.progress', 'en', {
+          processed,
+          total: 25,
+          sent,
+          failed,
+          capNote: '',
+        });
+      // The first edit replaces the confirmation prompt: leaving its
+      // (disabled) Confirm/Cancel buttons up for the whole run would mislead.
+      expect(payloadOf<Payload>(editReply, 0)).toEqual({
+        content: progress(0, 0, 0),
+        embeds: [],
+        components: [],
+      });
+      expect(editReply.mock.calls.map(([p]) => (p as Payload).content)).toEqual(
+        [
+          progress(0, 0, 0),
+          progress(12, 11, 1),
+          progress(24, 23, 1),
+          progress(25, 24, 1),
+          '',
+        ]
       );
     });
 
@@ -465,13 +547,15 @@ describe('executeOwnerCommand', () => {
       await executeOwnerCommand(interaction);
 
       expect(editReply).toHaveBeenCalledTimes(2);
-      expect(payloadOf<Payload>(editReply, 0)).toMatchObject({
+      // Progress text and titles are hard-coded per locale in the source.
+      expect(payloadOf<Payload>(editReply, 0)).toEqual({
         embeds: [],
         components: [],
-        content: expect.any(String),
+        content: 'Running backup...',
       });
       const result = lastEdit(editReply);
       expect(result.content).toBe('');
+      expect(embedAt(result).title).toBe('Backup Complete');
       expect(embedAt(result).description).toBe(
         t('owner.backup.complete', 'en', {
           filename: 'backup-2026-10-24.db',
@@ -492,32 +576,62 @@ describe('executeOwnerCommand', () => {
 
       await executeOwnerCommand(interaction);
 
-      expect(embedAt(lastEdit(editReply)).description).toBe(
+      expect(payloadOf<Payload>(editReply, 0).content).toBe(
+        'バックアップを実行中...'
+      );
+      const result = embedAt(lastEdit(editReply));
+      expect(result.title).toBe('バックアップ完了');
+      expect(result.description).toBe(
         t('owner.backup.complete', 'ja', { filename: 'b.db', size: 2 })
       );
     });
 
     it.each([
-      ['the reported error', 'SQLITE_BUSY', 'SQLITE_BUSY'],
-      ['a fallback when none is given', undefined, 'Unknown error occurred'],
-    ])('reports a failed backup with %s', async (_case, error, shown) => {
-      vi.mocked(backupService.runBackup).mockResolvedValue({
-        success: false,
-        filename: '',
-        size: 0,
-        timestamp: new Date(0),
-        error,
-      });
-      const { interaction, editReply } = runBackup();
+      [
+        'the reported error',
+        'SQLITE_BUSY',
+        'SQLITE_BUSY',
+        'en',
+        'Backup Failed',
+      ],
+      [
+        'a fallback when none is given',
+        undefined,
+        'Unknown error occurred',
+        'en',
+        'Backup Failed',
+      ],
+      [
+        'the reported error in Japanese',
+        'SQLITE_BUSY',
+        'SQLITE_BUSY',
+        'ja',
+        'バックアップ失敗',
+      ],
+    ] as const)(
+      'reports a failed backup with %s',
+      async (_case, error, shown, locale, title) => {
+        vi.mocked(backupService.runBackup).mockResolvedValue({
+          success: false,
+          filename: '',
+          size: 0,
+          timestamp: new Date(0),
+          error,
+        });
+        const { interaction, editReply } = runBackup(
+          locale === 'ja' ? 'ja' : 'en-US'
+        );
 
-      await executeOwnerCommand(interaction);
+        await executeOwnerCommand(interaction);
 
-      const result = lastEdit(editReply);
-      expect(result.content).toBe('');
-      expect(embedAt(result).description).toBe(
-        t('owner.backup.failed', 'en', { error: shown })
-      );
-      expect(embedAt(result).color).toBe(COLORS.ERROR);
-    });
+        const result = lastEdit(editReply);
+        expect(result.content).toBe('');
+        expect(embedAt(result).title).toBe(title);
+        expect(embedAt(result).description).toBe(
+          t('owner.backup.failed', locale, { error: shown })
+        );
+        expect(embedAt(result).color).toBe(COLORS.ERROR);
+      }
+    );
   });
 });

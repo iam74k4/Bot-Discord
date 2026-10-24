@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PermissionFlagsBits } from 'discord.js';
+import { logger } from '../../../shared/utils/logger.js';
 import { VoiceConnectionManager } from '../recording/connectionManager.js';
 import { channelMixRingManager } from '../recording/channelMixRing.js';
 
 const joinVoiceChannel = vi.hoisted(() => vi.fn());
 const entersState = vi.hoisted(() => vi.fn((c: unknown) => Promise.resolve(c)));
+/** MAX_CONCURRENT_VC_CONNECTIONS; each manager caches it on first use. */
+const limitState = vi.hoisted(() => ({ max: 2 }));
 
 vi.mock('@discordjs/voice', () => ({
   joinVoiceChannel,
@@ -37,7 +40,9 @@ vi.mock('prism-media', () => ({
 
 vi.mock('../../../config/index.js', () => ({
   env: {
-    MAX_CONCURRENT_VC_CONNECTIONS: 2,
+    get MAX_CONCURRENT_VC_CONNECTIONS() {
+      return limitState.max;
+    },
   },
   AUDIO: {
     SAMPLE_RATE: 48000,
@@ -88,9 +93,19 @@ function makeConnectionMock() {
   };
 }
 
+/** Log line for a join refused because the guild already has a channel. */
+function guildConflict(guildId: string, heldId: string, refusedId: string) {
+  return expect.stringContaining(
+    `Already connected in guild ${guildId} (channel ${heldId}). Cannot connect to ${refusedId}`
+  );
+}
+
+const LIMIT_REACHED = expect.stringContaining('Connection limit reached');
+
 describe('VoiceConnectionManager.connect concurrency', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    limitState.max = 2;
     joinVoiceChannel.mockImplementation(() => makeConnectionMock());
   });
 
@@ -138,20 +153,97 @@ describe('VoiceConnectionManager.connect concurrency', () => {
     expect(joinVoiceChannel).toHaveBeenCalledTimes(1);
     expect(manager.getConnection('ch-a')).toBeDefined();
     expect(manager.getConnection('ch-b')).toBeUndefined();
+    // Refused up front, before any permission lookup for the second channel.
+    expect(chB.permissionsFor).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      guildConflict('guild-shared', 'ch-a', 'ch-b')
+    );
   });
 
-  it('refuses concurrent joins to different channels in the same guild', async () => {
+  it('lets the first of two concurrent joins in one guild win and refuses the second', async () => {
     const manager = new VoiceConnectionManager();
     const chA = makeChannel('ch-a2', 'guild-race');
     const chB = makeChannel('ch-b2', 'guild-race');
 
-    const results = await Promise.all([
+    const [resultA, resultB] = await Promise.all([
       manager.connect(makeGuild(chA) as never, chA as never),
       manager.connect(makeGuild(chB) as never, chB as never),
     ]);
-    const successes = results.filter((r) => r !== null);
-    expect(successes).toHaveLength(1);
+
+    expect(resultA).not.toBeNull();
+    expect(resultB).toBeNull();
+    expect(manager.getConnection('ch-a2')?.connection).toBe(resultA);
+    expect(manager.getConnection('ch-b2')).toBeUndefined();
     expect(joinVoiceChannel).toHaveBeenCalledTimes(1);
+    expect(joinVoiceChannel).toHaveBeenCalledWith(
+      expect.objectContaining({ channelId: 'ch-a2', guildId: 'guild-race' })
+    );
+    // The in-flight join already holds the guild, so the second caller is
+    // turned away before its permissions are even checked.
+    expect(chB.permissionsFor).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      guildConflict('guild-race', 'ch-a2', 'ch-b2')
+    );
+  });
+
+  describe('with MAX_CONCURRENT_VC_CONNECTIONS = 1', () => {
+    beforeEach(() => {
+      limitState.max = 1;
+    });
+
+    it('reports a second channel in the same guild as a guild conflict, not as the limit', async () => {
+      const manager = new VoiceConnectionManager();
+      const chA = makeChannel('ch-solo-a', 'guild-solo');
+      const chB = makeChannel('ch-solo-b', 'guild-solo');
+
+      await manager.connect(makeGuild(chA) as never, chA as never);
+      const second = await manager.connect(
+        makeGuild(chB) as never,
+        chB as never
+      );
+
+      expect(second).toBeNull();
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        guildConflict('guild-solo', 'ch-solo-a', 'ch-solo-b')
+      );
+      expect(logger.warn).not.toHaveBeenCalledWith(LIMIT_REACHED);
+    });
+
+    it('reports a concurrent same-guild join as a guild conflict, not as the limit', async () => {
+      const manager = new VoiceConnectionManager();
+      const chA = makeChannel('ch-solo-a', 'guild-solo');
+      const chB = makeChannel('ch-solo-b', 'guild-solo');
+
+      const [resultA, resultB] = await Promise.all([
+        manager.connect(makeGuild(chA) as never, chA as never),
+        manager.connect(makeGuild(chB) as never, chB as never),
+      ]);
+
+      expect(resultA).not.toBeNull();
+      expect(resultB).toBeNull();
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        guildConflict('guild-solo', 'ch-solo-a', 'ch-solo-b')
+      );
+      expect(logger.warn).not.toHaveBeenCalledWith(LIMIT_REACHED);
+    });
+
+    it('still refuses another guild once the single slot is taken', async () => {
+      const manager = new VoiceConnectionManager();
+      const chA = makeChannel('ch-solo-a', 'guild-solo');
+      const other = makeChannel('ch-other', 'guild-other');
+
+      await manager.connect(makeGuild(chA) as never, chA as never);
+      await expect(
+        manager.connect(makeGuild(other) as never, other as never)
+      ).resolves.toBeNull();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Connection limit reached (1). Cannot connect to channel ch-other'
+      );
+      expect(other.permissionsFor).not.toHaveBeenCalled();
+    });
   });
 
   it('does not let a stale disconnect handler destroy a replacement connection', async () => {

@@ -48,7 +48,7 @@ This document describes the quality standards and practices for this Discord bot
 - Run `npm audit` (full tree) and `npm audit --omit=dev --audit-level=high` (matches CI) regularly or before releases.
 - **One-shot diagnosis**: `./scripts/audit-all.sh` runs both audits in order; use before releases and paste the terminal output into a PR or issue (do not commit generated audit JSON/HTML reports to the repo).
 - **Scheduled visibility**: `.github/workflows/dependency-audit.yml` runs a non-blocking weekly full-tree audit and uploads the JSON report as an artifact for triage.
-- **`package.json` overrides**: Some patched versions are pinned via `overrides` (e.g. `undici`, `flatted`) when upstream packages have not yet adopted a fixed release. Revisit after dependency upgrades: try removing an override and run `npm install` + audit; restore the override if advisories return. **Last check**: with overrides removed, `npm audit` reported high-severity `undici` issues via `discord.js` / `@discordjs/rest`; keep both overrides until upstream resolves the nested `undici` version.
+- **`package.json` overrides**: Some patched versions are pinned via `overrides` (e.g. `undici`, `flatted`) when upstream packages have not yet adopted a fixed release. Revisit after dependency upgrades: try removing an override and run `npm install` + audit; restore the override if advisories return. **Last check**: with overrides removed, `npm audit` reported high-severity `undici` issues via `discord.js` / `@discordjs/rest`; keep both overrides until upstream resolves the nested `undici` version. `undici` is pinned to 6.29.1 for GHSA-xjj6-f33q-929c (high) and GHSA-4qv8-2p9j-2685 (moderate), which affect 6.29.0.
 - **Dependabot**: Review weekly PRs for `npm` and `github-actions`. The PR cap is intentionally higher so security updates are less likely to queue behind routine bumps. Action bumps use commit SHA pins—merge security-related updates promptly.
 - **Code scanning**: The repository includes a GitHub Actions CodeQL workflow (`javascript-typescript`) on `main` / `develop`; fix or suppress findings per GitHub’s guidance.
 - **Native dependencies**: `better-sqlite3` and `sodium-native` are intentional for runtime performance and Discord voice compatibility. Keep them on supported Node.js versions, update them through Dependabot or explicit review, and re-run build/test/audit after every bump because they include platform-specific install/build paths.
@@ -60,6 +60,27 @@ This document describes the quality standards and practices for this Discord bot
 - Shared and infrastructure code may also colocate tests under their own `__tests__/` directories.
 - Use `getErrorMessage` pattern in mocks.
 - Integration tests for backup, admin commands.
+- **Every command is covered automatically.** `src/__tests__/integration/commands/commandPayload.test.ts`
+  checks every slash command against Discord's registration limits, and
+  `allCommands.smoke.test.ts` executes every command and subcommand path and
+  asserts it is acknowledged exactly once. A new command is picked up with no
+  extra test code; give it a dedicated test for its behaviour.
+- **Coverage is enforced in CI.** CI runs `npm run test:coverage`, which fails
+  below the floors in `vitest.config.ts`. Raise the floors when coverage grows;
+  do not lower them to make a change pass.
+- **Tests are type-checked.** `npm run type-check` also runs
+  `tsc -p tsconfig.test.json`, which includes the `__tests__` directories that
+  the build config excludes.
+- **Known bugs are pinned with `it.fails`.** A test that describes the correct
+  behaviour of a reported, not-yet-fixed bug is marked `it.fails` with a
+  comment naming the bug. It flips to failing the moment the bug is fixed,
+  which is the signal to change it to `it`.
+- **Assert behaviour, not wiring.** The suite was hardened with mutation
+  testing (deliberately breaking conditions, calls and boundaries in the
+  source and checking a test fails); prefer assertions that would catch such a
+  change over call-count or call-order checks.
+- Database tests use an in-memory SQLite (`new Database(':memory:')`) with the
+  real migrations, never `data/*.db`; time-based tests use fake timers.
 
 ## Localization
 

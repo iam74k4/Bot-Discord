@@ -20,13 +20,14 @@ export default defineConfig({
         'src/app-scripts/**', // CLI maintenance scripts
         'src/events/**', // Discord event handlers (integration)
       ],
-      // Current minimum thresholds: lines 46%, functions 52%, branches 38%, statements 45%
-      // (measured 49.7 / 56.2 / 41.2 / 48.5 — raise these as coverage grows)
+      // Floors sit a little under the measured coverage (lines 97.9,
+      // functions 98.1, branches 93.7, statements 97.1) so CI fails when a
+      // change lands without tests, not on rounding noise.
       thresholds: {
-        lines: 46,
-        functions: 52,
-        branches: 38,
-        statements: 45,
+        lines: 96,
+        functions: 96,
+        branches: 92,
+        statements: 95,
       },
     },
   },

@@ -272,10 +272,23 @@ describe('/voice status', () => {
 
       const enEmbed = statusEmbed(en);
       const jaEmbed = statusEmbed(ja);
-      expect(jaEmbed.title).not.toBe(enEmbed.title);
-      expect(jaEmbed.fields?.map((field) => field.name)).not.toEqual(
-        enEmbed.fields?.map((field) => field.name)
-      );
+      // These three labels are inlined in status.ts rather than kept in the
+      // locale files, so their exact wording is pinned here.
+      expect(enEmbed.title).toBe('Voice subsystem status');
+      expect(jaEmbed.title).toBe('ボイス機能の状態');
+      expect(enEmbed.fields?.slice(0, 2).map((field) => field.name)).toEqual([
+        'Active connections',
+        'Connection limit',
+      ]);
+      expect(jaEmbed.fields?.slice(0, 2).map((field) => field.name)).toEqual([
+        'アクティブ接続数',
+        '接続上限',
+      ]);
+      expect(jaEmbed.fields?.slice(2).map((field) => field.name)).toEqual([
+        t('record.bufferWindow', 'ja'),
+        t('record.autojoin.title', 'ja'),
+        t('record.autojoin.exclusionCount', 'ja'),
+      ]);
       expect(fieldValue(jaEmbed, t('record.bufferWindow', 'ja'))).toBeDefined();
       expect(fieldValue(jaEmbed, t('record.autojoin.title', 'ja'))).toBe(
         t('record.autojoin.statusEnabled', 'ja')

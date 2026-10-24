@@ -8,6 +8,7 @@ import {
   it,
   vi,
 } from 'vitest';
+import { mentioning } from './community.helpers.js';
 
 /**
  * Discord closes polls by itself, so the community feature's only lifecycle
@@ -82,8 +83,8 @@ describe('community feature lifecycle', () => {
     community.start();
 
     expect(storedIds()).toEqual(['live']);
-    expect(logger.info).toHaveBeenCalledWith('Pruned 2 expired poll record(s)');
-    expect(logger.info).toHaveBeenCalledWith('Community feature started');
+    expect(logger.info).toHaveBeenCalledWith(mentioning('prune', /\b2\b/));
+    expect(logger.info).toHaveBeenCalledWith(mentioning('start'));
   });
 
   it('stays quiet about pruning when nothing has expired', () => {
@@ -91,9 +92,7 @@ describe('community feature lifecycle', () => {
 
     community.start();
 
-    expect(logger.info).not.toHaveBeenCalledWith(
-      expect.stringContaining('Pruned')
-    );
+    expect(logger.info).not.toHaveBeenCalledWith(mentioning('prune'));
     expect(storedIds()).toEqual(['live']);
   });
 
@@ -131,7 +130,7 @@ describe('community feature lifecycle', () => {
     expect(
       vi
         .mocked(logger.info)
-        .mock.calls.filter(([msg]) => msg === 'Community feature started')
+        .mock.calls.filter(([msg]) => /start/i.test(String(msg)))
     ).toHaveLength(1);
   });
 
@@ -157,6 +156,6 @@ describe('community feature lifecycle', () => {
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('Failed to prune expired polls')
     );
-    expect(logger.info).toHaveBeenCalledWith('Community feature started');
+    expect(logger.info).toHaveBeenCalledWith(mentioning('start'));
   });
 });

@@ -14,6 +14,7 @@ import { COLORS } from '../../../shared/utils/constants/index.js';
 import { t } from '../../../locales/index.js';
 import {
   GUILD_ID,
+  USER_ID,
   clearNotificationTables,
   createCommandInteraction,
   createComponentInteraction,
@@ -45,6 +46,15 @@ const loggerWarn = vi.hoisted(() => vi.fn());
 vi.mock('../../../shared/utils/logger.js', () => ({
   logger: { error: vi.fn(), warn: loggerWarn, info: vi.fn(), debug: vi.fn() },
   getErrorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
+}));
+
+// The audit log posts to Discord. The panel does not import it yet (see the
+// "audit trail" block); the mock is here so that test can see the fix land.
+const notifySetup = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const notifyRemove = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+vi.mock('../../../infrastructure/audit/index.js', () => ({
+  audit: { notifySetup, notifyRemove },
 }));
 
 const { showNotificationPanel } = await import('../application/panel.js');
@@ -644,6 +654,113 @@ describe('showNotificationPanel', () => {
         );
         expect(rowsOf(payload)[3].map((b) => b.disabled)).toEqual(
           disabledAfter
+        );
+      }
+    );
+
+    it.each([
+      ['voice', 'notification-panel:voice:remove', 'member_join', 'welcome'],
+      [
+        'member_join',
+        'notification-panel:member_join:remove',
+        'voice',
+        'vc-log',
+      ],
+    ] as const)(
+      'just re-renders settings when %s is removed but was never configured',
+      async (type, customId, otherType, otherChannel) => {
+        // The button is rendered disabled here; a stale or forged click still
+        // reaches the collector and must not touch the other configuration.
+        notificationChannelRepository.set(GUILD_ID, otherType, otherChannel);
+        const command = await openPanel(
+          { manageGuild: true },
+          { initialView: 'status' }
+        );
+        const button = createComponentInteraction('button', customId);
+
+        await command.collect(button.interaction);
+
+        expect(button.reply).not.toHaveBeenCalled();
+        expect(button.deferUpdate).not.toHaveBeenCalled();
+        expect(loggerWarn).not.toHaveBeenCalled();
+        expect(button.update).toHaveBeenCalledTimes(1);
+        const payload = lastCallArg(button.update);
+        expect(embedOf(payload).title).toBe(
+          t('notification.status.title', 'en')
+        );
+        expect(customIdsOf(payload)).toEqual(SETTINGS_ROWS);
+        expect(notificationChannelRepository.get(GUILD_ID, type)).toBeNull();
+        expect(
+          notificationChannelRepository.getEnabled(GUILD_ID, otherType)
+        ).toBe(otherChannel);
+        // Nothing changed, so nothing belongs in the audit log either.
+        expect(notifyRemove).not.toHaveBeenCalled();
+      }
+    );
+  });
+
+  /**
+   * KNOWN BUG (panel.ts onComponent): the remove buttons and the channel
+   * pickers write to `notification_channels` without calling
+   * `audit.notifySetup` / `audit.notifyRemove`, while `/notification voice|
+   * welcome set|disable` audit the very same change. A Manage Server holder
+   * can therefore retarget or switch off notifications from the panel with no
+   * NOTIFY_SETUP / NOTIFY_REMOVE entry. These document the expected behaviour;
+   * drop `.fails` once the panel audits (removals only when something was
+   * actually removed, matching the slash handlers).
+   */
+  describe('audit trail', () => {
+    it.fails.each([
+      ['voice', 'notification-panel:voice:channel', 'Voice'],
+      ['member_join', 'notification-panel:member_join:channel', 'Welcome'],
+    ] as const)(
+      'records who pointed %s notifications at a channel from the picker',
+      async (_type, customId, auditKind) => {
+        const command = await openPanel(
+          {
+            manageGuild: true,
+            guild: createGuild({ cached: [createTextChannel('new-chan')] }),
+          },
+          { initialView: 'status' }
+        );
+
+        await command.collect(
+          createComponentInteraction('channelSelect', customId, {
+            values: ['new-chan'],
+          }).interaction
+        );
+
+        expect(notifySetup).toHaveBeenCalledWith(
+          expect.anything(),
+          GUILD_ID,
+          USER_ID,
+          'new-chan',
+          auditKind
+        );
+      }
+    );
+
+    it.fails.each([
+      ['voice', 'notification-panel:voice:remove', 'Voice'],
+      ['member_join', 'notification-panel:member_join:remove', 'Welcome'],
+    ] as const)(
+      'records who switched off %s notifications from the remove button',
+      async (type, customId, auditKind) => {
+        notificationChannelRepository.set(GUILD_ID, type, 'configured');
+        const command = await openPanel(
+          { manageGuild: true },
+          { initialView: 'status' }
+        );
+
+        await command.collect(
+          createComponentInteraction('button', customId).interaction
+        );
+
+        expect(notifyRemove).toHaveBeenCalledWith(
+          expect.anything(),
+          GUILD_ID,
+          USER_ID,
+          auditKind
         );
       }
     );

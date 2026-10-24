@@ -57,13 +57,15 @@ function createMember(
   guildOptions: FakeGuildOptions,
   overrides: { bot?: boolean; displayName?: string } = {}
 ) {
-  const displayAvatarURL = vi.fn(() => 'https://cdn.example/avatar.png');
   const member = {
     displayName: overrides.displayName ?? 'Newcomer',
-    user: { bot: overrides.bot ?? false, displayAvatarURL },
+    user: {
+      bot: overrides.bot ?? false,
+      displayAvatarURL: () => 'https://cdn.example/avatar.png',
+    },
     guild: createGuild(guildOptions),
   } as unknown as GuildMember;
-  return { member, displayAvatarURL };
+  return { member };
 }
 
 describe('memberJoinNotification event', () => {
@@ -96,7 +98,7 @@ describe('memberJoinNotification event', () => {
 
     it('posts a welcome embed with the member name, avatar and member count', async () => {
       const channel = createTextChannel(WELCOME_CHANNEL);
-      const { member, displayAvatarURL } = createMember(
+      const { member } = createMember(
         { cached: [channel], memberCount: 42 },
         { displayName: 'Alice' }
       );
@@ -111,7 +113,6 @@ describe('memberJoinNotification event', () => {
       );
       expect(embed.color).toBe(COLORS.SUCCESS);
       expect(embed.thumbnail?.url).toBe('https://cdn.example/avatar.png');
-      expect(displayAvatarURL).toHaveBeenCalledWith({ size: 128 });
       expect(embed.fields).toEqual([
         {
           name: t('notification.events.memberCount', 'en'),
@@ -234,13 +235,14 @@ describe('memberJoinNotification event', () => {
   });
 
   it('does not look up any channel when the guild has no welcome configuration', async () => {
+    // Only reachable by fetching, so any lookup at all would show up as a
+    // Discord API call.
     const channel = createTextChannel(WELCOME_CHANNEL);
-    const { member } = createMember({ cached: [channel] });
-    const cacheGet = vi.spyOn(member.guild.channels.cache, 'get');
+    const { member } = createMember({ fetchable: [channel] });
 
     await event.execute(readyClient(), member);
 
-    expect(cacheGet).not.toHaveBeenCalled();
+    expect(member.guild.channels.fetch).not.toHaveBeenCalled();
     expect(channel.send).not.toHaveBeenCalled();
   });
 

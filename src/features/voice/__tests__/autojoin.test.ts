@@ -72,7 +72,13 @@ function createInteraction(
     locale: options.locale ?? 'en-US',
     options: {
       getSubcommand: vi.fn(() => options.subcommand ?? 'enable'),
-      getChannel: vi.fn(() => options.channel ?? null),
+      // Like discord.js: a missing option is null, or throws when required.
+      getChannel: vi.fn((name: string, required?: boolean) => {
+        if (!options.channel && required) {
+          throw new TypeError(`Required option "${name}" not found.`);
+        }
+        return options.channel ?? null;
+      }),
     },
     reply: vi.fn().mockResolvedValue(undefined),
   } as unknown as ChatInputCommandInteraction;
@@ -91,6 +97,34 @@ function replyEmbed(interaction: ChatInputCommandInteraction) {
 }
 
 const minutes = () => Math.round(env.AUDIO_BUFFER_DURATION / 60);
+
+/**
+ * Make each disconnect settle a few microtasks after it is called and record
+ * when it does, so "replied after the disconnect finished" can be told apart
+ * from "replied after the disconnect was merely started".
+ */
+function trackDisconnectCompletion(): string[] {
+  const finished: string[] = [];
+  disconnect.mockImplementation(async (channelId: string) => {
+    await Promise.resolve();
+    await Promise.resolve();
+    finished.push(channelId);
+  });
+  return finished;
+}
+
+/** Capture which disconnects had finished at the moment the reply went out. */
+function snapshotAtReply(
+  interaction: ChatInputCommandInteraction,
+  finished: string[]
+): () => string[] | undefined {
+  let seen: string[] | undefined;
+  vi.mocked(interaction.reply).mockImplementation(async () => {
+    seen = [...finished];
+    return undefined as never;
+  });
+  return () => seen;
+}
 
 describe('/voice autojoin', () => {
   beforeEach(() => {
@@ -174,11 +208,23 @@ describe('/voice autojoin', () => {
       expect(disconnect).toHaveBeenCalledWith('voice-a');
       expect(disconnect).toHaveBeenCalledWith('voice-b');
       expect(disconnect).not.toHaveBeenCalledWith('voice-other');
-      // The admin is told it is off only once buffering has actually stopped.
-      const lastDisconnect = Math.max(...disconnect.mock.invocationCallOrder);
-      expect(
-        vi.mocked(interaction.reply).mock.invocationCallOrder[0]
-      ).toBeGreaterThan(lastDisconnect);
+    });
+
+    it('tells the admin it is off only after every disconnect has finished', async () => {
+      getAllConnections.mockReturnValue(
+        new Map([
+          ['voice-a', connectionInfo('voice-a', GUILD)],
+          ['voice-b', connectionInfo('voice-b', GUILD)],
+        ])
+      );
+      const finished = trackDisconnectCompletion();
+      const interaction = createInteraction({ subcommand: 'disable' });
+      const seenAtReply = snapshotAtReply(interaction, finished);
+
+      await executeAutoJoinCommand(interaction);
+
+      // Started-but-unfinished disconnects would still be buffering audio.
+      expect(seenAtReply()).toEqual(['voice-a', 'voice-b']);
     });
 
     it('leaves live connections alone when enabling', async () => {
@@ -253,6 +299,20 @@ describe('/voice autojoin', () => {
       expect(disconnect).toHaveBeenCalledWith('voice-9');
     });
 
+    it('confirms the exclusion only after the bot has actually left', async () => {
+      getConnection.mockReturnValue(connectionInfo('voice-9', GUILD));
+      const finished = trackDisconnectCompletion();
+      const interaction = createInteraction({
+        subcommand: 'exclude',
+        channel: voiceChannel('voice-9'),
+      });
+      const seenAtReply = snapshotAtReply(interaction, finished);
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(seenAtReply()).toEqual(['voice-9']);
+    });
+
     it('does not disconnect anything when the bot is not in that channel', async () => {
       await executeAutoJoinCommand(
         createInteraction({
@@ -310,18 +370,16 @@ describe('/voice autojoin', () => {
       expect(disconnect).not.toHaveBeenCalled();
     });
 
-    it('reads the channel option as required', async () => {
-      const interaction = createInteraction({
-        subcommand: 'exclude',
-        channel: voiceChannel('voice-9'),
-      });
+    it('fails loudly instead of excluding nothing when the channel option is missing', async () => {
+      const interaction = createInteraction({ subcommand: 'exclude' });
 
-      await executeAutoJoinCommand(interaction);
+      await expect(executeAutoJoinCommand(interaction)).rejects.toThrow();
 
-      expect(interaction.options.getChannel).toHaveBeenCalledWith(
-        'channel',
-        true
-      );
+      // Nothing was stored and nothing claimed success; the command router
+      // answers the admin with its generic error instead.
+      expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([]);
+      expect(interaction.reply).not.toHaveBeenCalled();
+      expect(disconnect).not.toHaveBeenCalled();
     });
   });
 
@@ -405,6 +463,59 @@ describe('/voice autojoin', () => {
       expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([
         'voice-9',
       ]);
+    });
+  });
+
+  /**
+   * A failed write must never be reported as saved. The error is left to
+   * propagate without a reply so the command router can still `reply` with
+   * its generic "unexpected error" embed.
+   */
+  describe('when the setting cannot be saved', () => {
+    it.each(['enable', 'disable'])(
+      'does not confirm "%s" and leaves the reply to the error handler',
+      async (subcommand) => {
+        db.exec('DROP TABLE guild_settings');
+        const interaction = createInteraction({ subcommand });
+
+        await expect(executeAutoJoinCommand(interaction)).rejects.toThrow(
+          /guild_settings/
+        );
+
+        expect(interaction.reply).not.toHaveBeenCalled();
+      }
+    );
+
+    it('does not confirm an exclusion it could not store, and does not leave', async () => {
+      db.exec('DROP TABLE voice_autojoin_exclusions');
+      getConnection.mockReturnValue(connectionInfo('voice-9', GUILD));
+      const interaction = createInteraction({
+        subcommand: 'exclude',
+        channel: voiceChannel('voice-9'),
+      });
+
+      await expect(executeAutoJoinCommand(interaction)).rejects.toThrow(
+        /voice_autojoin_exclusions/
+      );
+
+      expect(interaction.reply).not.toHaveBeenCalled();
+      // Leaving without a stored exclusion would just rejoin on the next
+      // voice event while looking like the exclusion worked.
+      expect(disconnect).not.toHaveBeenCalled();
+    });
+
+    it('does not report "not excluded" when the lookup itself failed', async () => {
+      db.exec('DROP TABLE voice_autojoin_exclusions');
+      const interaction = createInteraction({
+        subcommand: 'include',
+        channel: voiceChannel('voice-9'),
+      });
+
+      await expect(executeAutoJoinCommand(interaction)).rejects.toThrow(
+        /voice_autojoin_exclusions/
+      );
+
+      expect(interaction.reply).not.toHaveBeenCalled();
     });
   });
 });

@@ -14,7 +14,6 @@ import {
   mkdtemp,
   readdir,
   rm,
-  symlink,
   utimes,
   writeFile,
 } from 'fs/promises';
@@ -22,6 +21,35 @@ import { tmpdir } from 'os';
 import { join, relative } from 'path';
 import { logger } from '../../../shared/utils/logger.js';
 import { FileCleanupService } from '../jobs/fileCleanup.js';
+
+/**
+ * File names whose stat() fails with ENOENT, as if the file was deleted
+ * between readdir() and stat(). Portable, unlike a dangling symlink, which
+ * needs extra rights on Windows.
+ */
+const vanishingFiles = vi.hoisted(() => new Set<string>());
+
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  const { basename } = await import('path');
+  return {
+    ...actual,
+    stat: (path: string, ...rest: unknown[]) => {
+      if (vanishingFiles.has(basename(path))) {
+        return Promise.reject(
+          Object.assign(
+            new Error(`ENOENT: no such file or directory, stat '${path}'`),
+            { code: 'ENOENT' }
+          )
+        );
+      }
+      return (actual.stat as (...args: unknown[]) => Promise<unknown>)(
+        path,
+        ...rest
+      );
+    },
+  };
+});
 
 vi.mock('../../../shared/utils/logger.js', () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
@@ -74,6 +102,7 @@ describe('FileCleanupService', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vanishingFiles.clear();
     // Only Date is faked: fs callbacks still need the real event loop.
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(NOW);
@@ -164,17 +193,17 @@ describe('FileCleanupService', () => {
     });
 
     it('skips an entry it cannot stat and still cleans the rest', async () => {
-      await symlink(
-        join(recordingsDir, 'gone'),
-        join(recordingsDir, 'dangling.wav')
-      );
+      const vanishing = await createFile('vanishing.wav', 48 * HOUR_MS);
+      vanishingFiles.add('vanishing.wav');
       const old = await createFile('old.wav', 48 * HOUR_MS);
 
       await serviceFor(recordingsDir).cleanup();
 
       expect(await exists(old)).toBe(false);
+      // Without a stat there is no age, so it is never deleted blindly.
+      expect(await exists(vanishing)).toBe(true);
       expect(logger.warn).toHaveBeenCalledWith(
-        'Failed to process file dangling.wav:',
+        'Failed to process file vanishing.wav:',
         expect.stringContaining('ENOENT')
       );
       expect(logger.info).toHaveBeenCalledWith(
@@ -228,10 +257,8 @@ describe('FileCleanupService', () => {
     });
 
     it('skips entries it cannot stat', async () => {
-      await symlink(
-        join(recordingsDir, 'gone'),
-        join(recordingsDir, 'dangling.wav')
-      );
+      await createFile('vanishing.wav', 0, Buffer.alloc(1024 * 1024));
+      vanishingFiles.add('vanishing.wav');
       await createFile('real.wav', 0, Buffer.alloc(1024 * 1024));
 
       await expect(serviceFor(recordingsDir).getDiskUsage()).resolves.toEqual({
@@ -239,7 +266,7 @@ describe('FileCleanupService', () => {
         totalSizeMB: 1,
       });
       expect(logger.debug).toHaveBeenCalledWith(
-        expect.stringContaining('Skipped file dangling.wav')
+        expect.stringContaining('Skipped file vanishing.wav (stat failed)')
       );
     });
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GuildMember, MessageFlags, PermissionsBitField } from 'discord.js';
+import { t } from '../../../locales/index.js';
 
 vi.mock('../../../shared/utils/embed.js', () => ({
   createEmbed: vi.fn((opts) => opts),
@@ -20,6 +21,9 @@ vi.mock('../../../infrastructure/audit/index.js', () => ({
     roleRemove: (...args: unknown[]) => roleRemove(...args),
   },
 }));
+
+/** Passed through to the audit service, which posts to the audit channel. */
+const CLIENT = { id: 'client-stub' };
 
 function memberStub(
   opts: {
@@ -97,6 +101,7 @@ describe('admin role target hierarchy', () => {
     const reply = vi.fn();
     const interaction = {
       locale: 'en-US',
+      client: CLIENT,
       user: { id: 'mod-1', tag: 'Mod#0001' },
       member: {
         permissions: new PermissionsBitField(
@@ -122,8 +127,7 @@ describe('admin role target hierarchy', () => {
         flags: MessageFlags.Ephemeral,
         embeds: [
           expect.objectContaining({
-            description:
-              'You can only manage members with a lower highest role than yours.',
+            description: t('admin.role.errors.targetMemberHierarchy', 'en'),
           }),
         ],
       })
@@ -170,6 +174,7 @@ describe('admin role target hierarchy', () => {
     const reply = vi.fn();
     const interaction = {
       locale: 'en-US',
+      client: CLIENT,
       user: { id: 'mod-1', tag: 'Mod#0001' },
       member: {
         permissions: new PermissionsBitField(
@@ -192,13 +197,15 @@ describe('admin role target hierarchy', () => {
     expect(rolesAdd).toHaveBeenCalledWith('role-low');
     expect(reply).toHaveBeenCalledWith(
       expect.objectContaining({
-        embeds: [expect.objectContaining({ title: 'Role Added' })],
+        embeds: [
+          expect.objectContaining({ title: t('admin.role.add.success', 'en') }),
+        ],
       })
     );
     // Role grants are the most privilege-sensitive action the bot performs,
     // so they must reach the audit log.
     expect(roleAdd).toHaveBeenCalledWith(
-      undefined,
+      CLIENT,
       'guild-1',
       'mod-1',
       'user-1',
@@ -248,6 +255,7 @@ describe('admin role target hierarchy', () => {
     const reply = vi.fn();
     await executeRoleCommand({
       locale: 'en-US',
+      client: CLIENT,
       user: { id: 'mod-1', tag: 'Mod#0001' },
       member: {
         permissions: new PermissionsBitField(
@@ -270,8 +278,7 @@ describe('admin role target hierarchy', () => {
       expect.objectContaining({
         embeds: [
           expect.objectContaining({
-            description:
-              'You can only manage members with a lower highest role than yours.',
+            description: t('admin.role.errors.targetMemberHierarchy', 'en'),
           }),
         ],
       })

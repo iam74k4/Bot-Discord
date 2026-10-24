@@ -34,6 +34,11 @@ const { up: createDailyStats } =
 
 const GUILD = 'guild-1';
 const USER = 'user-1';
+const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
+// Local noon: tests that expect several visits in one daily row must not
+// straddle midnight, which an unpinned fake clock would do near 23:59.
+const NOON = new Date(2026, 6, 15, 12, 0, 0);
 
 function closedSession(
   channelId: string,
@@ -80,6 +85,7 @@ function rollupRows() {
 describe('voice daily stats rollup', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.setSystemTime(NOON);
     db.exec('DROP TABLE IF EXISTS voice_sessions');
     db.exec('DROP TABLE IF EXISTS notification_channels');
     db.exec('DROP TABLE IF EXISTS voice_daily_stats');
@@ -258,6 +264,54 @@ describe('voice daily stats rollup', () => {
     ]);
   });
 
+  describe('a channel renamed on a later day', () => {
+    beforeEach(() => {
+      vi.setSystemTime(new Date(NOON.getTime() - DAY));
+      const before = voiceSessionRepository.startSession(
+        GUILD,
+        USER,
+        'vc-a',
+        'Old name'
+      );
+      vi.advanceTimersByTime(MINUTE);
+      voiceSessionRepository.endSession(before);
+
+      vi.setSystemTime(NOON);
+      const after = voiceSessionRepository.startSession(
+        GUILD,
+        USER,
+        'vc-a',
+        'New name'
+      );
+      vi.advanceTimersByTime(MINUTE);
+      voiceSessionRepository.endSession(after);
+    });
+
+    it('still adds both days up under one channel', () => {
+      const stats = voiceSessionRepository.getUserChannelStats(GUILD, USER);
+
+      expect(rollupRows()).toHaveLength(2);
+      expect(stats).toHaveLength(1);
+      expect(stats[0]).toMatchObject({
+        channel_id: 'vc-a',
+        total_duration_ms: 2 * MINUTE,
+        session_count: 2,
+      });
+      expect(['Old name', 'New name']).toContain(stats[0].channel_name);
+    });
+
+    // KNOWN BUG (voiceSessionRepository.ts getUserChannelStats): it selects a
+    // bare `channel_name` under `GROUP BY channel_id`, and SQLite hands back
+    // the earliest day's row, so `/notification stats` keeps showing the old
+    // name for as long as that day is inside the period. Drop `.fails` once
+    // the query picks the name from the most recent day.
+    it.fails('shows the name the channel has now', () => {
+      expect(
+        voiceSessionRepository.getUserChannelStats(GUILD, USER)[0].channel_name
+      ).toBe('New name');
+    });
+  });
+
   it('closes only the stale sessions of the guild being swept', () => {
     vi.setSystemTime(new Date('2026-07-15T12:00:00Z'));
     const stale = voiceSessionRepository.startSession(
@@ -305,20 +359,30 @@ describe('voice daily stats rollup', () => {
   });
 
   it('retains open sessions and sessions newer than the retention window', () => {
-    const dayMs = 24 * 60 * 60 * 1000;
     const now = Date.now();
-    closedSession('old', now - 10 * dayMs, 60_000);
-    closedSession('recent', now - 2 * dayMs, 60_000);
-    voiceSessionRepository.startSession(GUILD, USER, 'open', '#open');
+    /** A one-minute visit that ended `msAgo` before now. */
+    const endedAgo = (channelId: string, msAgo: number) =>
+      closedSession(channelId, now - msAgo - MINUTE, MINUTE);
 
-    expect(voiceSessionRepository.cleanupOldSessions(7)).toBe(1);
+    endedAgo('old', 10 * DAY);
+    endedAgo('just-outside', 7.1 * DAY);
+    // The cutoff is "strictly older than N days".
+    endedAgo('on-cutoff', 7 * DAY);
+    endedAgo('just-inside', 6.9 * DAY);
+    endedAgo('recent', 2 * DAY);
+    // Still connected after a month: no end time, so never cleaned up.
+    vi.setSystemTime(now - 30 * DAY);
+    voiceSessionRepository.startSession(GUILD, USER, 'open', '#open');
+    vi.setSystemTime(now);
+
+    expect(voiceSessionRepository.cleanupOldSessions(7)).toBe(2);
 
     const remaining = (
       db
         .prepare('SELECT channel_id FROM voice_sessions ORDER BY channel_id')
         .all() as Array<{ channel_id: string }>
     ).map((r) => r.channel_id);
-    expect(remaining).toEqual(['open', 'recent']);
+    expect(remaining).toEqual(['just-inside', 'on-cutoff', 'open', 'recent']);
   });
 
   it('orders channel stats by time spent and scopes them to one user', () => {

@@ -14,6 +14,7 @@ import { tmpdir } from 'os';
 import { basename, dirname, join, relative } from 'path';
 import { Writable } from 'stream';
 import { DISCORD_LIMITS } from '../../../config/index.js';
+import { parseConfig } from '../../../config/schema.js';
 import {
   generateFileName,
   parseDurationString,
@@ -30,6 +31,13 @@ const mockEnv = vi.hoisted(() => ({
   MAX_RECORDING_DURATION: 300,
   AUDIO_BUFFER_DURATION: 300,
 }));
+/**
+ * Lets a single test shrink the upload limit so a many-part split stays
+ * small on disk. null keeps the real DISCORD_LIMITS value.
+ */
+const limitOverride = vi.hoisted(() => ({
+  maxFileSizeMb: null as number | null,
+}));
 
 vi.mock('../recording/channelMixRing.js', () => ({
   channelMixRingManager: {
@@ -38,11 +46,24 @@ vi.mock('../recording/channelMixRing.js', () => ({
 }));
 
 // Keep the real AUDIO / DISCORD_LIMITS constants so the WAV and split
-// assertions follow whatever the production values are.
+// assertions follow whatever the production values are. MAX_FILE_SIZE_MB is
+// read through a getter so one test can lower it; every split assertion reads
+// DISCORD_LIMITS back instead of hard-coding a size.
 vi.mock('../../../config/index.js', async (importOriginal) => {
   const actual =
     await importOriginal<typeof import('../../../config/index.js')>();
-  return { ...actual, env: mockEnv };
+  return {
+    ...actual,
+    env: mockEnv,
+    DISCORD_LIMITS: {
+      ...actual.DISCORD_LIMITS,
+      get MAX_FILE_SIZE_MB() {
+        return (
+          limitOverride.maxFileSizeMb ?? actual.DISCORD_LIMITS.MAX_FILE_SIZE_MB
+        );
+      },
+    },
+  };
 });
 
 // Real fs, with createWriteStream wrapped so single tests can inject a
@@ -53,7 +74,7 @@ vi.mock('fs', async (importOriginal) => {
 });
 
 const WAV_HEADER_BYTES = 44;
-/** Upload limit the service splits against, in bytes. */
+/** Upload limit the service splits against, in bytes (real config value). */
 const MAX_UPLOAD_BYTES = DISCORD_LIMITS.MAX_FILE_SIZE_MB * 1024 * 1024;
 
 let tempRoot: string;
@@ -121,6 +142,23 @@ function options(channelId: string, duration = 5) {
   return { channelId, duration, userId: 'user-1', guildId: 'guild-1' };
 }
 
+/**
+ * Name of part `part` of a split recording: the usual recording name with a
+ * 1-based `_partN` suffix before the extension.
+ */
+function expectPartName(
+  filePath: string,
+  duration: number,
+  channelId: string,
+  part: number
+): void {
+  expect(basename(filePath)).toMatch(
+    new RegExp(
+      `^recording_\\d{8}T\\d{6}-\\d{3}Z_${duration}s_${channelId}_[0-9a-f]{8}_part${part}\\.wav$`
+    )
+  );
+}
+
 /** Writable whose Nth write fails, to simulate a disk error mid-file. */
 function streamFailingOnWrite(failOn: number): WriteStream {
   let writes = 0;
@@ -152,6 +190,7 @@ describe('recordingService', () => {
 
   afterEach(async () => {
     vi.useRealTimers();
+    limitOverride.maxFileSizeMb = null;
     // Split tests write tens of MB; free them per test.
     await rm(recordingsDir, { recursive: true, force: true });
   });
@@ -192,6 +231,40 @@ describe('recordingService', () => {
         'Duration exceeds buffer duration (120s)'
       );
       expect(mockExtractLastSeconds).not.toHaveBeenCalled();
+    });
+
+    it('accepts a duration exactly at AUDIO_BUFFER_DURATION', async () => {
+      // The buffer, not the maximum, is the binding limit here.
+      mockEnv.MAX_RECORDING_DURATION = 300;
+      mockEnv.AUDIO_BUFFER_DURATION = 60;
+
+      const result = await recordAudio(options('ch-buf-edge', 60));
+
+      expect(result.duration).toBe(60);
+      expect(mockExtractLastSeconds).toHaveBeenCalledWith('ch-buf-edge', 60);
+    });
+
+    it('accepts the longest recording the default config allows', async () => {
+      // With the shipped defaults both limits are equal, so the longest
+      // `/voice record` sits on both boundaries at once.
+      const { config } = parseConfig({
+        DISCORD_TOKEN: 'token',
+        DISCORD_CLIENT_ID: 'client-id',
+      });
+      mockEnv.MAX_RECORDING_DURATION = config.MAX_RECORDING_DURATION;
+      mockEnv.AUDIO_BUFFER_DURATION = config.AUDIO_BUFFER_DURATION;
+      const longest = Math.min(
+        config.MAX_RECORDING_DURATION,
+        config.AUDIO_BUFFER_DURATION
+      );
+
+      const result = await recordAudio(options('ch-default-max', longest));
+
+      expect(result.duration).toBe(longest);
+      expect(mockExtractLastSeconds).toHaveBeenCalledWith(
+        'ch-default-max',
+        longest
+      );
     });
 
     it('does not reserve the channel when validation fails', async () => {
@@ -334,7 +407,7 @@ describe('recordingService', () => {
 
       const dataParts: Buffer[] = [];
       for (const [index, part] of parts.entries()) {
-        expect(basename(part)).toMatch(new RegExp(`_part${index + 1}\\.wav$`));
+        expectPartName(part, 60, 'ch-split', index + 1);
         const file = await readFile(part);
         expect(file.length).toBeLessThanOrEqual(MAX_UPLOAD_BYTES);
 
@@ -346,6 +419,41 @@ describe('recordingService', () => {
       }
 
       // Parts are in order and lose no audio.
+      expect(Buffer.concat(dataParts).equals(pcm)).toBe(true);
+    });
+
+    it('splits a recording several times the limit into three or more ordered parts that each fit', async () => {
+      // A small limit keeps this many-part split cheap on disk. Everything
+      // below is read back from DISCORD_LIMITS, not from the number set here.
+      limitOverride.maxFileSizeMb = 1;
+      const limitBytes = DISCORD_LIMITS.MAX_FILE_SIZE_MB * 1024 * 1024;
+      // 2.5x the limit, rounded down to whole int16 samples.
+      const pcm = audiblePcm(Math.floor(limitBytes * 1.25) * 2);
+      mockExtractLastSeconds.mockReturnValue(pcm);
+
+      const result = await recordAudio(options('ch-many', 30));
+
+      expect(result.isSplit).toBe(true);
+      const parts = [result.filePath, ...(result.additionalFiles ?? [])];
+      expect(parts.length).toBeGreaterThanOrEqual(3);
+      expect(new Set(parts).size).toBe(parts.length);
+      expect((await readdir(recordingsDir)).sort()).toEqual(
+        parts.map((p) => basename(p)).sort()
+      );
+      expect(result.fileSize).toBe((await stat(result.filePath)).size);
+
+      const dataParts: Buffer[] = [];
+      for (const [index, part] of parts.entries()) {
+        expectPartName(part, 30, 'ch-many', index + 1);
+        const file = await readFile(part);
+        expect(file.length).toBeLessThanOrEqual(limitBytes);
+
+        const wav = parseWav(file);
+        expectMono16Bit48kHeader(wav);
+        expect(wav.dataSize % wav.blockAlign).toBe(0);
+        dataParts.push(Buffer.from(wav.data));
+      }
+
       expect(Buffer.concat(dataParts).equals(pcm)).toBe(true);
     });
   });

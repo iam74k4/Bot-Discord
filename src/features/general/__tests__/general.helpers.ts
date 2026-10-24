@@ -228,10 +228,7 @@ export function embedAt(mock: MockFn, call = 0): APIEmbed {
 }
 
 /** The select menu in the first action row of the payload passed in `call`. */
-export function selectMenuAt(
-  mock: MockFn,
-  call = 0
-): APIStringSelectComponent {
+export function selectMenuAt(mock: MockFn, call = 0): APIStringSelectComponent {
   const rows = payloadAt(mock, call).components;
   if (!rows?.length) throw new Error(`call ${call} sent no components`);
   return rows[0].toJSON().components[0] as APIStringSelectComponent;

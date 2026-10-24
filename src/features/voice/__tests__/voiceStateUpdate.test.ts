@@ -284,6 +284,23 @@ describe('voiceStateUpdate', () => {
       expect(announceBuffering).not.toHaveBeenCalled();
     });
 
+    // KNOWN BUG (voiceStateUpdate.ts handleUserJoined): another bot joining
+    // makes this bot connect and then immediately leave again, and the
+    // in-flight connect can block a human's join elsewhere in the guild.
+    // `it.fails` keeps the suite green until the fix lands; then this starts
+    // failing and should become a plain `it`.
+    it.fails(
+      'does not even try to connect when only another bot joined',
+      async () => {
+        const music = botUser('music-bot');
+        const general = voiceChannel('general', [music]);
+
+        await fire(voiceState(null, music), voiceState(general, music));
+
+        expect(cm.connect).not.toHaveBeenCalled();
+      }
+    );
+
     it('ignores a state with no guild attached', async () => {
       const general = voiceChannel('general', [human('alice')]);
 
@@ -386,6 +403,20 @@ describe('voiceStateUpdate', () => {
       expect(cm.disconnect).toHaveBeenCalledWith('general');
       expect(cm.connect).not.toHaveBeenCalled();
       expect(fake.connections.size).toBe(0);
+    });
+
+    it('only refreshes activity when moving into the channel the bot is in', async () => {
+      alreadyConnected('lounge');
+      const general = voiceChannel('general', []);
+      const lounge = voiceChannel('lounge', [me, human('bob'), human('alice')]);
+
+      await fire(voiceState(general), voiceState(lounge));
+
+      expect(cm.updateActivity).toHaveBeenCalledWith('lounge');
+      expect(cm.connect).not.toHaveBeenCalled();
+      expect(cm.disconnect).not.toHaveBeenCalled();
+      expect(announceBuffering).not.toHaveBeenCalled();
+      expect([...fake.connections.keys()]).toEqual(['lounge']);
     });
 
     it('joins the destination when the bot was not connected anywhere', async () => {
