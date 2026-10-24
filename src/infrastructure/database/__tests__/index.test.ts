@@ -350,8 +350,8 @@ describe('initializeDatabase', () => {
       const schemaBefore = describeSchema(db);
       const rowsBefore = dumpRows(db);
 
-      // Everything a reboot replays except 006 (see the known bug below):
-      // 001/002 recreate the Steam tables and 005 drops them again, the
+      // Everything a reboot replays except 006 (covered by the full-boot test
+      // below): 001/002 recreate the Steam tables and 005 drops them again, the
       // guarded ALTERs in 007/008 must not reset settings, 009 must not
       // backfill a second time, and 010 must keep live polls.
       await runMigrations(
@@ -371,31 +371,27 @@ describe('initializeDatabase', () => {
     });
 
     /**
-     * KNOWN BUG (reported, production code untouched): on every boot after the
-     * first, 006_polls.ts runs `CREATE INDEX IF NOT EXISTS idx_polls_ends_at
-     * ON polls(ends_at)` against the table 010 rebuilt without `ends_at`, so
-     * initializeDatabase() throws "no such column: ends_at" and the bot cannot
-     * restart. Drop `.fails` once 006 is guarded on the old schema.
+     * Regression: 006_polls.ts used to run `CREATE INDEX IF NOT EXISTS
+     * idx_polls_ends_at ON polls(ends_at)` against the table 010 rebuilt
+     * without `ends_at`, so every boot after the first threw "no such column:
+     * ends_at" and the bot could not restart.
      */
-    it.fails(
-      'boots a second time on an initialized database without changing schema or rows',
-      async () => {
-        const first = await loadRunner();
-        await first.initializeDatabase();
-        seedKeptTables();
-        const schemaBefore = describeSchema(db);
-        const rowsBefore = dumpRows(db);
+    it('boots a second time on an initialized database without changing schema or rows', async () => {
+      const first = await loadRunner();
+      await first.initializeDatabase();
+      seedKeptTables();
+      const schemaBefore = describeSchema(db);
+      const rowsBefore = dumpRows(db);
 
-        // A new process: the once-per-process flag starts false again.
-        vi.resetModules();
-        const second = await loadRunner();
-        await second.initializeDatabase();
+      // A new process: the once-per-process flag starts false again.
+      vi.resetModules();
+      const second = await loadRunner();
+      await second.initializeDatabase();
 
-        expect(logger.warn).not.toHaveBeenCalled();
-        expect(describeSchema(db)).toEqual(schemaBefore);
-        expect(dumpRows(db)).toEqual(rowsBefore);
-      }
-    );
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(describeSchema(db)).toEqual(schemaBefore);
+      expect(dumpRows(db)).toEqual(rowsBefore);
+    });
 
     it('keeps every row when a second boot fails part-way', async () => {
       const first = await loadRunner();
@@ -404,8 +400,7 @@ describe('initializeDatabase', () => {
       const schemaBefore = describeSchema(db);
       const rowsBefore = dumpRows(db);
 
-      // Fail the reboot on purpose, early enough that it does not depend on
-      // the 006 bug above: by the time 005 runs, 001/002 have recreated the
+      // Fail the reboot on purpose at 005: by then 001/002 have recreated the
       // five Steam tables. The stand-in also destroys data before throwing,
       // as a half-applied migration would.
       vi.doMock('../migrations/005_drop_steam.js', () => ({
