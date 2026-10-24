@@ -24,6 +24,7 @@ A modular Discord bot built with TypeScript and discord.js v14.
 
 - Slash command support with automatic registration
 - **Voice channel recording** (restricted past-audio recording with `/voice record`)
+- **Text-to-speech** (`/tts`): reads chat aloud in voice channels with VOICEVOX, so members who cannot or would rather not speak can still take part
 - VC join/leave and member-join notifications, plus per-user VC time stats
 - Community features (native Discord polls, VC roulette)
 - Admin system (`/admin` server settings, `/owner` bot-owner tools)
@@ -246,6 +247,39 @@ are gone — use `/community poll end` to close a short poll when you are done.
 - Bot must be in the same voice channel
 - Maximum concurrent VC connections: 5 (configurable)
 - Opus decoding uses **`opusscript`** (pure JS) instead of `@discordjs/opus` so installs stay free of vulnerable native prebuild chains; CPU use can be higher than a native Opus build under heavy voice load. See [`docs/quality.md`](docs/quality.md) for dependency overrides.
+
+### Text-to-speech (`/tts`)
+
+Reads chat aloud in a voice channel using [VOICEVOX](https://voicevox.hiroshiba.jp/).
+Available when the bot operator sets `VOICEVOX_URL` (see
+[docs/deployment.md](docs/deployment.md#text-to-speech-optional)).
+
+| Command                          | Description                                          |
+| -------------------------------- | ---------------------------------------------------- |
+| `/tts start`                     | Start reading this channel in your voice channel     |
+| `/tts stop`                      | Stop reading                                         |
+| `/tts skip`                      | Skip the message being read                          |
+| `/tts voice [speaker] [speed]`   | Show or change your own voice (searchable) and speed |
+| `/tts dict add <word> <reading>` | Teach the server how to read a word                  |
+| `/tts dict remove <word>`        | Remove a reading                                     |
+| `/tts dict list`                 | Show the server's dictionary                         |
+
+**How it reads:**
+
+- Messages from members **in the voice channel being read** are spoken, from
+  the channel where `/tts start` was run and from the voice channel's own chat
+- Start a message with `;` to keep it silent
+- The speaker's name is announced when the speaker changes (or after a minute
+  of quiet), so listeners know who is talking
+- URLs, code blocks, spoilers, and long messages are summarised (`URL省略`,
+  `コード省略`, `ネタバレ`, `以下略`); mentions are read as names, emoji are
+  dropped, and trailing `www` is read as laughter
+- Each member picks their own voice; it follows them across servers
+- Anyone can start reading or add dictionary words; only members in the
+  channel being read (or with Manage Server) can stop or skip, and only the
+  member who added a word (or Manage Server) can remove it
+- If the server has turned auto-join off, the bot joins deafened and keeps no
+  audio; it is unmuted only while a reading session is running
 
 ### Memory
 

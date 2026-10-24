@@ -338,4 +338,69 @@ export const en: TranslationKeys = {
       failedDesc: 'An error occurred while processing the recording: {error}',
     },
   },
+
+  tts: {
+    errors: {
+      notConfigured: 'Text-to-speech is not set up',
+      notConfiguredDesc:
+        'This bot has no speech engine (VOICEVOX) configured. Ask the bot operator to set `VOICEVOX_URL`.',
+      engineDown: 'Cannot reach the speech engine',
+      engineDownDesc:
+        'VOICEVOX is not responding. Try again in a moment, and contact the bot operator if it keeps happening.',
+      notInVoice: 'Join a voice channel first',
+      notInVoiceDesc:
+        'Join the voice channel you want messages read in, then run `/tts start`.',
+      busyElsewhere: 'The bot is in another voice channel',
+      busyElsewhereDesc:
+        'The bot is currently in <#{channel}> (Discord lets a bot be in one voice channel per server). Use it there, or wait until it leaves.',
+      cannotJoin: 'Could not join the voice channel',
+      cannotJoinDesc:
+        'Check that the bot has the Connect permission there and that the connection limit has not been reached.',
+      notRunning: 'Nothing is being read',
+      notRunningDesc: 'Start reading with `/tts start`.',
+      notInSameVoice: 'Not allowed',
+      notInSameVoiceDesc:
+        'Only members in the voice channel being read (<#{channel}>) or members with Manage Server can do this.',
+    },
+    started: 'Text-to-speech started',
+    startedDesc:
+      'Messages in this channel and in the voice chat of <#{voice}> will be read aloud.',
+    howToTitle: 'How it works',
+    howTo:
+      '• Only messages from people in <#{voice}> are read\n• Start a message with `;` to keep it silent\n• Change your voice and speed with `/tts voice`\n• Teach readings with `/tts dict add`\n• `/tts skip` skips the current message, `/tts stop` ends reading',
+    noSpeakPermission:
+      '⚠️ The bot lacks the Speak permission in this channel, so it may not be heard.',
+    credit: 'Voice: VOICEVOX',
+    stopped: 'Text-to-speech stopped',
+    stoppedDesc: 'Run `/tts start` whenever you want it again.',
+    skipped: 'Skipped the current message.',
+    nothingToSkip: 'Nothing is being read right now.',
+    voice: {
+      currentTitle: 'Your text-to-speech settings',
+      current: 'Voice: **{voice}**\nSpeed: **{speed}x**',
+      changeHint:
+        'Use the `speaker` option of `/tts voice` to change voice and `speed` (0.5–2.0) to change speed.',
+      setTitle: 'Voice updated',
+      unknown: 'Voice not found',
+      unknownDesc: 'Pick one of the suggestions shown while typing.',
+      credit: 'Credit: VOICEVOX:{character}',
+      preview: 'この声で読み上げます',
+    },
+    dict: {
+      addedTitle: 'Added to the dictionary',
+      added: '"{word}" will be read as "{reading}".',
+      updated: 'Updated the reading of "{word}" to "{reading}".',
+      removedTitle: 'Removed from the dictionary',
+      removed: 'Removed "{word}" from the dictionary.',
+      notFound: '"{word}" is not in the dictionary.',
+      notOwner:
+        'Only the member who added a word, or members with Manage Server, can remove it.',
+      full: 'The dictionary is full ({max} words). Remove unused words with `/tts dict remove`.',
+      listTitle: 'Reading dictionary for this server',
+      listEmpty: 'No words yet. Add one with `/tts dict add`.',
+      listMore: 'and {count} more',
+      invalid:
+        'Words must be 1–{wordMax} characters and readings 1–{readingMax} characters.',
+    },
+  },
 };

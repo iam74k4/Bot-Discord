@@ -3,6 +3,7 @@ import { MemoryMonitor } from './jobs/memoryMonitor.js';
 import { FileCleanupService } from './jobs/fileCleanup.js';
 import { connectionManager } from './recording/connectionManager.js';
 import { reconcileOccupiedVoiceChannels } from './application/reconcile.js';
+import { ttsSessions } from './tts/sessionManager.js';
 import { setServiceStatus } from '../../infrastructure/health/index.js';
 
 export const name = 'voice';
@@ -14,6 +15,7 @@ export const name = 'voice';
  */
 let memoryMonitor: MemoryMonitor | null = null;
 let fileCleanupService: FileCleanupService | null = null;
+let unsubscribeTts: (() => void) | null = null;
 
 /**
  * Start Voice jobs and recording runtime
@@ -26,6 +28,11 @@ export async function start({ client, config }: FeatureContext): Promise<void> {
   fileCleanupService = new FileCleanupService(config);
   fileCleanupService.start();
   setServiceStatus('voiceFileCleanup', true);
+
+  // A reading session cannot outlive the connection it plays through.
+  unsubscribeTts = connectionManager.onDisconnect((channelId) =>
+    ttsSessions.handleDisconnect(channelId)
+  );
 
   await reconcileOccupiedVoiceChannels(client);
 }
@@ -41,6 +48,10 @@ export async function stop(): Promise<void> {
   memoryMonitor?.stop();
   memoryMonitor = null;
   setServiceStatus('voiceMemoryMonitor', false);
+
+  ttsSessions.stopAll();
+  unsubscribeTts?.();
+  unsubscribeTts = null;
 
   for (const [channelId] of connectionManager.getAllConnections()) {
     await connectionManager.disconnect(channelId);

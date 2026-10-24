@@ -172,6 +172,37 @@ PRIMARY KEY (`guild_id`, `channel_id`)
 
 ---
 
+### tts_user_settings
+
+Each user's text-to-speech voice. Keyed by user alone so a voice follows the
+person across servers.
+
+| Column     | Type    | Constraints          |
+| ---------- | ------- | -------------------- |
+| user_id    | TEXT    | PRIMARY KEY          |
+| speaker_id | INTEGER | NOT NULL             |
+| speed      | REAL    | NOT NULL DEFAULT 1.0 |
+| updated_at | INTEGER | NOT NULL             |
+
+---
+
+### tts_dictionary
+
+A server's reading dictionary for text-to-speech (`/tts dict`). At most 200
+entries per guild.
+
+| Column     | Type    | Constraints |
+| ---------- | ------- | ----------- |
+| guild_id   | TEXT    | NOT NULL    |
+| word       | TEXT    | NOT NULL    |
+| reading    | TEXT    | NOT NULL    |
+| created_by | TEXT    | NOT NULL    |
+| created_at | INTEGER | NOT NULL    |
+
+PRIMARY KEY (`guild_id`, `word`)
+
+---
+
 ### audit_logs
 
 Audit log entries for admin actions.
@@ -221,6 +252,7 @@ Defined in `src/features/admin/repositories/auditRepository.ts`.
 | audit_logs                                               | infrastructure | `infrastructure/audit/auditRepository.ts`                       |
 | polls                                                    | community      | `poll/pollRepository.ts`                                        |
 | voice_autojoin_exclusions                                | voice          | `repositories/voiceSettingsRepository.ts`                       |
+| tts_user_settings, tts_dictionary                        | voice          | `repositories/ttsRepository.ts`                                 |
 
 `guild_settings` and `audit_logs` are owned by infrastructure rather than a
 feature because several features read them: locale resolution reads
@@ -247,6 +279,7 @@ Migrations live in `src/infrastructure/database/migrations/` and are run in orde
 8. `008_announcement_channel.ts` — `guild_settings.announcement_channel_id`
 9. `009_voice_daily_stats.ts` — voice_daily_stats, backfilled once from existing `voice_sessions`
 10. `010_native_polls.ts` — drops poll_votes and the custom `polls` schema, replacing it with the message pointer Discord's native polls need
+11. `011_tts.ts` — tts_user_settings, tts_dictionary
 
 `initializeDatabase()` runs all migrations inside a single transaction. It is safe to call multiple times; migrations use `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, and `DROP TABLE IF EXISTS`. Initialization is performed once per process.
 

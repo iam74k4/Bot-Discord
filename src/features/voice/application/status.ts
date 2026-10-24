@@ -7,6 +7,12 @@ import { resolveLocale } from '../../../locales/guildLocale.js';
 import { connectionManager } from '../recording/connectionManager.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 
+/** A text-to-speech-only join keeps no audio, so it does not count. */
+function isBuffering(channelId: string): boolean {
+  const connection = connectionManager.getConnection(channelId);
+  return connection !== undefined && connection.receiving !== false;
+}
+
 /**
  * `/voice status` - recorder capacity plus whether this channel is buffered.
  */
@@ -38,7 +44,7 @@ export async function executeStatusCommand(
     voiceSettingsRepository.isChannelExcluded(guildId, memberChannelId)
   ) {
     currentChannelState = t('record.autojoin.currentChannelExcluded', locale);
-  } else if (connectionManager.getConnection(memberChannelId)) {
+  } else if (isBuffering(memberChannelId)) {
     currentChannelState = t('record.autojoin.currentChannelBuffered', locale);
   } else {
     currentChannelState = t('record.autojoin.currentChannelNone', locale);

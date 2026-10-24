@@ -39,7 +39,7 @@ import { cooldownStore } from '../middleware/cooldown/cooldownStore.js';
  * with extra steps. See `docs/architecture.md`.
  */
 export interface AppDependencies {
-  createClient(): ExtendedClient;
+  createClient(config: AppConfig): ExtendedClient;
   initializeDatabase(): Promise<void>;
   closeDatabase(): void;
   loadFeatures(): Promise<void>;
@@ -76,7 +76,10 @@ interface ShutdownStep {
 
 export function defaultDependencies(): AppDependencies {
   return {
-    createClient,
+    // Text-to-speech is the only reader of chat, so the privileged intent is
+    // requested only when an engine is configured.
+    createClient: (config) =>
+      createClient({ messageContent: Boolean(config.VOICEVOX_URL) }),
     initializeDatabase,
     closeDatabase,
     loadFeatures,
@@ -103,7 +106,7 @@ export function createApp(
   config: AppConfig,
   deps: AppDependencies = defaultDependencies()
 ): App {
-  const client = deps.createClient();
+  const client = deps.createClient(config);
 
   async function start(): Promise<void> {
     await deps.initializeDatabase();

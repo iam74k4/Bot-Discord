@@ -334,4 +334,70 @@ export const ja: TranslationKeys = {
       failedDesc: '録音の処理中にエラーが発生しました: {error}',
     },
   },
+
+  tts: {
+    errors: {
+      notConfigured: '読み上げは準備中です',
+      notConfiguredDesc:
+        'このBotには読み上げエンジン（VOICEVOX）が設定されていません。Botの運営者に `VOICEVOX_URL` の設定を依頼してください。',
+      engineDown: '読み上げエンジンに接続できません',
+      engineDownDesc:
+        'VOICEVOXが応答していません。少し待ってからもう一度お試しください。続く場合はBotの運営者に連絡してください。',
+      notInVoice: 'VCに参加してください',
+      notInVoiceDesc:
+        '読み上げたいボイスチャンネルに先に参加してから、`/tts start` を実行してください。',
+      busyElsewhere: 'Botは別のVCにいます',
+      busyElsewhereDesc:
+        'Botは今 <#{channel}> に参加しています（Discordの仕様で、1つのサーバーで同時に入れるVCは1つだけです）。そのVCで使うか、Botが抜けるまでお待ちください。',
+      cannotJoin: 'VCに参加できませんでした',
+      cannotJoinDesc:
+        'Botにそのチャンネルの「接続」権限があるか、同時接続数の上限に達していないか確認してください。',
+      notRunning: '読み上げは行われていません',
+      notRunningDesc: '`/tts start` で読み上げを始められます。',
+      notInSameVoice: '操作できません',
+      notInSameVoiceDesc:
+        '読み上げ中のVC（<#{channel}>）に参加している人か、「サーバーの管理」権限を持つ人だけが操作できます。',
+    },
+    started: '読み上げを開始しました',
+    startedDesc:
+      '<#{voice}> で、このチャンネルとVCのチャットに書かれた発言を読み上げます。',
+    howToTitle: '使い方',
+    howTo:
+      '・読み上げるのは <#{voice}> にいる人の発言だけです\n・先頭に `;` を付けると読み上げません\n・`/tts voice` で自分の声と速さを変えられます\n・`/tts dict add` で読み方を登録できます\n・`/tts skip` で今の発言を飛ばし、`/tts stop` で終了します',
+    noSpeakPermission:
+      '⚠️ Botにこのチャンネルの「発言」権限がないため、声が届かない可能性があります。',
+    credit: '音声: VOICEVOX',
+    stopped: '読み上げを終了しました',
+    stoppedDesc: 'また使うときは `/tts start` を実行してください。',
+    skipped: '今の発言を飛ばしました。',
+    nothingToSkip: '今は何も読み上げていません。',
+    voice: {
+      currentTitle: 'あなたの読み上げ設定',
+      current: '声: **{voice}**\n速さ: **{speed}倍**',
+      changeHint:
+        '`/tts voice` の `speaker` で声を、`speed` で速さ（0.5〜2.0）を変えられます。',
+      setTitle: '読み上げの声を変更しました',
+      unknown: 'その声は見つかりませんでした',
+      unknownDesc: '入力欄に表示される候補から選んでください。',
+      credit: 'クレジット: VOICEVOX:{character}',
+      preview: 'この声で読み上げます',
+    },
+    dict: {
+      addedTitle: '辞書に登録しました',
+      added: '「{word}」を「{reading}」と読みます。',
+      updated: '「{word}」の読み方を「{reading}」に更新しました。',
+      removedTitle: '辞書から削除しました',
+      removed: '「{word}」を辞書から削除しました。',
+      notFound: '「{word}」は辞書に登録されていません。',
+      notOwner:
+        '他の人が登録した単語は、登録した本人か「サーバーの管理」権限を持つ人だけが削除できます。',
+      full: '辞書の登録数が上限（{max}件）に達しています。不要な単語を `/tts dict remove` で削除してください。',
+      listTitle: 'このサーバーの読み上げ辞書',
+      listEmpty:
+        'まだ単語が登録されていません。`/tts dict add` で登録できます。',
+      listMore: 'ほか{count}件',
+      invalid:
+        '単語は1〜{wordMax}文字、読み方は1〜{readingMax}文字で入力してください。',
+    },
+  },
 };

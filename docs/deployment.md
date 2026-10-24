@@ -51,10 +51,39 @@ In Railway dashboard, add the following variables:
 | `DATABASE_PATH`                 | SQLite database path (must stay relative to repo root)                                    | No                |
 | `RECORDINGS_DIR`                | Generated recording files directory (must stay relative to repo root)                     | No                |
 | `BACKUP_DIR`                    | Backup output directory (must stay relative to repo root)                                 | No                |
+| `VOICEVOX_URL`                  | VOICEVOX engine URL; enables `/tts` and the Message Content intent (see below)            | No                |
 
 If you enable voice recording in production, remember that `/voice record` now requires `Manage Server`, and generated files are delivered ephemerally and cleaned up automatically according to `RECORDING_RETENTION_HOURS`.
 
 Size the instance from `AUDIO_BUFFER_DURATION × 0.27MB × MAX_CONCURRENT_VC_CONNECTIONS` — about 410MB at the defaults — plus the bot's baseline, and set `MEMORY_LIMIT_MB` to the memory the host actually grants. That is the worst case, not the steady state: a channel's buffer is allocated on its first decoded audio chunk, so idle connections cost nothing. Servers that do not want the bot buffering their voice channels can turn it off per guild or per channel with `/voice autojoin`.
+
+### Text-to-speech (optional)
+
+`/tts` reads chat aloud with [VOICEVOX](https://voicevox.hiroshiba.jp/), which
+runs as its own service next to the bot:
+
+1. In the same Railway project, add a service from the Docker image
+   `voicevox/voicevox_engine:cpu-latest`. It listens on port `50021` and needs
+   no volume.
+2. Set `VOICEVOX_URL` on the bot to the engine's private address, e.g.
+   `http://voicevox.railway.internal:50021`. Keeping the engine on private
+   networking means it is never exposed to the internet.
+3. In the Discord Developer Portal, open **Bot → Privileged Gateway Intents** and
+   turn on **MESSAGE CONTENT INTENT**. The bot only requests that intent when
+   `VOICEVOX_URL` is set, and Discord refuses the login (close code 4014) if it
+   is requested without being enabled. Apps with fewer than 10,000 users can
+   toggle it directly; larger apps must apply for it.
+4. Give the bot the **Speak** permission in voice channels where people will use
+   it.
+
+Playback needs no ffmpeg: the bot asks VOICEVOX for 48 kHz stereo audio and
+encodes it to Opus with the bundled encoder. VOICEVOX requires a credit for the
+voices used (for example `VOICEVOX:ずんだもん`); the bot shows it in `/tts`
+replies, and each character's own terms apply.
+
+Where a server has turned auto-join off (`/voice autojoin disable` or an
+excluded channel), `/tts start` still joins, but deafened and without buffering
+any audio, so reading never overrides that choice.
 
 ### 4. Choose how production deploys run
 
