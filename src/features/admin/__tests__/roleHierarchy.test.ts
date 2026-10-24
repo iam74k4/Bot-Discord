@@ -49,7 +49,7 @@ function memberStub(
     },
   };
   Object.setPrototypeOf(member, GuildMember.prototype);
-  return member as GuildMember;
+  return member as unknown as GuildMember;
 }
 
 describe('admin role target hierarchy', () => {
