@@ -58,6 +58,8 @@ export interface VoiceConnectionInfo {
   connectedAt: number;
   /** Last activity timestamp */
   lastActivity: number;
+  /** Whether audio is decoded into the record buffer (false = TTS-only join) */
+  receiving?: boolean;
 }
 
 /**
