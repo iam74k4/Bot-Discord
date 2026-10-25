@@ -502,8 +502,7 @@ async function suggestionsFor(
     const { interaction, respond } = autocompleteFor(world, path, option, '');
     await autocomplete(interaction);
     const choices = respond.mock.calls[0]?.[0] as
-      | Array<{ value: string | number }>
-      | undefined;
+      Array<{ value: string | number }> | undefined;
     if (choices?.[0]) suggestions.set(option.name, choices[0].value);
   }
   return suggestions;
