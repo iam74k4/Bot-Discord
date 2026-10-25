@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # Every pull request, whatever its base: stacked PRs (a feature branch
+  # targeting another feature branch) would otherwise get no CI at all.
   pull_request:
-    branches: [main, develop]
   push:
     branches: [main, develop]
   workflow_dispatch:
