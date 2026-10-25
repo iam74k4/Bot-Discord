@@ -18,8 +18,14 @@ vi.mock('../../../shared/utils/discord.js', () => ({
   getSendableTextChannel: vi.fn().mockResolvedValue({ id: 'text-1' }),
 }));
 
-vi.mock('./panel.js', () => ({
+vi.mock('../application/panel.js', () => ({
   showNotificationPanel: vi.fn(),
+}));
+
+// The real resolver reads guild_settings, which would open the on-disk test
+// database for 'guild-1'. Locale is not what these tests are about.
+vi.mock('../../../locales/guildLocale.js', () => ({
+  resolveLocale: () => 'en',
 }));
 
 const {
