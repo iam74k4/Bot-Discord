@@ -22,6 +22,7 @@ import {
   initializeDatabase,
 } from '../../infrastructure/database/index.js';
 import { backupService } from '../../infrastructure/backup/index.js';
+import { restoreOnStartup } from '../../infrastructure/backup/restore.js';
 import {
   startAuditRetention,
   stopAuditRetention,
@@ -65,6 +66,7 @@ function harness(overrides: Partial<AppDependencies> = {}) {
 
   const deps: AppDependencies = {
     createClient: () => client as never,
+    restoreBackup: record('restoreBackup'),
     initializeDatabase: async () => void order.push('initializeDatabase'),
     closeDatabase: record('closeDatabase'),
     loadFeatures: async () => void order.push('loadFeatures'),
@@ -106,6 +108,7 @@ describe('composition root', () => {
     await createApp(config(), deps).start();
 
     expect(order).toEqual([
+      'restoreBackup',
       'initializeDatabase',
       'loadFeatures',
       'loadCommands',
@@ -116,6 +119,18 @@ describe('composition root', () => {
       'backup.start',
       'startAuditRetention',
     ]);
+  });
+
+  it('applies a requested restore with the config it was built with, before the database opens', async () => {
+    const restoreBackup = vi.fn();
+    const { deps } = harness({ restoreBackup });
+    const appConfig = config({
+      RESTORE_BACKUP: 'backup-2026-10-25T04-00-00-abcdef.db',
+    });
+
+    await createApp(appConfig, deps).start();
+
+    expect(restoreBackup).toHaveBeenCalledWith(appConfig);
   });
 
   it('hands features the client and the configuration it was built with', async () => {
@@ -187,15 +202,22 @@ describe('composition root', () => {
   });
 
   it.each<[keyof AppDependencies, string[]]>([
-    ['initializeDatabase', []],
-    ['loadCommands', ['initializeDatabase', 'loadFeatures']],
+    ['initializeDatabase', ['restoreBackup']],
+    ['loadCommands', ['restoreBackup', 'initializeDatabase', 'loadFeatures']],
     [
       'login',
-      ['initializeDatabase', 'loadFeatures', 'loadCommands', 'loadEvents'],
+      [
+        'restoreBackup',
+        'initializeDatabase',
+        'loadFeatures',
+        'loadCommands',
+        'loadEvents',
+      ],
     ],
     [
       'awaitReady',
       [
+        'restoreBackup',
         'initializeDatabase',
         'loadFeatures',
         'loadCommands',
@@ -315,6 +337,7 @@ describe('defaultDependencies', () => {
   it('wires the production collaborators', () => {
     const deps = defaultDependencies();
 
+    expect(deps.restoreBackup).toBe(restoreOnStartup);
     expect(deps.initializeDatabase).toBe(initializeDatabase);
     expect(deps.closeDatabase).toBe(closeDatabase);
     expect(deps.loadFeatures).toBe(loadFeatures);
