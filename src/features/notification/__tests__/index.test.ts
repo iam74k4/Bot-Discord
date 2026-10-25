@@ -23,6 +23,15 @@ vi.mock('../repositories/voiceSessionRepository.js', () => ({
 vi.mock('../../../shared/utils/logger.js', () => ({
   logger: {
     info: loggerInfo,
+    warn: vi.fn(),
+  },
+  getErrorMessage: (e: unknown) => String(e),
+}));
+
+vi.mock('../repositories/notificationChannelRepository.js', () => ({
+  notificationChannelRepository: {
+    getEnabled: (_guildId: string, type: string) =>
+      type === 'voice' ? 'vc-log' : null,
   },
 }));
 
@@ -62,5 +71,52 @@ describe('notification feature lifecycle', () => {
     expect(endAllSessions).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(24 * 60 * 60 * 1000);
     expect(cleanupOldSessions).toHaveBeenCalledTimes(2);
+  });
+
+  it('keys stats days by the configured time zone', async () => {
+    const { start, stop } = await import('../index.js');
+    const { getStatsTimeZone } = await import('../stats/calendar.js');
+
+    start({
+      client: {},
+      config: {
+        VOICE_SESSION_RETENTION_DAYS: 30,
+        STATS_TIMEZONE: 'Europe/London',
+      },
+    } as never);
+
+    expect(getStatsTimeZone()).toBe('Europe/London');
+    stop();
+  });
+
+  it('adds its settings to the admin overview only while started', async () => {
+    const { start, stop } = await import('../index.js');
+    const { collectSettingsSummaries } =
+      await import('../../../shared/settingsSummary/index.js');
+    const { t } = await import('../../../locales/index.js');
+    const { commandMention } =
+      await import('../../../shared/utils/commandMentions.js');
+    const context = { guildId: 'guild-1', locale: 'en' } as const;
+
+    start({
+      client: {},
+      config: { VOICE_SESSION_RETENTION_DAYS: 30 },
+    } as never);
+
+    const fields = await collectSettingsSummaries(context);
+    expect(fields.map((f) => f.name)).toEqual([
+      t('notification.summary.voice', 'en'),
+      t('notification.summary.welcome', 'en'),
+    ]);
+    expect(fields[0].value).toBe('<#vc-log>');
+    // Unset reads as a setup hint, not a blank.
+    expect(fields[1].value).toBe(
+      t('common.notSetWithHint', 'en', {
+        command: commandMention('notification welcome set'),
+      })
+    );
+
+    stop();
+    expect(await collectSettingsSummaries(context)).toEqual([]);
   });
 });

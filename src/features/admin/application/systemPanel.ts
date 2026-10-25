@@ -3,10 +3,14 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ChatInputCommandInteraction,
+  escapeMarkdown,
 } from 'discord.js';
+import type { ExtendedClient } from '../../../client.js';
+import { env } from '../../../config/index.js';
 import { createEmbed } from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { type Locale, t } from '../../../locales/index.js';
+import { formatDuration, formatNumber } from '../../../locales/format.js';
 import { databaseStatsRepository } from '../repositories/index.js';
 import {
   formatHealthStatus,
@@ -14,7 +18,12 @@ import {
 } from '../../../infrastructure/health/index.js';
 import { backupService } from '../../../infrastructure/backup/index.js';
 import { metrics } from '../../../infrastructure/metrics/index.js';
-import { runComponentPanel } from '../../../shared/utils/panel.js';
+import {
+  PANEL_MAX_LIFETIME,
+  runComponentPanel,
+  type PanelPayload,
+} from '../../../shared/utils/panel.js';
+import { runBackupSafely } from './backupRun.js';
 
 type AdminPanelView =
   | 'stats'
@@ -25,6 +34,12 @@ type AdminPanelView =
   | 'backups';
 
 const PANEL_TIMEOUT = 120_000;
+/**
+ * Slack for the panel's own timers, which start a moment before this code
+ * reads the clock: a result this close to the close is shown disabled.
+ */
+const PANEL_CLOSE_MARGIN_MS = 1_000;
+const SECONDS_PER_DAY = 86_400;
 const DB_STATS_TABLES = [
   'guild_settings',
   'audit_logs',
@@ -94,6 +109,22 @@ function buildUtilityRow(
   );
 }
 
+/**
+ * `1日2時間3分` / `1d 2h 3m`. formatDuration stops at hours, which reads
+ * badly for a process that has been up for weeks, so days are added here.
+ */
+export function formatUptime(seconds: number, locale: Locale): string {
+  const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  const days = Math.floor(safeSeconds / SECONDS_PER_DAY);
+  const restSeconds = safeSeconds - days * SECONDS_PER_DAY;
+  const rest = formatDuration(restSeconds * 1000, locale);
+  if (days === 0) return rest;
+
+  const daysText = t('admin.panel.uptimeDays', locale, { count: days });
+  if (restSeconds < 60) return daysText;
+  return t('common.duration.pair', locale, { first: daysText, second: rest });
+}
+
 function buildStatsEmbed(
   interaction: ChatInputCommandInteraction,
   locale: Locale
@@ -105,11 +136,11 @@ function buildStatsEmbed(
     0
   );
   const channelCount = client.channels.cache.size;
-  const uptime = process.uptime();
-  const days = Math.floor(uptime / 86400);
-  const hours = Math.floor((uptime % 86400) / 3600);
-  const minutes = Math.floor((uptime % 3600) / 60);
   const memoryMB = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+  // Only the bot's own client carries the command registry; a bare Client
+  // reads as zero instead of breaking the panel.
+  const commandCount =
+    (client as Partial<Pick<ExtendedClient, 'commands'>>).commands?.size ?? 0;
 
   return createEmbed({
     title: t('admin.panel.statsTitle', locale),
@@ -117,32 +148,42 @@ function buildStatsEmbed(
     fields: [
       {
         name: t('admin.panel.serversLabel', locale),
-        value: guildCount.toLocaleString(),
+        value: formatNumber(guildCount, locale),
         inline: true,
       },
       {
         name: t('admin.panel.usersLabel', locale),
-        value: userCount.toLocaleString(),
+        value: formatNumber(userCount, locale),
         inline: true,
       },
       {
         name: t('admin.panel.channelsLabel', locale),
-        value: channelCount.toLocaleString(),
+        value: formatNumber(channelCount, locale),
         inline: true,
       },
       {
         name: t('admin.panel.uptimeLabel', locale),
-        value: `${days}d ${hours}h ${minutes}m`,
+        value: formatUptime(process.uptime(), locale),
         inline: true,
       },
       {
         name: t('admin.panel.memoryLabel', locale),
-        value: `${memoryMB} MB`,
+        value: `${formatNumber(memoryMB, locale)} MB`,
         inline: true,
       },
       {
         name: t('admin.panel.nodeLabel', locale),
         value: process.version,
+        inline: true,
+      },
+      {
+        name: t('admin.panel.environmentLabel', locale),
+        value: env.NODE_ENV,
+        inline: true,
+      },
+      {
+        name: t('admin.panel.commandsLabel', locale),
+        value: formatNumber(commandCount, locale),
         inline: true,
       },
     ],
@@ -167,7 +208,10 @@ function buildDbEmbed(locale: Locale) {
         value:
           tableCounts.length > 0
             ? tableCounts
-                .map((table) => `\`${table.name}\`: ${table.count}`)
+                .map(
+                  (table) =>
+                    `\`${table.name}\`: ${formatNumber(table.count, locale)}`
+                )
                 .join('\n')
             : t('common.noData', locale),
         inline: false,
@@ -181,8 +225,9 @@ function buildGuildsEmbed(
   interaction: ChatInputCommandInteraction,
   locale: Locale
 ) {
+  // `sorted` copies: `sort` would reorder the live guild cache in place.
   const guilds = interaction.client.guilds.cache
-    .sort((a, b) => b.memberCount - a.memberCount)
+    .sorted((a, b) => b.memberCount - a.memberCount)
     .first(20);
 
   return createEmbed({
@@ -191,7 +236,10 @@ function buildGuildsEmbed(
       guilds
         .map(
           (guild, index) =>
-            `${index + 1}. **${guild.name}** (${guild.memberCount.toLocaleString()})`
+            `${index + 1}. **${escapeMarkdown(guild.name)}** (${formatNumber(
+              guild.memberCount,
+              locale
+            )})`
         )
         .join('\n') || t('common.noData', locale),
     color: COLORS.INFO,
@@ -228,11 +276,37 @@ function buildMetricsEmbed(locale: Locale) {
   });
 }
 
+/** Backups named in the list; the rest are counted. */
+const BACKUPS_LISTED = 10;
+
+/**
+ * The newest backups, one per line. Times are Discord timestamps, so each
+ * viewer reads them in their own language and time zone.
+ */
+export async function formatBackupList(locale: Locale): Promise<string> {
+  const backups = await backupService.listBackups();
+  if (backups.length === 0) return t('admin.panel.noBackups', locale);
+
+  const lines = backups.slice(0, BACKUPS_LISTED).map((backup, index) => {
+    const sizeKb = formatNumber(Math.round(backup.size / 1024), locale);
+    const at = Math.floor(backup.createdAt.getTime() / 1000);
+    return `${index + 1}. \`${backup.filename}\` (${sizeKb} KB) - <t:${at}:f>`;
+  });
+  if (backups.length > BACKUPS_LISTED) {
+    lines.push(
+      t('admin.panel.moreBackups', locale, {
+        count: formatNumber(backups.length - BACKUPS_LISTED, locale),
+      })
+    );
+  }
+  return lines.join('\n');
+}
+
 async function buildBackupsEmbed(
   locale: Locale,
   lastRunMessage: string | null
 ) {
-  const backupList = await backupService.formatBackupList();
+  const backupList = await formatBackupList(locale);
   const description = lastRunMessage
     ? `${lastRunMessage}\n\n${backupList}`
     : backupList;
@@ -246,6 +320,20 @@ async function buildBackupsEmbed(
   });
 }
 
+/** What the panel says about the backup it just ran. */
+async function runBackupForPanel(locale: Locale): Promise<string> {
+  const result = await runBackupSafely();
+
+  return result.success
+    ? t('admin.panel.backupSuccess', locale, {
+        filename: result.filename,
+        size: String(Math.round(result.size / 1024)),
+      })
+    : t('admin.panel.backupFailure', locale, {
+        error: result.error || t('owner.backup.noReason', locale),
+      });
+}
+
 export async function showAdminSystemPanel(
   interaction: ChatInputCommandInteraction,
   locale: Locale,
@@ -254,7 +342,7 @@ export async function showAdminSystemPanel(
   let currentView = initialView;
   let lastBackupMessage: string | null = null;
 
-  const render = async () => {
+  const renderEmbed = async () => {
     switch (currentView) {
       case 'stats':
         return buildStatsEmbed(interaction, locale);
@@ -271,22 +359,33 @@ export async function showAdminSystemPanel(
     }
   };
 
+  const rows = (disabled: boolean) => [
+    buildMainRow(locale, currentView, disabled),
+    buildUtilityRow(locale, currentView, disabled),
+  ];
+
+  const render = async (): Promise<PanelPayload> => ({
+    embeds: [await renderEmbed()],
+    components: rows(false),
+  });
+
+  // When the panel's collector will have closed: idle since the last click,
+  // or at the end of its lifetime. A backup can outlast either, and its
+  // result must not switch the buttons back on with nothing listening.
+  const openedAt = Date.now();
+  const closedBy = (clickedAt: number) =>
+    Math.min(
+      clickedAt + PANEL_TIMEOUT - PANEL_CLOSE_MARGIN_MS,
+      openedAt + PANEL_MAX_LIFETIME - PANEL_CLOSE_MARGIN_MS
+    );
+
   await runComponentPanel({
     interaction,
     locale,
     label: 'admin system panel',
     timeout: PANEL_TIMEOUT,
-    render: async () => ({
-      embeds: [await render()],
-      components: [
-        buildMainRow(locale, currentView),
-        buildUtilityRow(locale, currentView),
-      ],
-    }),
-    renderDisabled: () => [
-      buildMainRow(locale, currentView, true),
-      buildUtilityRow(locale, currentView, true),
-    ],
+    render,
+    renderDisabled: () => rows(true),
     onComponent: async (componentInteraction) => {
       const action = componentInteraction.customId.replace('admin-panel:', '');
 
@@ -302,27 +401,30 @@ export async function showAdminSystemPanel(
       }
 
       if (action === 'run-backup') {
+        const clickedAt = Date.now();
         currentView = 'backups';
-        await componentInteraction.deferUpdate();
-
-        const result = await backupService.runBackup();
-        lastBackupMessage = result.success
-          ? t('admin.panel.backupSuccess', locale, {
-              filename: result.filename,
-              size: String(Math.round(result.size / 1024)),
-            })
-          : t('admin.panel.backupFailure', locale, {
-              error: result.error || t('common.unexpectedError', locale),
-            });
-
-        await interaction.editReply({
-          embeds: [await render()],
-          components: [
-            buildMainRow(locale, currentView),
-            buildUtilityRow(locale, currentView),
+        // Answer the click with a visible "running" state and every button
+        // off, so the owner sees it started and cannot start a second one.
+        await componentInteraction.update({
+          embeds: [
+            createEmbed({
+              title: t('admin.panel.backupsTitle', locale),
+              description: t('owner.backup.running', locale),
+              color: COLORS.INFO,
+            }),
           ],
+          components: rows(true),
         });
-        // Already deferred and edited above; nothing left for the panel to do.
+
+        lastBackupMessage = await runBackupForPanel(locale);
+        // The panel closed while the backup ran (it has already said so):
+        // show the result, but keep the buttons off.
+        const expired = Date.now() >= closedBy(clickedAt);
+        await interaction.editReply({
+          embeds: [await renderEmbed()],
+          components: rows(expired),
+        });
+        // Already answered and edited above; nothing left for the panel.
         return 'handled';
       }
 

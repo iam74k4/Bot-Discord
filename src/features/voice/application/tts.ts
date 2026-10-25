@@ -5,9 +5,19 @@ import {
   type Message,
   MessageFlags,
   PermissionFlagsBits,
+  type VoiceBasedChannel,
 } from 'discord.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
-import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
+import {
+  createEmbed,
+  createErrorEmbed,
+  createInfoEmbed,
+  createWarningEmbed,
+} from '../../../shared/utils/embed.js';
+import { commandMention } from '../../../shared/utils/commandMentions.js';
+import { formatPermissionNames } from '../../../shared/utils/discord.js';
+import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
+import { releaseCooldown } from '../../../middleware/index.js';
 import { t, type Locale } from '../../../locales/index.js';
 import { resolveLocale } from '../../../locales/guildLocale.js';
 import { connectionManager } from '../recording/connectionManager.js';
@@ -27,6 +37,7 @@ import {
   clampSpeed,
   DEFAULT_SPEAKER_ID,
   getVoicevoxClient,
+  type VoicevoxVoice,
   voiceLabel,
 } from '../tts/voicevoxClient.js';
 import { announceBuffering } from './announce.js';
@@ -45,21 +56,62 @@ export const MAX_READING_LENGTH = 100;
 const DEFAULT_SPEED = 1;
 const CONNECT_TIMEOUT_MS = 15_000;
 const AUTOCOMPLETE_LIMIT = 25;
+/**
+ * Autocomplete must answer within Discord's 3 s; with nothing cached, wait
+ * this long for the engine and then offer nothing rather than fail.
+ */
+export const AUTOCOMPLETE_WAIT_MS = 2_000;
 const LIST_LIMIT = 40;
 
 type GuildInteraction = ChatInputCommandInteraction<'cached'>;
+type Severity = 'error' | 'warning' | 'info';
 
-async function replyError(
+const EMBED_FOR: Record<
+  Severity,
+  (title: string, description: string) => ReturnType<typeof createErrorEmbed>
+> = {
+  error: createErrorEmbed,
+  warning: createWarningEmbed,
+  info: createInfoEmbed,
+};
+
+/** A private answer in place of the result: before or after deferring. */
+async function replyNotice(
   interaction: ChatInputCommandInteraction,
+  severity: Severity,
   title: string,
   description: string
 ): Promise<void> {
-  const embed = createErrorEmbed(title, description);
+  const embed = EMBED_FOR[severity](title, description);
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply({ embeds: [embed] });
     return;
   }
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+/** Something went wrong on our side (engine, joining). */
+function replyError(
+  interaction: ChatInputCommandInteraction,
+  title: string,
+  description: string
+): Promise<void> {
+  return replyNotice(interaction, 'error', title, description);
+}
+
+/**
+ * The request was turned down before any work, for a reason the member can
+ * fix (join the channel, pick another word): the cooldown it started is
+ * given back so the retry goes through at once.
+ */
+function refuse(
+  interaction: ChatInputCommandInteraction,
+  severity: Exclude<Severity, 'error'>,
+  title: string,
+  description: string
+): Promise<void> {
+  releaseCooldown(interaction);
+  return replyNotice(interaction, severity, title, description);
 }
 
 function connectedChannelInGuild(guildId: string): string | undefined {
@@ -107,6 +159,17 @@ export async function executeTtsCommand(
   }
 }
 
+/** The voices members of a channel will be read with, default included. */
+function speakersIn(channel: VoiceBasedChannel): number[] {
+  const speakers = new Set<number>([DEFAULT_SPEAKER_ID]);
+  for (const member of channel.members?.values() ?? []) {
+    if (member.user?.bot) continue;
+    const settings = ttsRepository.getUserSettings(member.id);
+    if (settings) speakers.add(settings.speakerId);
+  }
+  return [...speakers];
+}
+
 async function handleStart(
   interaction: GuildInteraction,
   locale: Locale
@@ -123,18 +186,22 @@ async function handleStart(
 
   const voiceChannel = interaction.member.voice.channel;
   if (!voiceChannel) {
-    await replyError(
+    await refuse(
       interaction,
+      'warning',
       t('tts.errors.notInVoice', locale),
-      t('tts.errors.notInVoiceDesc', locale)
+      t('tts.errors.notInVoiceDesc', locale, {
+        command: commandMention('tts start'),
+      })
     );
     return;
   }
 
   const busyChannelId = connectedChannelInGuild(interaction.guildId);
   if (busyChannelId && busyChannelId !== voiceChannel.id) {
-    await replyError(
+    await refuse(
       interaction,
+      'warning',
       t('tts.errors.busyElsewhere', locale),
       t('tts.errors.busyElsewhereDesc', locale, { channel: busyChannelId })
     );
@@ -204,7 +271,10 @@ async function handleStart(
     startedBy: interaction.user.id,
   });
 
-  // Warm the voice list so the first `/tts voice` autocomplete is instant.
+  // Load the voices of everyone here, so nobody's first line waits a second
+  // for its model, and warm the voice list for `/tts voice` autocomplete.
+  // Neither is awaited: the reply does not wait on the engine.
+  ttsSessions.warmUp(speakersIn(voiceChannel));
   void client.listVoices().catch(() => undefined);
 
   const me = interaction.guild.members.me;
@@ -227,7 +297,13 @@ async function handleStart(
         fields: [
           {
             name: t('tts.howToTitle', locale),
-            value: t('tts.howTo', locale, { voice: voiceChannel.id }),
+            value: t('tts.howTo', locale, {
+              voice: voiceChannel.id,
+              voiceCommand: commandMention('tts voice'),
+              dictCommand: commandMention('tts dict add'),
+              skipCommand: commandMention('tts skip'),
+              stopCommand: commandMention('tts stop'),
+            }),
           },
         ],
         footer: t('tts.credit', locale),
@@ -246,10 +322,13 @@ async function requireSessionControl(
 ): Promise<string | null> {
   const session = ttsSessions.getForGuild(interaction.guildId);
   if (!session) {
-    await replyError(
+    await refuse(
       interaction,
+      'info',
       t('tts.errors.notRunning', locale),
-      t('tts.errors.notRunningDesc', locale)
+      t('tts.errors.notRunningDesc', locale, {
+        command: commandMention('tts start'),
+      })
     );
     return null;
   }
@@ -260,11 +339,16 @@ async function requireSessionControl(
     PermissionFlagsBits.ManageGuild
   );
   if (!inChannel && !isManager) {
-    await replyError(
+    await refuse(
       interaction,
+      'warning',
       t('tts.errors.notInSameVoice', locale),
       t('tts.errors.notInSameVoiceDesc', locale, {
         channel: session.voiceChannelId,
+        permission: formatPermissionNames(
+          PermissionFlagsBits.ManageGuild,
+          locale
+        ),
       })
     );
     return null;
@@ -291,7 +375,9 @@ async function handleStop(
     embeds: [
       createEmbed({
         title: t('tts.stopped', locale),
-        description: t('tts.stoppedDesc', locale),
+        description: t('tts.stoppedDesc', locale, {
+          command: commandMention('tts start'),
+        }),
         color: COLORS.INFO,
       }),
     ],
@@ -359,7 +445,9 @@ async function handleVoice(
           description: `${t('tts.voice.current', locale, {
             voice: voice ? voiceLabel(voice) : `#${current.speakerId}`,
             speed: formatSpeed(current.speed),
-          })}\n\n${t('tts.voice.changeHint', locale)}`,
+          })}\n\n${t('tts.voice.changeHint', locale, {
+            command: commandMention('tts voice'),
+          })}`,
           color: COLORS.INFO,
           footer: voice
             ? t('tts.voice.credit', locale, { character: voice.character })
@@ -373,8 +461,9 @@ async function handleVoice(
   const speakerId = speakerOption ?? current.speakerId;
   const voice = voices.find((v) => v.id === speakerId);
   if (!voice) {
-    await replyError(
+    await refuse(
       interaction,
+      'warning',
       t('tts.voice.unknown', locale),
       t('tts.voice.unknownDesc', locale)
     );
@@ -384,12 +473,13 @@ async function handleVoice(
   const speed = clampSpeed(speedOption ?? current.speed);
   ttsRepository.setUserSettings(userId, { speakerId, speed });
 
-  // Let them hear the new voice right away when they are being read.
   const session = ttsSessions.getForGuild(interaction.guildId);
   if (
     session &&
     interaction.member.voice.channelId === session.voiceChannelId
   ) {
+    // Let them hear the new voice right away when they are being read. The
+    // preview is its own line, never folded into one of their messages.
     ttsSessions.enqueue(session.voiceChannelId, {
       authorId: userId,
       authorName: speakableName(
@@ -399,7 +489,11 @@ async function handleVoice(
       text: t('tts.voice.preview', locale),
       speakerId,
       speed,
+      mergeable: false,
     });
+  } else if (session) {
+    // Reading is running here, so this voice will be needed soon.
+    ttsSessions.warmUp([speakerId]);
   }
 
   await interaction.editReply({
@@ -442,7 +536,9 @@ async function handleDictionary(
           description:
             lines.length > 0
               ? lines.join('\n')
-              : t('tts.dict.listEmpty', locale),
+              : t('tts.dict.listEmpty', locale, {
+                  command: commandMention('tts dict add'),
+                }),
           color: COLORS.INFO,
         }),
       ],
@@ -456,9 +552,10 @@ async function handleDictionary(
   if (subcommand === 'remove') {
     const entry = ttsRepository.getDictionaryEntry(guildId, word);
     if (!entry) {
-      await replyError(
+      await refuse(
         interaction,
-        t('common.error', locale),
+        'warning',
+        t('tts.dict.notFoundTitle', locale),
         t('tts.dict.notFound', locale, { word })
       );
       return;
@@ -467,10 +564,16 @@ async function handleDictionary(
       PermissionFlagsBits.ManageGuild
     );
     if (entry.createdBy !== interaction.user.id && !isManager) {
-      await replyError(
+      await refuse(
         interaction,
-        t('common.error', locale),
-        t('tts.dict.notOwner', locale)
+        'warning',
+        t('tts.dict.notOwnerTitle', locale),
+        t('tts.dict.notOwner', locale, {
+          permission: formatPermissionNames(
+            PermissionFlagsBits.ManageGuild,
+            locale
+          ),
+        })
       );
       return;
     }
@@ -495,9 +598,10 @@ async function handleDictionary(
     reading.length === 0 ||
     reading.length > MAX_READING_LENGTH
   ) {
-    await replyError(
+    await refuse(
       interaction,
-      t('common.error', locale),
+      'warning',
+      t('tts.dict.invalidTitle', locale),
       t('tts.dict.invalid', locale, {
         wordMax: MAX_WORD_LENGTH,
         readingMax: MAX_READING_LENGTH,
@@ -511,10 +615,14 @@ async function handleDictionary(
     !exists &&
     ttsRepository.countDictionary(guildId) >= MAX_DICTIONARY_ENTRIES
   ) {
-    await replyError(
+    await refuse(
       interaction,
-      t('common.error', locale),
-      t('tts.dict.full', locale, { max: MAX_DICTIONARY_ENTRIES })
+      'warning',
+      t('tts.dict.fullTitle', locale),
+      t('tts.dict.full', locale, {
+        max: MAX_DICTIONARY_ENTRIES,
+        command: commandMention('tts dict remove'),
+      })
     );
     return;
   }
@@ -539,6 +647,29 @@ async function handleDictionary(
   });
 }
 
+/** The promise's result, or `fallback` if it takes longer than `ms`. */
+function withDeadline<T>(promise: Promise<T>, ms: number, fallback: T) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Voices for autocomplete: the cached list at once (refreshed in the
+ * background when old), or - before the engine has ever answered - whatever
+ * arrives within `AUTOCOMPLETE_WAIT_MS`.
+ */
+async function voicesForAutocomplete(): Promise<VoicevoxVoice[]> {
+  const client = getVoicevoxClient();
+  if (!client) return [];
+  const cached = client.peekVoices();
+  const pending = client.listVoices().catch(() => [] as VoicevoxVoice[]);
+  if (cached) return cached;
+  return withDeadline(pending, AUTOCOMPLETE_WAIT_MS, []);
+}
+
 export async function autocompleteTts(
   interaction: AutocompleteInteraction
 ): Promise<void> {
@@ -546,8 +677,7 @@ export async function autocompleteTts(
   const query = String(focused.value).trim().toLowerCase();
 
   if (focused.name === 'speaker') {
-    const client = getVoicevoxClient();
-    const voices = client ? await client.listVoices().catch(() => []) : [];
+    const voices = await voicesForAutocomplete();
     await interaction.respond(
       voices
         .filter((voice) => voiceLabel(voice).toLowerCase().includes(query))
@@ -585,7 +715,7 @@ function speechContextFor(guild: Guild): SpeechContext {
       guild.client.users.cache.get(id)?.displayName,
     resolveRole: (id) => guild.roles.cache.get(id)?.name,
     resolveChannel: (id) => guild.channels.cache.get(id)?.name,
-    dictionary: ttsRepository.listDictionary(guild.id),
+    dictionary: ttsRepository.compiledDictionary(guild.id),
   };
 }
 
@@ -630,4 +760,18 @@ export async function handleTtsMessage(message: Message): Promise<void> {
     speakerId: settings?.speakerId ?? DEFAULT_SPEAKER_ID,
     speed: settings?.speed ?? DEFAULT_SPEED,
   });
+}
+
+/**
+ * Get the engine ready once the bot is up: the voice list for autocomplete
+ * and the default voice's model. Fire-and-forget; a missing or sleeping
+ * engine only means the first request pays the cost instead.
+ */
+export function warmUpTts(): void {
+  const client = getVoicevoxClient();
+  if (!client) return;
+  void client.listVoices().catch((error: unknown) => {
+    logger.debug(`TTS voice list warm-up failed: ${getErrorMessage(error)}`);
+  });
+  ttsSessions.warmUp([DEFAULT_SPEAKER_ID]);
 }

@@ -7,6 +7,7 @@ import {
   announceBuffering,
   forgetAnnouncement,
 } from '../application/announce.js';
+import { reconcileGuild } from '../application/reconcile.js';
 import { logger } from '../../../shared/utils/logger.js';
 
 function humanMemberCount(
@@ -14,19 +15,6 @@ function humanMemberCount(
 ): number {
   if (!channel) return 0;
   return channel.members.filter((member) => !member.user.bot).size;
-}
-
-/**
- * Channel id of an existing connection in this guild, if any.
- * Discord allows one voice connection per guild.
- */
-function connectedChannelInGuild(guildId: string): string | undefined {
-  for (const info of connectionManager.getAllConnections().values()) {
-    if (info.guildId === guildId) {
-      return info.channelId;
-    }
-  }
-  return undefined;
 }
 
 /**
@@ -54,7 +42,12 @@ export const event: Event<typeof Events.VoiceStateUpdate> = {
 
     // User left a voice channel
     if (oldState.channel && !newState.channel) {
-      await handleUserLeft(client, oldState);
+      const disconnected = await handleUserLeft(client, oldState);
+      // The bot's channel emptied; people may still be talking in another
+      // channel of this guild, which nothing else would make it join.
+      if (disconnected && oldState.guild) {
+        await reconcileGuild(oldState.guild);
+      }
     }
 
     // User moved to a different channel
@@ -126,6 +119,13 @@ async function handleUserJoined(
   const channel = state.channel;
   const guild = state.guild;
 
+  // Another bot (a music bot, say) joining is not a conversation to keep.
+  // Checking before connecting matters: connecting first and leaving again
+  // would hold the guild's one voice slot and could block a human's join.
+  if (humanMemberCount(channel) === 0) {
+    return;
+  }
+
   // Check if bot is already connected to this channel
   const existingConnection = connectionManager.getConnection(channel.id);
   if (existingConnection) {
@@ -144,7 +144,7 @@ async function handleUserJoined(
   // Discord allows one voice connection per guild. Staying on the current
   // channel avoids joinVoiceChannel moving the shared connection and
   // cross-wiring per-channel mix rings.
-  const busyChannelId = connectedChannelInGuild(guild.id);
+  const busyChannelId = connectionManager.getConnectedChannelInGuild(guild.id);
   if (busyChannelId) {
     logger.debug(
       `Already connected in guild ${guild.id} (channel ${busyChannelId}); skipping auto-join of ${channel.name} (${channel.id})`
@@ -187,27 +187,29 @@ async function handleUserJoined(
 
 /**
  * Handle user leaving a voice channel
+ * @returns true when the bot left the channel because nobody was left
  */
 async function handleUserLeft(
   _client: ExtendedClient,
   state: VoiceState
-): Promise<void> {
-  if (!state.channel || !state.guild) return;
+): Promise<boolean> {
+  if (!state.channel || !state.guild) return false;
 
   const channel = state.channel;
 
   // Check if bot is connected to this channel
   const connection = connectionManager.getConnection(channel.id);
-  if (!connection) return;
+  if (!connection) return false;
 
-  if (humanMemberCount(channel) === 0) {
-    // No users left, disconnect
-    logger.info(
-      `No users left in channel ${channel.name} (${channel.id}). Disconnecting...`
-    );
-    await connectionManager.disconnect(channel.id);
-    forgetAnnouncement(channel.id);
-  }
+  if (humanMemberCount(channel) > 0) return false;
+
+  // No users left, disconnect
+  logger.info(
+    `No users left in channel ${channel.name} (${channel.id}). Disconnecting...`
+  );
+  await connectionManager.disconnect(channel.id);
+  forgetAnnouncement(channel.id);
+  return true;
 }
 
 /**
@@ -219,8 +221,19 @@ async function handleUserMoved(
   newState: VoiceState
 ): Promise<void> {
   // Handle leaving old channel
-  await handleUserLeft(client, oldState);
+  const disconnected = await handleUserLeft(client, oldState);
 
-  // Handle joining new channel
+  // Handle joining new channel: the bot follows the user when it can.
   await handleUserJoined(client, newState);
+
+  // It could not follow (excluded channel, say) and left its old channel:
+  // pick up whichever channel of the guild is still occupied.
+  const guild = newState.guild;
+  if (
+    disconnected &&
+    guild &&
+    !connectionManager.getConnectedChannelInGuild(guild.id)
+  ) {
+    await reconcileGuild(guild);
+  }
 }

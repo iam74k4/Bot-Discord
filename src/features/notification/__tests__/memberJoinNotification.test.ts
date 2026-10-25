@@ -48,6 +48,14 @@ const { guildSettingsRepository } =
   await import('../../../infrastructure/guildSettings/index.js');
 
 const WELCOME_CHANNEL = 'welcome-1';
+const MEMBER_ID = 'member-1';
+
+function sentPayload(channel: ReturnType<typeof createTextChannel>) {
+  return vi.mocked(channel.send).mock.calls[0][0] as {
+    content: string;
+    allowedMentions: unknown;
+  };
+}
 
 function readyClient(isFullyReady = true) {
   return { isFullyReady } as never;
@@ -58,6 +66,7 @@ function createMember(
   overrides: { bot?: boolean; displayName?: string } = {}
 ) {
   const member = {
+    id: MEMBER_ID,
     displayName: overrides.displayName ?? 'Newcomer',
     user: {
       bot: overrides.bot ?? false,
@@ -96,31 +105,70 @@ describe('memberJoinNotification event', () => {
       );
     });
 
-    it('posts a welcome embed with the member name, avatar and member count', async () => {
+    it('welcomes the member by mention with their member number and avatar', async () => {
       const channel = createTextChannel(WELCOME_CHANNEL);
       const { member } = createMember(
-        { cached: [channel], memberCount: 42 },
+        { cached: [channel], memberCount: 1234 },
         { displayName: 'Alice' }
       );
 
       await event.execute(readyClient(), member);
 
       expect(channel.send).toHaveBeenCalledTimes(1);
-      const embed = embedOf(vi.mocked(channel.send).mock.calls[0][0]);
-      expect(embed.title).toBe(t('notification.events.memberJoinTitle', 'en'));
+      const payload = sentPayload(channel);
+      // The mention pings the newcomer and nobody else.
+      expect(payload.content).toBe(`<@${MEMBER_ID}>`);
+      expect(payload.allowedMentions).toEqual({ users: [MEMBER_ID] });
+      const embed = embedOf(payload);
+      // A server that never chose a language posts in Japanese.
+      expect(embed.title).toBe(t('notification.events.memberJoinTitle', 'ja'));
       expect(embed.description).toBe(
-        t('notification.events.memberJoin', 'en', { name: 'Alice' })
+        t('notification.events.memberJoin', 'ja', {
+          name: 'Alice',
+          count: '1,234',
+        })
       );
       expect(embed.color).toBe(COLORS.SUCCESS);
       expect(embed.thumbnail?.url).toBe('https://cdn.example/avatar.png');
-      expect(embed.fields).toEqual([
-        {
-          name: t('notification.events.memberCount', 'en'),
-          value: '42',
-          inline: true,
-        },
-      ]);
+      expect(embed.fields).toBeUndefined();
       expect(embed.timestamp).toBeDefined();
+    });
+
+    it('escapes markdown in the display name', async () => {
+      const channel = createTextChannel(WELCOME_CHANNEL);
+      const { member } = createMember(
+        { cached: [channel], memberCount: 3 },
+        { displayName: '**big**_name' }
+      );
+
+      await event.execute(readyClient(), member);
+
+      expect(embedOf(sentPayload(channel)).description).toBe(
+        t('notification.events.memberJoin', 'ja', {
+          name: '\\*\\*big\\*\\*\\_name',
+          count: '3',
+        })
+      );
+    });
+
+    it('points at the rules channel when the server has one', async () => {
+      const channel = createTextChannel(WELCOME_CHANNEL);
+      const { member } = createMember({
+        cached: [channel],
+        memberCount: 5,
+        rulesChannelId: 'rules-1',
+      });
+
+      await event.execute(readyClient(), member);
+
+      expect(embedOf(sentPayload(channel)).description).toBe(
+        `${t('notification.events.memberJoin', 'ja', {
+          name: 'Newcomer',
+          count: '5',
+        })}\n${t('notification.events.memberJoinRules', 'ja', {
+          channel: 'rules-1',
+        })}`
+      );
     });
 
     it('fetches the channel when it is not cached yet', async () => {
@@ -133,24 +181,46 @@ describe('memberJoinNotification event', () => {
       expect(channel.send).toHaveBeenCalledTimes(1);
     });
 
-    it('writes in the guild preferred locale when no language is configured', async () => {
-      const channel = createTextChannel(WELCOME_CHANNEL);
-      const { member } = createMember({
-        cached: [channel],
-        preferredLocale: 'ja',
-      });
+    it.each([
+      [
+        'a non-Community server, whose language Discord fixes at en-US',
+        {},
+        'ja',
+      ],
+      [
+        'a Community server set to English',
+        { features: ['COMMUNITY'], preferredLocale: 'en-US' },
+        'en',
+      ],
+      [
+        'a Community server set to Japanese',
+        { features: ['COMMUNITY'], preferredLocale: 'ja' },
+        'ja',
+      ],
+    ] as const)(
+      'writes for %s in its language when none is configured',
+      async (_case, guildOptions, locale) => {
+        const channel = createTextChannel(WELCOME_CHANNEL);
+        const { member } = createMember({
+          cached: [channel],
+          ...guildOptions,
+        });
 
-      await event.execute(readyClient(), member);
+        await event.execute(readyClient(), member);
 
-      const embed = embedOf(vi.mocked(channel.send).mock.calls[0][0]);
-      expect(embed.title).toBe(t('notification.events.memberJoinTitle', 'ja'));
-    });
+        const embed = embedOf(sentPayload(channel));
+        expect(embed.title).toBe(
+          t('notification.events.memberJoinTitle', locale)
+        );
+      }
+    );
 
-    it('lets the configured guild language override the preferred locale', async () => {
+    it('lets the configured guild language override the server language', async () => {
       guildSettingsRepository.setLanguage(GUILD_ID, 'en');
       const channel = createTextChannel(WELCOME_CHANNEL);
       const { member } = createMember({
         cached: [channel],
+        features: ['COMMUNITY'],
         preferredLocale: 'ja',
       });
 

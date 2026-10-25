@@ -1,15 +1,70 @@
 import {
   ChannelType,
   ChatInputCommandInteraction,
+  type ColorResolvable,
   MessageFlags,
 } from 'discord.js';
 import { env } from '../../../config/index.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
-import { t } from '../../../locales/index.js';
+import { commandMention } from '../../../shared/utils/commandMentions.js';
+import { releaseCooldown } from '../../../middleware/index.js';
+import { t, type Locale } from '../../../locales/index.js';
 import { resolveLocale } from '../../../locales/guildLocale.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 import { connectionManager } from '../recording/connectionManager.js';
+import type { ReconcileOutcome } from './reconcile.js';
+import { auditVoiceSettingChange } from './settingsAudit.js';
+import {
+  disableAutoJoin,
+  enableAutoJoin,
+  excludeChannel,
+  includeChannel,
+} from './policy.js';
+
+/** What a reconcile right after a change means for the admin. */
+export function describeReconcile(
+  outcome: ReconcileOutcome | undefined,
+  locale: Locale
+): string | null {
+  switch (outcome?.status) {
+    case 'joined':
+      return t('record.autojoin.joinedNow', locale, {
+        channel: outcome.channelId,
+      });
+    case 'none':
+      return t('record.autojoin.waitingForMembers', locale);
+    case 'already':
+      // A reading-only connection holds the guild's one voice slot without
+      // keeping anything; "turned on" alone would suggest otherwise.
+      return connectionManager.getConnection(outcome.channelId)?.receiving ===
+        false
+        ? t('record.autojoin.alreadyReadOnly', locale, {
+            channel: outcome.channelId,
+          })
+        : null;
+    default:
+      return null;
+  }
+}
+
+function answer(
+  interaction: ChatInputCommandInteraction,
+  locale: Locale,
+  lines: Array<string | null>,
+  color: ColorResolvable
+) {
+  return interaction.reply({
+    embeds: [
+      createEmbed({
+        title: t('record.autojoin.title', locale),
+        description: lines.filter(Boolean).join('\n\n'),
+        color,
+      }),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
 
 /**
  * `/voice autojoin` - control whether the bot joins voice channels and keeps
@@ -33,36 +88,49 @@ export async function executeAutoJoinCommand(
     return;
   }
 
-  const guildId = interaction.guildId;
+  const guild = interaction.guild;
   const subcommand = interaction.options.getSubcommand();
   const minutes = Math.round(env.AUDIO_BUFFER_DURATION / 60);
+  const audit = (change: Parameters<typeof auditVoiceSettingChange>[3]) =>
+    auditVoiceSettingChange(
+      interaction.client,
+      guild,
+      interaction.user.id,
+      change,
+      { command: `voice autojoin ${subcommand}` }
+    );
 
-  if (subcommand === 'enable' || subcommand === 'disable') {
-    const enable = subcommand === 'enable';
-    voiceSettingsRepository.setAutoJoinEnabled(guildId, enable);
-
-    // Turning it off should stop the buffering already in progress, not just
-    // prevent the next join.
-    if (!enable) {
-      for (const [channelId, info] of connectionManager.getAllConnections()) {
-        if (info.guildId === guildId) {
-          await connectionManager.disconnect(channelId);
-        }
-      }
-    }
-
-    await interaction.reply({
-      embeds: [
-        createEmbed({
-          title: t('record.autojoin.title', locale),
-          description: enable
-            ? t('record.autojoin.enabled', locale, { minutes })
-            : t('record.autojoin.disabled', locale),
-          color: enable ? COLORS.SUCCESS : COLORS.WARNING,
-        }),
+  if (subcommand === 'enable') {
+    const outcome = await enableAutoJoin(guild);
+    audit({ kind: 'autoJoinEnabled' });
+    await answer(
+      interaction,
+      locale,
+      [
+        t('record.autojoin.enabled', locale, { minutes }),
+        describeReconcile(outcome, locale),
       ],
-      flags: MessageFlags.Ephemeral,
-    });
+      COLORS.SUCCESS
+    );
+    return;
+  }
+
+  if (subcommand === 'disable') {
+    // Turning it off stops the buffering already in progress, not just the
+    // next join, and the reply waits until the bot has actually left.
+    const dropped = await disableAutoJoin(guild.id);
+    audit({ kind: 'autoJoinDisabled' });
+    await answer(
+      interaction,
+      locale,
+      [
+        t('record.autojoin.disabled', locale, {
+          command: commandMention('voice autojoin enable'),
+        }),
+        dropped > 0 ? t('record.autojoin.disabledDropped', locale) : null,
+      ],
+      COLORS.SUCCESS
+    );
     return;
   }
 
@@ -71,11 +139,12 @@ export async function executeAutoJoinCommand(
     channel.type !== ChannelType.GuildVoice &&
     channel.type !== ChannelType.GuildStageVoice
   ) {
+    releaseCooldown(interaction);
     await interaction.reply({
       embeds: [
         createErrorEmbed(
           t('common.error', locale),
-          t('record.errors.notInVoiceDesc', locale)
+          t('record.errors.notVoiceChannel', locale)
         ),
       ],
       flags: MessageFlags.Ephemeral,
@@ -84,43 +153,51 @@ export async function executeAutoJoinCommand(
   }
 
   if (subcommand === 'exclude') {
-    voiceSettingsRepository.addExclusion(guildId, channel.id);
-
-    if (connectionManager.getConnection(channel.id)) {
-      await connectionManager.disconnect(channel.id);
-    }
-
-    await interaction.reply({
-      embeds: [
-        createEmbed({
-          title: t('record.autojoin.title', locale),
-          description: t('record.autojoin.excluded', locale, {
-            channel: channel.id,
-          }),
-          color: COLORS.WARNING,
-        }),
+    const { added, left } = await excludeChannel(guild, channel.id);
+    if (added) audit({ kind: 'channelExcluded', channelId: channel.id });
+    await answer(
+      interaction,
+      locale,
+      [
+        added
+          ? t('record.autojoin.excluded', locale, { channel: channel.id })
+          : t('record.autojoin.alreadyExcluded', locale, {
+              channel: channel.id,
+            }),
+        left
+          ? t('record.autojoin.excludedLeft', locale, { channel: channel.id })
+          : null,
       ],
-      flags: MessageFlags.Ephemeral,
-    });
+      added ? COLORS.SUCCESS : COLORS.INFO
+    );
     return;
   }
 
-  const removed = voiceSettingsRepository.removeExclusion(guildId, channel.id);
-  await interaction.reply({
-    embeds: [
-      removed
-        ? createEmbed({
-            title: t('record.autojoin.title', locale),
-            description: t('record.autojoin.included', locale, {
-              channel: channel.id,
-            }),
-            color: COLORS.SUCCESS,
-          })
-        : createErrorEmbed(
-            t('common.error', locale),
-            t('record.autojoin.notExcluded', locale, { channel: channel.id })
-          ),
+  const { removed, outcome } = await includeChannel(guild, channel.id);
+  if (!removed) {
+    // Nothing to undo: say so plainly, it is not an error.
+    await answer(
+      interaction,
+      locale,
+      [t('record.autojoin.notExcluded', locale, { channel: channel.id })],
+      COLORS.INFO
+    );
+    return;
+  }
+
+  audit({ kind: 'channelIncluded', channelId: channel.id });
+  const autoJoinOn = voiceSettingsRepository.isAutoJoinEnabled(guild.id);
+  await answer(
+    interaction,
+    locale,
+    [
+      t('record.autojoin.included', locale, { channel: channel.id }),
+      autoJoinOn
+        ? describeReconcile(outcome, locale)
+        : t('record.autojoin.includedWhileOff', locale, {
+            command: commandMention('voice autojoin enable'),
+          }),
     ],
-    flags: MessageFlags.Ephemeral,
-  });
+    autoJoinOn ? COLORS.SUCCESS : COLORS.WARNING
+  );
 }

@@ -11,6 +11,17 @@ export interface DiscoveredCommand {
   command: Command;
 }
 
+/**
+ * Whether a directory entry is a module to import: `.ts` in development,
+ * `.js` once built. Declaration files (`.d.ts`, emitted by `npm run build`
+ * next to every module) and `index.*` barrels are not.
+ */
+export function isLoadableModuleFile(file: string): boolean {
+  if (file.startsWith('index.')) return false;
+  if (file.endsWith('.d.ts')) return false;
+  return file.endsWith('.ts') || file.endsWith('.js');
+}
+
 function isValidCommand(command: unknown): command is Command {
   if (!command || typeof command !== 'object') return false;
   const c = command as Partial<Command>;
@@ -31,11 +42,8 @@ export async function discoverFeatureCommands(
     const featureCommandsPath = join(featuresPath, feature, 'commands');
     if (!existsSync(featureCommandsPath)) continue;
 
-    const commandFiles = readdirSync(featureCommandsPath).filter(
-      (file) =>
-        (file.endsWith('.ts') || file.endsWith('.js')) &&
-        !file.startsWith('index.')
-    );
+    const commandFiles =
+      readdirSync(featureCommandsPath).filter(isLoadableModuleFile);
 
     for (const file of commandFiles) {
       const filePath = join(featureCommandsPath, file);

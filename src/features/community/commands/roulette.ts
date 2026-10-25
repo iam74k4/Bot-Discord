@@ -1,9 +1,85 @@
-import { SlashCommandBuilder } from 'discord.js';
+import {
+  InteractionContextType,
+  SlashCommandBuilder,
+  type SlashCommandSubcommandBuilder,
+} from 'discord.js';
 import { Command } from '../../../shared/types/index.js';
 import {
+  autocompletePollToEnd,
   executePollCommand,
   executeRouletteCommand,
+  MAX_ANSWER_LENGTH,
 } from '../application/index.js';
+
+/** Option slots on `/community poll create`; the form takes any number. */
+const OPTION_SLOTS = 10;
+
+function pollCreateSubcommand(
+  subcommand: SlashCommandSubcommandBuilder
+): SlashCommandSubcommandBuilder {
+  subcommand
+    .setName('create')
+    .setDescription(
+      'Create a poll (leave the options empty to type them in a form)'
+    )
+    .setDescriptionLocalizations({
+      ja: '投票を作成（選択肢を省略すると入力フォームが開きます）',
+    })
+    .addStringOption((option) =>
+      option
+        .setName('question')
+        .setNameLocalizations({ ja: '質問' })
+        .setDescription('The poll question (up to 300 characters)')
+        .setDescriptionLocalizations({ ja: '投票の質問（300文字まで）' })
+        .setRequired(true)
+        .setMaxLength(300)
+    );
+
+  // Optional, all of them: with fewer than two filled in, the command opens
+  // a form that takes the options one per line, which is quicker on a phone.
+  for (let slot = 1; slot <= OPTION_SLOTS; slot++) {
+    subcommand.addStringOption((option) =>
+      option
+        .setName(`option${slot}`)
+        .setNameLocalizations({ ja: `選択肢${slot}` })
+        .setDescription(
+          `Option ${slot} (up to ${MAX_ANSWER_LENGTH} characters)`
+        )
+        .setDescriptionLocalizations({
+          ja: `選択肢${slot}（${MAX_ANSWER_LENGTH}文字まで）`,
+        })
+        .setMaxLength(MAX_ANSWER_LENGTH)
+    );
+  }
+
+  return subcommand
+    .addIntegerOption((option) =>
+      option
+        .setName('duration')
+        .setNameLocalizations({ ja: '期間' })
+        .setDescription('How long the poll stays open (default: 24 hours)')
+        .setDescriptionLocalizations({
+          ja: '投票を受け付ける期間（既定: 24時間）',
+        })
+        .addChoices(
+          { name: '1 hour', name_localizations: { ja: '1時間' }, value: 1 },
+          { name: '4 hours', name_localizations: { ja: '4時間' }, value: 4 },
+          { name: '8 hours', name_localizations: { ja: '8時間' }, value: 8 },
+          { name: '24 hours', name_localizations: { ja: '24時間' }, value: 24 },
+          { name: '3 days', name_localizations: { ja: '3日' }, value: 72 },
+          { name: '7 days', name_localizations: { ja: '7日' }, value: 168 }
+        )
+    )
+    .addBooleanOption((option) =>
+      option
+        .setName('multi')
+        .setNameLocalizations({ ja: '複数選択' })
+        .setDescription('Let people pick more than one option')
+        .setDescriptionLocalizations({
+          ja: '1人で複数の選択肢に投票できるようにする',
+        })
+    );
+}
 
 export const command: Command = {
   data: new SlashCommandBuilder()
@@ -12,6 +88,8 @@ export const command: Command = {
     .setDescriptionLocalizations({
       ja: '投票とVCルーレットのコミュニティ機能',
     })
+    // Polls and roulette both belong to a server; hide it from DMs.
+    .setContexts(InteractionContextType.Guild)
     .addSubcommandGroup((group) =>
       group
         .setName('poll')
@@ -19,151 +97,26 @@ export const command: Command = {
         .setDescriptionLocalizations({
           ja: '投票の作成と管理',
         })
-        .addSubcommand((subcommand) =>
-          subcommand
-            .setName('create')
-            .setDescription('Create a new poll')
-            .setDescriptionLocalizations({
-              ja: '新しい投票を作成',
-            })
-            .addStringOption((option) =>
-              option
-                .setName('question')
-                .setDescription('The poll question')
-                .setDescriptionLocalizations({
-                  ja: '投票の質問',
-                })
-                .setRequired(true)
-                .setMaxLength(300)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option1')
-                .setDescription('First option')
-                .setDescriptionLocalizations({ ja: '選択肢1' })
-                .setRequired(true)
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option2')
-                .setDescription('Second option')
-                .setDescriptionLocalizations({ ja: '選択肢2' })
-                .setRequired(true)
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option3')
-                .setDescription('Third option')
-                .setDescriptionLocalizations({ ja: '選択肢3' })
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option4')
-                .setDescription('Fourth option')
-                .setDescriptionLocalizations({ ja: '選択肢4' })
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option5')
-                .setDescription('Fifth option')
-                .setDescriptionLocalizations({ ja: '選択肢5' })
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option6')
-                .setDescription('Sixth option')
-                .setDescriptionLocalizations({ ja: '選択肢6' })
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option7')
-                .setDescription('Seventh option')
-                .setDescriptionLocalizations({ ja: '選択肢7' })
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option8')
-                .setDescription('Eighth option')
-                .setDescriptionLocalizations({ ja: '選択肢8' })
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option9')
-                .setDescription('Ninth option')
-                .setDescriptionLocalizations({ ja: '選択肢9' })
-                .setMaxLength(55)
-            )
-            .addStringOption((option) =>
-              option
-                .setName('option10')
-                .setDescription('Tenth option')
-                .setDescriptionLocalizations({ ja: '選択肢10' })
-                .setMaxLength(55)
-            )
-            .addIntegerOption((option) =>
-              option
-                .setName('duration')
-                .setDescription('How long the poll stays open (default: 24h)')
-                .setDescriptionLocalizations({
-                  ja: '投票を開けておく期間（既定: 24時間）',
-                })
-                .addChoices(
-                  {
-                    name: '1 hour',
-                    name_localizations: { ja: '1時間' },
-                    value: 1,
-                  },
-                  {
-                    name: '4 hours',
-                    name_localizations: { ja: '4時間' },
-                    value: 4,
-                  },
-                  {
-                    name: '8 hours',
-                    name_localizations: { ja: '8時間' },
-                    value: 8,
-                  },
-                  {
-                    name: '24 hours',
-                    name_localizations: { ja: '24時間' },
-                    value: 24,
-                  },
-                  {
-                    name: '3 days',
-                    name_localizations: { ja: '3日' },
-                    value: 72,
-                  },
-                  {
-                    name: '7 days',
-                    name_localizations: { ja: '7日' },
-                    value: 168,
-                  }
-                )
-            )
-            .addBooleanOption((option) =>
-              option
-                .setName('multi')
-                .setDescription('Let people pick more than one option')
-                .setDescriptionLocalizations({
-                  ja: '複数の選択肢に投票できるようにする',
-                })
-            )
-        )
+        .addSubcommand(pollCreateSubcommand)
         .addSubcommand((subcommand) =>
           subcommand
             .setName('end')
-            .setDescription('Close your poll early')
+            .setDescription('Close one of your polls early')
             .setDescriptionLocalizations({
               ja: '自分の投票を早めに締め切る',
             })
+            .addStringOption((option) =>
+              option
+                .setName('poll')
+                .setNameLocalizations({ ja: '投票' })
+                .setDescription(
+                  'Which poll to end (default: your newest here, else in this server)'
+                )
+                .setDescriptionLocalizations({
+                  ja: '締め切る投票（未指定ならこのチャンネルの最新、なければサーバー内の最新）',
+                })
+                .setAutocomplete(true)
+            )
         )
     )
     .addSubcommandGroup((group) =>
@@ -171,29 +124,32 @@ export const command: Command = {
         .setName('roulette')
         .setDescription('Pick members or split teams from your current VC')
         .setDescriptionLocalizations({
-          ja: '現在のVCからメンバー抽選やチーム分け',
+          ja: '参加中のVCからメンバー抽選やチーム分け',
         })
         .addSubcommand((subcommand) =>
           subcommand
             .setName('member')
-            .setDescription('Randomly select one member from voice channel')
+            .setDescription('Pick one member of your voice channel at random')
             .setDescriptionLocalizations({
-              ja: 'ボイスチャンネルからランダムに1人選択',
+              ja: '参加中のVCからランダムに1人選ぶ',
             })
         )
         .addSubcommand((subcommand) =>
           subcommand
             .setName('team')
-            .setDescription('Divide voice channel members into teams')
+            .setDescription(
+              'Split the members of your voice channel into teams'
+            )
             .setDescriptionLocalizations({
-              ja: 'ボイスチャンネルのメンバーをチーム分け',
+              ja: '参加中のVCのメンバーをチームに分ける',
             })
             .addIntegerOption((option) =>
               option
                 .setName('count')
+                .setNameLocalizations({ ja: 'チーム数' })
                 .setDescription('Number of teams')
                 .setDescriptionLocalizations({
-                  ja: '作成するチーム数',
+                  ja: '作るチームの数',
                 })
                 .setRequired(true)
                 .addChoices(
@@ -230,11 +186,44 @@ export const command: Command = {
   middleware: ['cooldown'],
 
   options: {
-    cooldown: 10000, // 10 seconds cooldown (animation takes time)
+    // Per path, so creating a poll never blocks ending it, and neither
+    // touches roulette.
+    cooldowns: {
+      'community poll': 3_000,
+      // Covers the ~3.6 s animation; another pick uses the result's buttons.
+      'community roulette': 5_000,
+    },
   },
 
   help: {
     category: { en: 'Community', ja: 'コミュニティ' },
+    keywords: {
+      'community roulette': [{ ja: 'ルーレット', en: 'roulette' }],
+    },
+    examples: {
+      'community poll create': [
+        {
+          ja: '`/community poll create 質問:お昼どうする？` 選択肢を1行ずつ入力するフォームが開く',
+          en: '`/community poll create question:Lunch?` opens a form to type the options one per line',
+        },
+        {
+          ja: '`/community poll create 質問:お昼どうする？ 選択肢1:ラーメン 選択肢2:カレー` その場で投票を作成',
+          en: '`/community poll create question:Lunch? option1:Ramen option2:Curry` posts the poll right away',
+        },
+      ],
+      'community poll end': [
+        {
+          ja: '`/community poll end` このチャンネルで自分が最後に作った投票を締め切る（なければサーバー内で最後に作った投票）',
+          en: '`/community poll end` closes your newest poll in this channel, or else your newest in the server',
+        },
+      ],
+      'community roulette team': [
+        {
+          ja: '`/community roulette team チーム数:2` VCのメンバーを2チームに分ける',
+          en: '`/community roulette team count:2` splits your VC into two teams',
+        },
+      ],
+    },
   },
 
   async execute(interaction) {
@@ -244,5 +233,10 @@ export const command: Command = {
       return;
     }
     await executeRouletteCommand(interaction);
+  },
+
+  async autocomplete(interaction) {
+    // `poll` on `/community poll end` is the only autocomplete option.
+    await autocompletePollToEnd(interaction);
   },
 };

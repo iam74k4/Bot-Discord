@@ -14,8 +14,14 @@ vi.mock('../repositories/notificationChannelRepository.js', () => ({
   notificationChannelRepository: { set, remove },
 }));
 
-vi.mock('../../../shared/utils/discord.js', () => ({
-  getSendableTextChannel: vi.fn().mockResolvedValue({ id: 'text-1' }),
+vi.mock('../application/channelCheck.js', () => ({
+  checkNotificationChannel: vi
+    .fn()
+    .mockResolvedValue({ ok: true, channel: { id: 'channel-1' } }),
+}));
+
+vi.mock('../application/postLanguage.js', () => ({
+  postLanguageLines: () => [],
 }));
 
 vi.mock('../application/panel.js', () => ({

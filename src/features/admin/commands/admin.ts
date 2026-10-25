@@ -1,5 +1,6 @@
 import {
   ChannelType,
+  InteractionContextType,
   PermissionFlagsBits,
   SlashCommandBuilder,
 } from 'discord.js';
@@ -17,6 +18,8 @@ export const command: Command = {
       ja: 'サーバー設定とロール操作の管理者コマンド',
     })
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    // Every subcommand acts on a server, so it is not offered in DMs.
+    .setContexts(InteractionContextType.Guild)
     .addSubcommandGroup((group) =>
       group
         .setName('settings')
@@ -42,6 +45,7 @@ export const command: Command = {
             .addChannelOption((opt) =>
               opt
                 .setName('channel')
+                .setNameLocalizations({ ja: 'チャンネル' })
                 .setDescription(
                   'Channel for audit logs (leave empty to disable)'
                 )
@@ -54,13 +58,14 @@ export const command: Command = {
         .addSubcommand((sub) =>
           sub
             .setName('announcements')
-            .setDescription('Set the channel for bot owner announcements')
+            .setDescription('Set the channel for bot operator announcements')
             .setDescriptionLocalizations({
-              ja: 'Bot オーナーからのお知らせを受け取るチャンネルを設定',
+              ja: 'Bot運営者からのお知らせを受け取るチャンネルを設定',
             })
             .addChannelOption((opt) =>
               opt
                 .setName('channel')
+                .setNameLocalizations({ ja: 'チャンネル' })
                 .setDescription(
                   'Channel for announcements (leave empty to opt out)'
                 )
@@ -88,9 +93,12 @@ export const command: Command = {
             .addStringOption((opt) =>
               opt
                 .setName('lang')
-                .setDescription('Language')
+                .setNameLocalizations({ ja: '言語' })
+                .setDescription(
+                  "Bot language (automatic: replies follow each user's Discord)"
+                )
                 .setDescriptionLocalizations({
-                  ja: '言語',
+                  ja: 'Botの表示言語（自動: 返信を各ユーザーのDiscordの言語に合わせる）',
                 })
                 .setRequired(true)
                 .addChoices(
@@ -110,7 +118,7 @@ export const command: Command = {
         .setName('role')
         .setDescription('Add or remove member roles')
         .setDescriptionLocalizations({
-          ja: 'メンバーへのロール付与・剥奪',
+          ja: 'メンバーへのロール付与・解除',
         })
         .addSubcommand((sub) =>
           sub
@@ -122,6 +130,7 @@ export const command: Command = {
             .addUserOption((opt) =>
               opt
                 .setName('user')
+                .setNameLocalizations({ ja: 'メンバー' })
                 .setDescription('Member to add the role to')
                 .setDescriptionLocalizations({
                   ja: 'ロールを付与するメンバー',
@@ -131,6 +140,7 @@ export const command: Command = {
             .addRoleOption((opt) =>
               opt
                 .setName('role')
+                .setNameLocalizations({ ja: 'ロール' })
                 .setDescription('Role to add')
                 .setDescriptionLocalizations({
                   ja: '付与するロール',
@@ -143,23 +153,25 @@ export const command: Command = {
             .setName('remove')
             .setDescription('Remove a role from a member')
             .setDescriptionLocalizations({
-              ja: 'メンバーからロールを剥奪',
+              ja: 'メンバーからロールを外す',
             })
             .addUserOption((opt) =>
               opt
                 .setName('user')
+                .setNameLocalizations({ ja: 'メンバー' })
                 .setDescription('Member to remove the role from')
                 .setDescriptionLocalizations({
-                  ja: 'ロールを剥奪するメンバー',
+                  ja: 'ロールを外すメンバー',
                 })
                 .setRequired(true)
             )
             .addRoleOption((opt) =>
               opt
                 .setName('role')
+                .setNameLocalizations({ ja: 'ロール' })
                 .setDescription('Role to remove')
                 .setDescriptionLocalizations({
-                  ja: '剥奪するロール',
+                  ja: '外すロール',
                 })
                 .setRequired(true)
             )
@@ -169,6 +181,15 @@ export const command: Command = {
   help: {
     category: { en: 'Admin', ja: '管理者' },
     permission: ['manageGuild', 'manageRoles'],
+    // Each group checks its own permission, so help lists each group only to
+    // the members that group serves. Discord still shows /admin only to
+    // Manage Server holders (the default above); a moderator with Manage
+    // Roles alone gets `/admin role` once a server admin allows them the
+    // command under Server Settings → Integrations.
+    subcommandPermissions: {
+      'admin settings': 'manageGuild',
+      'admin role': 'manageRoles',
+    },
   },
 
   async execute(interaction) {

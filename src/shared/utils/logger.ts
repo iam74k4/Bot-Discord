@@ -33,12 +33,16 @@ const colors = {
 } as const;
 
 /**
- * Patterns for sensitive data masking
+ * Patterns for sensitive data masking.
+ *
+ * Bare 17-19 digit numbers are deliberately left alone: they are Discord
+ * snowflakes (user, guild, channel ids) that logs need to stay useful. The
+ * old Steam64 mask matched any 17-digit number and garbled 2015-2016
+ * snowflakes; Steam support is gone, so the mask went with it.
  */
 const MASK_PATTERNS: {
   pattern: RegExp;
   name: string;
-  replacer?: (match: string) => string;
 }[] = [
   // Discord tokens (Bot/Bearer tokens format: base64.base64.base64)
   {
@@ -49,12 +53,6 @@ const MASK_PATTERNS: {
   {
     pattern: /\b([A-F0-9]{32})\b/gi,
     name: 'apikey',
-  },
-  // Steam ID 64 (17 digits) - partial mask
-  {
-    pattern: /\b(\d{17})\b/g,
-    name: 'steamid',
-    replacer: (match: string) => match.slice(0, 4) + '***' + match.slice(-4),
   },
   // Webhook URLs
   {
@@ -68,12 +66,8 @@ const MASK_PATTERNS: {
  */
 function maskString(str: string): string {
   let masked = str;
-  for (const { pattern, name, replacer } of MASK_PATTERNS) {
-    if (replacer) {
-      masked = masked.replace(pattern, replacer);
-    } else {
-      masked = masked.replace(pattern, `[MASKED_${name.toUpperCase()}]`);
-    }
+  for (const { pattern, name } of MASK_PATTERNS) {
+    masked = masked.replace(pattern, `[MASKED_${name.toUpperCase()}]`);
   }
   return masked;
 }

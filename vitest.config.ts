@@ -20,14 +20,14 @@ export default defineConfig({
         'src/app-scripts/**', // CLI maintenance scripts
         'src/events/**', // Discord event handlers (integration)
       ],
-      // Floors sit a little under the measured coverage (lines 97.9,
-      // functions 98.1, branches 93.7, statements 97.1) so CI fails when a
+      // Floors sit a little under the measured coverage (lines 98.4,
+      // functions 97.2, branches 93.9, statements 97.6) so CI fails when a
       // change lands without tests, not on rounding noise.
       thresholds: {
-        lines: 96,
+        lines: 97,
         functions: 96,
         branches: 92,
-        statements: 95,
+        statements: 96,
       },
     },
   },

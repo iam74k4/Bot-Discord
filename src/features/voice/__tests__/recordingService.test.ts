@@ -8,74 +8,84 @@ import {
   it,
   vi,
 } from 'vitest';
-import { createWriteStream, type WriteStream } from 'fs';
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { basename, dirname, join, relative } from 'path';
-import { Writable } from 'stream';
 import { DISCORD_LIMITS } from '../../../config/index.js';
 import { parseConfig } from '../../../config/schema.js';
 import {
   generateFileName,
   parseDurationString,
   pcmBufferHasAudibleSignal,
+  planRecordingParts,
   recordAudio,
+  RecordingInProgressError,
   RecordingNoAudibleAudioError,
 } from '../recording/recordingService.js';
 
 const mockExtractLastSeconds = vi.hoisted(() =>
   vi.fn<(channelId: string, seconds: number) => Buffer>()
 );
+const mockBufferedSeconds = vi.hoisted(() =>
+  vi.fn<(channelId: string) => number>()
+);
 const mockEnv = vi.hoisted(() => ({
   RECORDINGS_DIR: '',
   MAX_RECORDING_DURATION: 300,
   AUDIO_BUFFER_DURATION: 300,
 }));
+
 /**
- * Lets a single test shrink the upload limit so a many-part split stays
- * small on disk. null keeps the real DISCORD_LIMITS value.
+ * The ring's async extract, reduced to what the service relies on: the PCM,
+ * whether any sample is above the noise floor, and room for a header in
+ * front of it in the same allocation.
  */
-const limitOverride = vi.hoisted(() => ({
-  maxFileSizeMb: null as number | null,
-}));
-
-vi.mock('../recording/channelMixRing.js', () => ({
-  channelMixRingManager: {
-    extractLastSeconds: mockExtractLastSeconds,
-  },
-}));
-
-// Keep the real AUDIO / DISCORD_LIMITS constants so the WAV and split
-// assertions follow whatever the production values are. MAX_FILE_SIZE_MB is
-// read through a getter so one test can lower it; every split assertion reads
-// DISCORD_LIMITS back instead of hard-coding a size.
-vi.mock('../../../config/index.js', async (importOriginal) => {
+vi.mock('../recording/channelMixRing.js', async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import('../../../config/index.js')>();
+    await importOriginal<typeof import('../recording/channelMixRing.js')>();
   return {
     ...actual,
-    env: mockEnv,
-    DISCORD_LIMITS: {
-      ...actual.DISCORD_LIMITS,
-      get MAX_FILE_SIZE_MB() {
-        return (
-          limitOverride.maxFileSizeMb ?? actual.DISCORD_LIMITS.MAX_FILE_SIZE_MB
-        );
-      },
+    channelMixRingManager: {
+      getBufferedSeconds: mockBufferedSeconds,
+      extractLastSecondsAsync: vi.fn(
+        async (
+          channelId: string,
+          seconds: number,
+          _now?: number,
+          options?: { leadingBytes?: number }
+        ) => {
+          const pcm = mockExtractLastSeconds(channelId, seconds);
+          const lead = options?.leadingBytes ?? 0;
+          const framed = Buffer.alloc(lead + pcm.length);
+          pcm.copy(framed, lead);
+          let audible = false;
+          for (let i = 0; i < pcm.length; i += 2) {
+            if (Math.abs(pcm.readInt16LE(i)) > 48) audible = true;
+          }
+          return { pcm: framed.subarray(lead), audible, framed };
+        }
+      ),
     },
   };
 });
 
-// Real fs, with createWriteStream wrapped so single tests can inject a
-// failing stream.
-vi.mock('fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('fs')>();
-  return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) };
+vi.mock('../../../config/index.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../../config/index.js')>();
+  return { ...actual, env: mockEnv };
+});
+
+// Real fs/promises, with writeFile wrapped so single tests can make it fail.
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return { ...actual, writeFile: vi.fn(actual.writeFile) };
 });
 
 const WAV_HEADER_BYTES = 44;
-/** Upload limit the service splits against, in bytes (real config value). */
-const MAX_UPLOAD_BYTES = DISCORD_LIMITS.MAX_FILE_SIZE_MB * 1024 * 1024;
+/** One 20 ms frame of 48 kHz 16-bit mono: the unit parts are cut on. */
+const FRAME_BYTES = 1920;
+const HEADROOM = DISCORD_LIMITS.UPLOAD_HEADROOM_BYTES;
+const MiB = 1024 * 1024;
 
 let tempRoot: string;
 let recordingsDir: string;
@@ -138,8 +148,18 @@ function expectMono16Bit48kHeader(wav: ReturnType<typeof parseWav>): void {
   expect(wav.data.length).toBe(wav.dataSize);
 }
 
-function options(channelId: string, duration = 5) {
-  return { channelId, duration, userId: 'user-1', guildId: 'guild-1' };
+function options(
+  channelId: string,
+  duration = 5,
+  maxUploadBytes: number | undefined = undefined
+) {
+  return {
+    channelId,
+    duration,
+    userId: 'user-1',
+    guildId: 'guild-1',
+    ...(maxUploadBytes === undefined ? {} : { maxUploadBytes }),
+  };
 }
 
 /**
@@ -159,17 +179,6 @@ function expectPartName(
   );
 }
 
-/** Writable whose Nth write fails, to simulate a disk error mid-file. */
-function streamFailingOnWrite(failOn: number): WriteStream {
-  let writes = 0;
-  return new Writable({
-    write(_chunk, _encoding, callback) {
-      writes++;
-      callback(writes === failOn ? new Error('disk full') : null);
-    },
-  }) as unknown as WriteStream;
-}
-
 describe('recordingService', () => {
   beforeAll(async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'voice-recording-test-'));
@@ -186,11 +195,11 @@ describe('recordingService', () => {
     recordingsDir = await mkdtemp(join(tempRoot, 'rec-'));
     pointRecordingsDirAt(recordingsDir);
     mockExtractLastSeconds.mockReturnValue(pcmFromSamples([0, 1000, -1000]));
+    mockBufferedSeconds.mockReturnValue(300);
   });
 
   afterEach(async () => {
     vi.useRealTimers();
-    limitOverride.maxFileSizeMb = null;
     // Split tests write tens of MB; free them per test.
     await rm(recordingsDir, { recursive: true, force: true });
   });
@@ -379,82 +388,242 @@ describe('recordingService', () => {
   });
 
   describe('file splitting', () => {
-    it('keeps a recording that exactly fills the upload limit in one file', async () => {
-      const pcm = audiblePcm(MAX_UPLOAD_BYTES - WAV_HEADER_BYTES);
-      mockExtractLastSeconds.mockReturnValue(pcm);
-
-      const result = await recordAudio(options('ch-at-limit'));
-
-      expect(result.isSplit).toBe(false);
-      expect(result.fileSize).toBe(MAX_UPLOAD_BYTES);
-      expect(await readdir(recordingsDir)).toHaveLength(1);
-    });
-
-    it('splits a recording one sample over the limit into valid, upload-sized WAV parts', async () => {
-      const pcm = audiblePcm(MAX_UPLOAD_BYTES - WAV_HEADER_BYTES + 2);
-      mockExtractLastSeconds.mockReturnValue(pcm);
-
-      const result = await recordAudio(options('ch-split', 60));
-
-      expect(result.isSplit).toBe(true);
-      const parts = [result.filePath, ...(result.additionalFiles ?? [])];
-      expect(parts).toHaveLength(2);
-      expect((await readdir(recordingsDir)).sort()).toEqual(
-        parts.map((p) => basename(p)).sort()
-      );
-      expect(result.fileSize).toBe((await stat(result.filePath)).size);
-      expect(result.duration).toBe(60);
-
-      const dataParts: Buffer[] = [];
-      for (const [index, part] of parts.entries()) {
-        expectPartName(part, 60, 'ch-split', index + 1);
-        const file = await readFile(part);
-        expect(file.length).toBeLessThanOrEqual(MAX_UPLOAD_BYTES);
-
+    /** Read every part back from disk, check its header, return its PCM. */
+    async function readParts(
+      paths: string[],
+      limit: number
+    ): Promise<Buffer[]> {
+      const data: Buffer[] = [];
+      for (const path of paths) {
+        const file = await readFile(path);
+        expect(file.length).toBeLessThanOrEqual(limit - HEADROOM);
         const wav = parseWav(file);
         expectMono16Bit48kHeader(wav);
         // A part must never cut an int16 sample in half.
         expect(wav.dataSize % wav.blockAlign).toBe(0);
-        dataParts.push(Buffer.from(wav.data));
+        data.push(Buffer.from(wav.data));
       }
+      return data;
+    }
 
-      // Parts are in order and lose no audio.
-      expect(Buffer.concat(dataParts).equals(pcm)).toBe(true);
-    });
-
-    it('splits a recording several times the limit into three or more ordered parts that each fit', async () => {
-      // A small limit keeps this many-part split cheap on disk. Everything
-      // below is read back from DISCORD_LIMITS, not from the number set here.
-      limitOverride.maxFileSizeMb = 1;
-      const limitBytes = DISCORD_LIMITS.MAX_FILE_SIZE_MB * 1024 * 1024;
-      // 2.5x the limit, rounded down to whole int16 samples.
-      const pcm = audiblePcm(Math.floor(limitBytes * 1.25) * 2);
+    it('keeps a recording that fits under the upload limit, headroom included, in one file', async () => {
+      const limit = 2 * MiB;
+      const pcm = audiblePcm(limit - HEADROOM - WAV_HEADER_BYTES);
       mockExtractLastSeconds.mockReturnValue(pcm);
 
-      const result = await recordAudio(options('ch-many', 30));
+      const result = await recordAudio(options('ch-at-limit', 10, limit));
+
+      expect(result.isSplit).toBe(false);
+      expect(result.fileSize).toBe(limit - HEADROOM);
+      expect(result.parts).toHaveLength(1);
+      expect(await readdir(recordingsDir)).toHaveLength(1);
+    });
+
+    it('splits a recording one sample over into equal, frame-aligned parts that each fit', async () => {
+      const limit = 2 * MiB;
+      const pcm = audiblePcm(limit - HEADROOM - WAV_HEADER_BYTES + 2);
+      mockExtractLastSeconds.mockReturnValue(pcm);
+
+      const result = await recordAudio(options('ch-split', 60, limit));
 
       expect(result.isSplit).toBe(true);
-      const parts = [result.filePath, ...(result.additionalFiles ?? [])];
-      expect(parts.length).toBeGreaterThanOrEqual(3);
-      expect(new Set(parts).size).toBe(parts.length);
+      const paths = [result.filePath, ...(result.additionalFiles ?? [])];
+      expect(paths).toHaveLength(2);
       expect((await readdir(recordingsDir)).sort()).toEqual(
-        parts.map((p) => basename(p)).sort()
+        paths.map((p) => basename(p)).sort()
       );
-      expect(result.fileSize).toBe((await stat(result.filePath)).size);
+      const data = await readParts(paths, limit);
+      // Halves (within frame rounding), not one full part and a stub.
+      expect(data[0].length % FRAME_BYTES).toBe(0);
+      expect(Math.abs(data[0].length - data[1].length)).toBeLessThan(
+        2 * FRAME_BYTES
+      );
+      // Parts are in order and lose no audio.
+      expect(Buffer.concat(data).equals(pcm)).toBe(true);
+    });
 
-      const dataParts: Buffer[] = [];
-      for (const [index, part] of parts.entries()) {
-        expectPartName(part, 30, 'ch-many', index + 1);
-        const file = await readFile(part);
-        expect(file.length).toBeLessThanOrEqual(limitBytes);
+    it('splits a long recording into the fewest parts under the limit, in order', async () => {
+      const limit = MiB;
+      // 2.5x what fits in one part, an odd number of frames plus a sample.
+      const pcm = audiblePcm(Math.floor(((limit - HEADROOM) * 2.5) / 2) * 2);
+      mockExtractLastSeconds.mockReturnValue(pcm);
 
-        const wav = parseWav(file);
-        expectMono16Bit48kHeader(wav);
-        expect(wav.dataSize % wav.blockAlign).toBe(0);
-        dataParts.push(Buffer.from(wav.data));
+      const result = await recordAudio(options('ch-many', 30, limit));
+
+      const paths = [result.filePath, ...(result.additionalFiles ?? [])];
+      expect(paths).toHaveLength(3);
+      expect(new Set(paths).size).toBe(3);
+      for (const [index, path] of paths.entries()) {
+        expectPartName(path, 30, 'ch-many', index + 1);
       }
+      const data = await readParts(paths, limit);
+      expect(Buffer.concat(data).equals(pcm)).toBe(true);
+    });
 
-      expect(Buffer.concat(dataParts).equals(pcm)).toBe(true);
+    it('stays sample-aligned under an odd upload limit', async () => {
+      const limit = 1_000_001;
+      const pcm = audiblePcm(Math.floor((3 * limit) / 2) * 2);
+      mockExtractLastSeconds.mockReturnValue(pcm);
+
+      const result = await recordAudio(options('ch-odd', 30, limit));
+
+      const paths = [result.filePath, ...(result.additionalFiles ?? [])];
+      const data = await readParts(paths, limit);
+      for (const part of data) expect(part.length % 2).toBe(0);
+      expect(Buffer.concat(data).equals(pcm)).toBe(true);
+    });
+
+    it('names every part of one recording alike, differing only in the part number', async () => {
+      const limit = MiB;
+      mockExtractLastSeconds.mockReturnValue(audiblePcm(3 * limit));
+
+      const result = await recordAudio(options('ch-names', 30, limit));
+
+      const stems = (result.parts ?? []).map((part) =>
+        basename(part.filePath).replace(/_part\d+\.wav$/, '')
+      );
+      expect(stems.length).toBeGreaterThanOrEqual(3);
+      expect(new Set(stems).size).toBe(1);
+      expect(
+        (result.parts ?? []).map(
+          (part) => basename(part.filePath).match(/_part(\d+)\.wav$/)?.[1]
+        )
+      ).toEqual(stems.map((_, i) => String(i + 1)));
+    });
+
+    it('hands back each part in memory, byte for byte what was written, with its time range', async () => {
+      const limit = MiB;
+      const pcm = audiblePcm(2 * limit);
+      mockExtractLastSeconds.mockReturnValue(pcm);
+
+      const result = await recordAudio(options('ch-memory', 30, limit));
+
+      const parts = result.parts ?? [];
+      expect(parts.length).toBeGreaterThan(1);
+      let expectedStart = 0;
+      for (const part of parts) {
+        expect(part.data.equals(await readFile(part.filePath))).toBe(true);
+        expect(part.size).toBe(part.data.length);
+        expect(part.startSeconds).toBeCloseTo(expectedStart, 9);
+        expect(part.endSeconds).toBeCloseTo(
+          part.startSeconds + (part.size - WAV_HEADER_BYTES) / 96_000,
+          9
+        );
+        expectedStart = part.endSeconds;
+      }
+      expect(expectedStart).toBeCloseTo(pcm.length / 96_000, 9);
+      expect(result.fileSize).toBe(
+        parts.reduce((sum, part) => sum + part.size, 0)
+      );
+    });
+
+    it('splits against the fallback limit when the interaction gave none', async () => {
+      const pcm = audiblePcm(
+        DISCORD_LIMITS.FALLBACK_ATTACHMENT_BYTES - HEADROOM
+      );
+      mockExtractLastSeconds.mockReturnValue(pcm);
+
+      const result = await recordAudio(options('ch-fallback', 60));
+
+      expect(result.isSplit).toBe(true);
+      await readParts(
+        [result.filePath, ...(result.additionalFiles ?? [])],
+        DISCORD_LIMITS.FALLBACK_ATTACHMENT_BYTES
+      );
+    });
+  });
+
+  describe('planRecordingParts', () => {
+    it('cuts a 5-minute clip for a 10 MiB limit into three equal parts', () => {
+      const pcmBytes = 300 * 96_000;
+      const parts = planRecordingParts(pcmBytes, 10 * MiB);
+
+      expect(parts).toHaveLength(3);
+      expect(parts.map((part) => part.length)).toEqual([
+        9_600_000, 9_600_000, 9_600_000,
+      ]);
+      expect(parts.map((part) => part.offset)).toEqual([
+        0, 9_600_000, 19_200_000,
+      ]);
+    });
+
+    it('keeps a 5-minute clip whole when the server allows 50 MiB', () => {
+      expect(planRecordingParts(300 * 96_000, 50 * MiB)).toEqual([
+        { offset: 0, length: 28_800_000 },
+      ]);
+    });
+
+    it('covers every byte exactly once, every part under the limit', () => {
+      for (const [pcmBytes, limit] of [
+        [28_800_000, 20 * MiB],
+        [1_234_566, 300_000],
+        [96_000, 70_000],
+      ]) {
+        const parts = planRecordingParts(pcmBytes, limit);
+        let next = 0;
+        for (const part of parts) {
+          expect(part.offset).toBe(next);
+          expect(part.length % 2).toBe(0);
+          expect(WAV_HEADER_BYTES + part.length).toBeLessThanOrEqual(
+            limit - HEADROOM
+          );
+          next += part.length;
+        }
+        expect(next).toBe(pcmBytes);
+      }
+    });
+  });
+
+  describe('time actually heard', () => {
+    it('saves only as much as the bot has heard, rounded up to a whole second', async () => {
+      mockBufferedSeconds.mockReturnValue(12.3);
+
+      const result = await recordAudio(options('ch-young', 60));
+
+      expect(mockExtractLastSeconds).toHaveBeenCalledWith('ch-young', 13);
+      expect(result.duration).toBe(13);
+      expect(result.requestedDuration).toBe(60);
+      expect(basename(result.filePath)).toContain('_13s_');
+    });
+
+    it('saves the full request once the bot has heard that long', async () => {
+      mockBufferedSeconds.mockReturnValue(300);
+
+      const result = await recordAudio(options('ch-old', 60));
+
+      expect(mockExtractLastSeconds).toHaveBeenCalledWith('ch-old', 60);
+      expect(result.duration).toBe(60);
+      expect(result.requestedDuration).toBe(60);
+    });
+
+    it('reports no audio, without reading, when nothing has been heard at all', async () => {
+      mockBufferedSeconds.mockReturnValue(0);
+
+      const error = await recordAudio(options('ch-new', 30)).catch(
+        (e: unknown) => e
+      );
+
+      expect(error).toBeInstanceOf(RecordingNoAudibleAudioError);
+      expect(
+        (error as InstanceType<typeof RecordingNoAudibleAudioError>)
+          .checkedSeconds
+      ).toBe(0);
+      expect(mockExtractLastSeconds).not.toHaveBeenCalled();
+    });
+
+    it('says how much it checked when a trimmed window was silent', async () => {
+      mockBufferedSeconds.mockReturnValue(12.3);
+      mockExtractLastSeconds.mockReturnValue(Buffer.alloc(13 * 96000));
+
+      const error = await recordAudio(options('ch-young-silent', 60)).catch(
+        (e: unknown) => e
+      );
+
+      expect(error).toBeInstanceOf(RecordingNoAudibleAudioError);
+      expect(
+        (error as InstanceType<typeof RecordingNoAudibleAudioError>)
+          .checkedSeconds
+      ).toBe(13);
     });
   });
 
@@ -521,8 +690,8 @@ describe('recordingService', () => {
     it('refuses a second recording on a channel while one is in progress', async () => {
       const first = recordAudio(options('ch-busy'));
 
-      await expect(recordAudio(options('ch-busy'))).rejects.toThrow(
-        'Recording already in progress for this channel'
+      await expect(recordAudio(options('ch-busy'))).rejects.toBeInstanceOf(
+        RecordingInProgressError
       );
       await expect(first).resolves.toMatchObject({ isSplit: false });
 
@@ -544,38 +713,32 @@ describe('recordingService', () => {
       expect(await readdir(recordingsDir)).toHaveLength(2);
     });
 
-    it.each([
-      ['header', 1],
-      ['PCM data', 2],
-    ])(
-      'rejects and releases the channel when writing the %s fails',
-      async (_label, failOn) => {
-        vi.mocked(createWriteStream).mockImplementationOnce(() =>
-          streamFailingOnWrite(failOn)
-        );
+    it('rejects and releases the channel when writing the file fails', async () => {
+      vi.mocked(writeFile).mockRejectedValueOnce(new Error('disk full'));
 
-        await expect(recordAudio(options('ch-write-fail'))).rejects.toThrow(
-          'disk full'
-        );
-
-        await expect(
-          recordAudio(options('ch-write-fail'))
-        ).resolves.toMatchObject({ isSplit: false });
-      }
-    );
-
-    it('rejects and releases the channel when the file cannot be opened', async () => {
-      // e.g. the directory vanished between mkdir and open.
-      const actualFs = await vi.importActual<typeof import('fs')>('fs');
-      vi.mocked(createWriteStream).mockImplementationOnce(() =>
-        actualFs.createWriteStream(join(recordingsDir, 'vanished', 'x.wav'))
+      await expect(recordAudio(options('ch-write-fail'))).rejects.toThrow(
+        'disk full'
       );
 
-      await expect(recordAudio(options('ch-open-fail'))).rejects.toMatchObject({
-        code: 'ENOENT',
-      });
+      await expect(
+        recordAudio(options('ch-write-fail'))
+      ).resolves.toMatchObject({ isSplit: false });
+    });
 
-      await expect(recordAudio(options('ch-open-fail'))).resolves.toMatchObject(
+    it('rejects and releases the channel when a later part cannot be written', async () => {
+      const actual =
+        await vi.importActual<typeof import('fs/promises')>('fs/promises');
+      vi.mocked(writeFile)
+        .mockImplementationOnce(actual.writeFile)
+        .mockRejectedValueOnce(new Error('disk full'));
+      mockExtractLastSeconds.mockReturnValue(audiblePcm(2 * MiB));
+
+      await expect(
+        recordAudio(options('ch-part-fail', 30, MiB))
+      ).rejects.toThrow('disk full');
+
+      mockExtractLastSeconds.mockReturnValue(pcmFromSamples([0, 1000]));
+      await expect(recordAudio(options('ch-part-fail'))).resolves.toMatchObject(
         { isSplit: false }
       );
     });

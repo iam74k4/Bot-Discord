@@ -22,14 +22,15 @@ A modular Discord bot built with TypeScript and discord.js v14.
 
 ## Features
 
-- Slash command support with automatic registration
+- Slash command support with automatic registration (skipped when nothing changed)
+- Japanese-first replies with English for everyone else; every command name in a reply is a clickable mention
 - **Voice channel recording** (restricted past-audio recording with `/voice record`)
 - **Text-to-speech** (`/tts`): reads chat aloud in voice channels with VOICEVOX, so members who cannot or would rather not speak can still take part
 - VC join/leave and member-join notifications, plus per-user VC time stats
 - Community features (native Discord polls, VC roulette)
-- Admin system (`/admin` server settings, `/owner` bot-owner tools)
+- Admin system (`/admin` server settings with one overview of every feature's settings, `/owner` bot-owner tools)
 - Audit logging for role changes, notification setup, and settings changes
-- Middleware system (permissions, cooldown)
+- Middleware system (permissions, per-subcommand cooldowns)
 - SQLite database for persistence
 - Modular feature-based architecture for easy extension
 - TypeScript with strict type checking
@@ -98,8 +99,17 @@ See [.env.example](.env.example) for all configuration options and [docs/deploym
 5. Go to "OAuth2" > "General" and copy the Client ID
 6. Go to "OAuth2" > "URL Generator":
    - Select scopes: `bot`, `applications.commands`
-   - Select bot permissions: `Send Messages`, `Use Slash Commands`, `Embed Links`
-   - Use the generated URL to invite the bot to your server
+   - Select bot permissions: `View Channels`, `Send Messages`, `Embed Links`,
+     `Attach Files` (recordings), `Read Message History` (`/community poll
+end`), `Connect` (voice), `Manage Roles` (`/admin role`), and `Speak` if
+     you use `/tts`
+   - Optional: `Set Voice Channel Status` lets the bot show "🔴 keeping
+     audio" on the voice channel it buffers (only when the status is empty),
+     and `Manage Channels` lets it clear a status it left behind after a crash
+     without rejoining
+   - Use the generated URL to invite the bot to your server. On joining, the
+     bot posts a short welcome in the server's language explaining what it
+     does, how to turn voice auto-join off, and any permission it is missing
 
 ## Usage
 
@@ -124,11 +134,27 @@ npm start
 
 ### General
 
-| Command          | Description                |
-| ---------------- | -------------------------- |
-| `/general ping`  | Check bot latency          |
-| `/general help`  | Show command list and help |
-| `/general about` | Show bot overview          |
+| Command                            | Description                                                     |
+| ---------------------------------- | --------------------------------------------------------------- |
+| `/general ping`                    | Check bot latency                                               |
+| `/general help [command] [public]` | Show the commands you can use, or one command's page            |
+| `/general about`                   | What the bot does in this server, including what audio it keeps |
+
+`/general help` lists only the commands you are allowed to run. `command`
+autocompletes and searches names, descriptions and keywords in Japanese or
+English (`録音`, `投票`, `tts`); a close typo gets a "did you mean". Replies are
+private unless you set `public` (`みんなに表示`).
+
+### Cooldowns and refusals
+
+Cooldowns are per user and per subcommand, so `/voice status` never holds up
+`/voice record`: 3 s for `/general`, `/voice` and `/community poll`, 10 s for
+`/voice record`, 5 s for `/community roulette` and 2 s for `/tts`; the
+settings commands (`/admin`, `/notification`, `/owner`) have none. A request
+turned down before any work (not in a VC, invalid input) gives the cooldown
+back. Being asked to wait or lacking a permission is shown as a private
+warning that names the command or the permission, and unexpected errors show a
+short error ID that matches the bot's log.
 
 ### Notification (`/notification`)
 
@@ -141,15 +167,39 @@ npm start
 | `/notification status`                | Show current notification settings     |
 | `/notification stats [period]`        | Show your VC time statistics           |
 
+`/notification status` opens a panel where both channels can be picked or
+switched off (switching one off asks first). Every channel is checked before
+it is saved: the bot needs View Channel, Send Messages and Embed Links there,
+and a refusal names what is missing.
+
 VC notifications are throttled: the first change is posted right away, then
 anything happening in the next 30 seconds is collapsed into one summary. A
 channel filling up costs two messages instead of ten, moving between channels
 reads as a single line, and someone who drops in and out inside the window is
-not announced at all.
+not announced at all. A join into an empty VC, which starts a call, is always
+posted at once, together with anything still waiting in the window. Moving
+into the server's AFK channel is posted as leaving VC, and AFK time does not
+count toward stats.
+
+The welcome message mentions (pings) the new member, says which member number
+they are, and points to the rules channel when the server has one.
+
+Posts in channels (VC notifications, welcome, recording notices, audit log,
+announcements) use the server language set with `/admin settings language`.
+When that is `auto`, they use the server's Discord language on Community
+servers and Japanese otherwise.
+
+`/notification stats` periods are whole calendar days in `STATS_TIMEZONE`
+(default: `TZ`, else `Asia/Tokyo`): 今日 / 過去7日間 / 過去30日間 / 全期間
+(Today / Last 7 days / Last 30 days / All time). A visit that crosses midnight
+is split across the days it covers, and a visit in progress is included.
 
 ### Admin (`/admin`)
 
-Requires **Manage Server** in the guild (slash command default permission).
+Available in servers only. Discord shows it to members with **Manage Server**
+(its default permission); `/admin settings` needs Manage Server and
+`/admin role` needs Manage Roles. To let a moderator with only Manage Roles use
+`/admin role`, allow `/admin` for them under Server Settings → Integrations.
 
 | Command                                   | Description                                                    |
 | ----------------------------------------- | -------------------------------------------------------------- |
@@ -165,9 +215,16 @@ Requires **Manage Server** in the guild (slash command default permission).
 `auto` follows each user's own Discord client language, which is how the bot
 behaves when nothing is configured.
 
+`/admin settings view` opens a panel with tabs for the overview (including
+VC auto-join and notification channels), language, audit channel,
+announcements and the audit log.
+
 ### Bot owner (`/owner`)
 
-Only users listed in `BOT_OWNER_IDS` can run these commands (can be used in DMs with the bot).
+Only users listed in `BOT_OWNER_IDS` can run these commands. In servers,
+Discord hides `/owner` from everyone but administrators; in a DM with the bot
+it is always available to the owner. Broadcasts and manual backups ask for
+confirmation first.
 
 | Command                             | Description                                                                                          |
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------- |
@@ -182,19 +239,32 @@ Only users listed in `BOT_OWNER_IDS` can run these commands (can be used in DMs 
 
 ### Community (`/community`)
 
-| Command                                          | Description                                 |
-| ------------------------------------------------ | ------------------------------------------- |
-| `/community poll create <question> <options...>` | Create a native Discord poll (2-10 options) |
-| `/community poll end`                            | Close your poll early                       |
-| `/community roulette member`                     | Randomly select one member from VC          |
-| `/community roulette team <count>`               | Divide voice channel members into teams     |
+Available in servers only (not in DMs).
+
+| Command                                           | Description                                                           |
+| ------------------------------------------------- | --------------------------------------------------------------------- |
+| `/community poll create <question> [option1..10]` | Create a native Discord poll (2-10 options; with fewer, a form opens) |
+| `/community poll end [poll]`                      | Close one of your polls early, from any channel of the server         |
+| `/community roulette member`                      | Pick one member of your VC                                            |
+| `/community roulette team <count>`                | Split your VC into 2-6 teams                                          |
 
 **Options:**
 
 - `question`: Poll question, up to 300 characters (required)
-- `option1` to `option10`: Choices, up to 55 characters each (at least 2 required, up to 10)
+- `option1` to `option10`: Choices, up to 55 characters each (optional). With
+  fewer than two, a form takes the options one per line (2-10; blank lines and
+  repeats are dropped), plus duration and multi-select. A rejected form offers
+  「入力し直す」, which reopens it with what was typed
 - `duration`: How long the poll stays open — 1h, 4h, 8h, 24h, 3d, or 7d (default: 24h)
 - `multi`: Let people pick more than one option (default: false)
+- `poll` (`poll end`): an autocompleted list of your open polls in this server
+  (`#channel · time left`). The default is your newest poll in this channel,
+  else your newest in the server. Ending asks for confirmation first
+
+Roulette results keep 🎲 もう一度 / 🙅 当選者を除いて再抽選 (member) or
+🔀 チームを組み直す (team) buttons for 5 idle minutes, up to about 14 minutes
+after the command. Anyone in the VC can press them, and each press re-reads
+who is in the VC.
 
 Polls use Discord's own poll feature, so voting, the running tally, and closing
 are handled by Discord itself: results survive a bot restart, and everyone sees
@@ -206,14 +276,19 @@ are gone — use `/community poll end` to close a short poll when you are done.
 
 ### Voice (`/voice`)
 
-| Command                             | Description                                   |
-| ----------------------------------- | --------------------------------------------- |
-| `/voice record <duration>`          | Record past audio from your voice channel     |
-| `/voice status`                     | Show buffer window, auto-join state, capacity |
-| `/voice autojoin enable`            | Allow the bot to join occupied voice channels |
-| `/voice autojoin disable`           | Stop joining and buffering in this server     |
-| `/voice autojoin exclude <channel>` | Keep the bot out of one voice channel         |
-| `/voice autojoin include <channel>` | Remove a channel from the exclusion list      |
+Available in servers only, and hidden from members without **Manage Server**.
+
+| Command                             | Description                                                                   |
+| ----------------------------------- | ----------------------------------------------------------------------------- |
+| `/voice record <duration>`          | Save past audio from your voice channel                                       |
+| `/voice status`                     | Whether your VC is kept and why not; panel to toggle auto-join and exclusions |
+| `/voice autojoin enable`            | Allow the bot to join occupied voice channels                                 |
+| `/voice autojoin disable`           | Stop joining and buffering in this server                                     |
+| `/voice autojoin exclude <channel>` | Keep the bot out of one voice channel                                         |
+| `/voice autojoin include <channel>` | Remove a channel from the exclusion list                                      |
+
+Every auto-join change (command, status panel or the notice's button) is
+written to the audit log in the server language.
 
 **Options:**
 
@@ -227,7 +302,9 @@ are gone — use `/community poll end` to close a short poll when you are done.
   a rolling window of that channel's audio so `/voice record` can reach backwards
   in time
 - Disclosure: on joining, the bot posts once into the voice channel's own text
-  chat saying audio is being kept and how to turn it off
+  chat saying audio is being kept and how to turn it off, with a button
+  (Manage Server only) that excludes that channel; a newer notice replaces the
+  previous one
 - Opt-out: `/voice autojoin disable` (whole server) or
   `/voice autojoin exclude <channel>` (one channel). Both also drop any
   connection already buffering
@@ -235,8 +312,14 @@ are gone — use `/community poll end` to close a short poll when you are done.
   minutes), about **82MB per voice channel**, allocated the first time someone
   actually speaks — a channel the bot sits in silently costs nothing. Multiply
   by `MAX_CONCURRENT_VC_CONNECTIONS` for the worst case when sizing your host
-- WAV format output at 48kHz/16bit/mono (~27.5MB for 5 minutes)
-- Private delivery: Recording responses and files are sent ephemerally
+- WAV format output at 48kHz/16bit/mono (~27.5MB for 5 minutes). Only what
+  was actually heard is saved; a recording over the server's upload limit is
+  split into the fewest equal parts, each labelled with its time range
+- Private delivery: Recording responses and files are sent ephemerally, and
+  the progress message becomes the result
+- When a channel is not being kept, `/voice record` and `/voice status` say
+  why (auto-join off, channel excluded, bot busy in another VC, reading-only)
+  and what to do
 - Automatic file cleanup after `RECORDING_RETENTION_HOURS` (default: 24 hours)
 - Memory monitoring against `MEMORY_LIMIT_MB` (RSS), disconnecting the oldest
   connections when usage passes 85% of the budget
@@ -246,7 +329,7 @@ are gone — use `/community poll end` to close a short poll when you are done.
 - Requires `Manage Server`
 - Bot must be in the same voice channel
 - Maximum concurrent VC connections: 5 (configurable)
-- Opus decoding uses **`opusscript`** (pure JS) instead of `@discordjs/opus` so installs stay free of vulnerable native prebuild chains; CPU use can be higher than a native Opus build under heavy voice load. See [`docs/quality.md`](docs/quality.md) for dependency overrides.
+- Opus decoding uses **`opusscript`** (pure JS, decoded to mono) instead of `@discordjs/opus` so installs stay free of vulnerable native prebuild chains; it supports about 29 simultaneous speakers per process, and CPU use can be higher than a native Opus build under heavy voice load. See [`docs/quality.md`](docs/quality.md) for dependency overrides.
 
 ### Text-to-speech (`/tts`)
 
@@ -270,7 +353,12 @@ Available when the bot operator sets `VOICEVOX_URL` (see
   the channel where `/tts start` was run and from the voice channel's own chat
 - Start a message with `;` to keep it silent
 - The speaker's name is announced when the speaker changes (or after a minute
-  of quiet), so listeners know who is talking
+  of quiet), so listeners know who is talking. Names are spoken on their own
+  and remembered, so they play instantly
+- A speaker's messages that are still waiting are read together as one
+  sentence, with one name, when they fit in 100 characters
+- A message still waiting 25 seconds after it was posted is skipped, so
+  reading never falls far behind the chat
 - URLs, code blocks, spoilers, and long messages are summarised (`URL省略`,
   `コード省略`, `ネタバレ`, `以下略`); mentions are read as names, emoji are
   dropped, and trailing `www` is read as laughter

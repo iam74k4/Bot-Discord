@@ -1,5 +1,5 @@
 import { once } from 'node:events';
-import { Events } from 'discord.js';
+import { Events, RESTEvents } from 'discord.js';
 import { createClient, type ExtendedClient } from '../client.js';
 import type { AppConfig } from '../config/index.js';
 import { loadCommands } from '../handlers/commandHandler.js';
@@ -20,6 +20,30 @@ import {
   stopAuditRetention,
 } from '../infrastructure/audit/index.js';
 import { cooldownStore } from '../middleware/cooldown/cooldownStore.js';
+import { metrics } from '../infrastructure/metrics/index.js';
+import {
+  setComponentRoutingReady,
+  stopLiveComponents,
+} from '../shared/interactions/index.js';
+
+/** The longest shutdown waits for open panels to show they have closed. */
+const LIVE_COMPONENT_SHUTDOWN_MS = 3_000;
+
+/**
+ * How long shutdown may spend closing open panels and prompts: at most 3 s
+ * and at most a fifth of the whole shutdown budget, so the final backup and
+ * stopping the features (closing VC sessions, flushing recordings) are never
+ * cut off by the forced exit.
+ */
+export function liveComponentShutdownBudget(shutdownTimeoutMs: number): number {
+  if (!Number.isFinite(shutdownTimeoutMs) || shutdownTimeoutMs <= 0) {
+    return LIVE_COMPONENT_SHUTDOWN_MS;
+  }
+  return Math.min(
+    LIVE_COMPONENT_SHUTDOWN_MS,
+    Math.floor(shutdownTimeoutMs / 5)
+  );
+}
 
 /**
  * The composition root.
@@ -60,6 +84,26 @@ export interface AppDependencies {
   startAuditRetention(): void;
   stopAuditRetention(): void;
   clearCooldowns(): void;
+  /**
+   * Event-loop monitoring and time-to-acknowledge measurement. Started
+   * before login so the first interaction is already measured.
+   */
+  startRuntimeMetrics(client: ExtendedClient): void;
+  stopRuntimeMetrics(client: ExtendedClient): void;
+  /**
+   * Close every open panel and confirmation, so none stays clickable on a
+   * message no process will answer after the restart. Waits at most
+   * `timeoutMs` for them to show they have closed.
+   */
+  stopLiveComponents(timeoutMs: number): Promise<void>;
+  /**
+   * Whether every feature has registered its persistent component handlers.
+   * Until it is set (and again from the start of shutdown), the interaction
+   * router never greys out a click it cannot place; it only asks the user to
+   * try again, because the button may belong to a handler that is not
+   * registered yet or any more.
+   */
+  setComponentRoutingReady(ready: boolean): void;
 }
 
 export interface App {
@@ -75,6 +119,8 @@ interface ShutdownStep {
 }
 
 export function defaultDependencies(): AppDependencies {
+  const acknowledgementListener = metrics.createAcknowledgementListener();
+
   return {
     // Text-to-speech is the only reader of chat, so the privileged intent is
     // requested only when an engine is configured.
@@ -99,6 +145,16 @@ export function defaultDependencies(): AppDependencies {
     startAuditRetention,
     stopAuditRetention,
     clearCooldowns: () => cooldownStore.clearAll(),
+    startRuntimeMetrics: (client) => {
+      metrics.startEventLoopMonitor();
+      client.rest.on(RESTEvents.Response, acknowledgementListener);
+    },
+    stopRuntimeMetrics: (client) => {
+      client.rest.off(RESTEvents.Response, acknowledgementListener);
+      metrics.stopEventLoopMonitor();
+    },
+    stopLiveComponents: (timeoutMs) => stopLiveComponents({ timeoutMs }),
+    setComponentRoutingReady,
   };
 }
 
@@ -115,20 +171,48 @@ export function createApp(
     await deps.loadCommands(client);
     await deps.loadEvents(client);
 
+    deps.startRuntimeMetrics(client);
     await deps.login(client, config.DISCORD_TOKEN);
     await deps.awaitReady(client);
 
     // Features start only once the gateway is ready, so their `start` may rely
     // on warmed guild caches.
     await deps.startAllFeatures({ client, config });
+    // Every persistent button now has its handler; clicks nothing claims can
+    // be treated as expired from here on.
+    deps.setComponentRoutingReady(true);
 
     deps.backup.start();
     deps.startAuditRetention();
   }
 
   function shutdownSteps(): ShutdownStep[] {
-    const steps: ShutdownStep[] = [];
+    // Features unregister their persistent buttons below while clicks still
+    // arrive, so the router stops treating unclaimed clicks as expired first.
+    // Then open panels close, while the gateway and REST still work, so users
+    // see them close instead of failing after the restart.
+    const steps: ShutdownStep[] = [
+      {
+        name: 'Component routing',
+        run: () => deps.setComponentRoutingReady(false),
+      },
+      {
+        name: 'Live components',
+        run: () =>
+          deps.stopLiveComponents(
+            liveComponentShutdownBudget(config.SHUTDOWN_TIMEOUT_MS)
+          ),
+      },
+      // The schedule stops first so no cron backup starts during shutdown.
+      { name: 'Backup service', run: () => deps.backup.stop() },
+      { name: 'Audit retention', run: () => deps.stopAuditRetention() },
+      { name: 'Features', run: () => deps.stopAllFeatures() },
+    ];
 
+    // The final backup runs after features stop, so what they write on the
+    // way out (the VC sessions closed by the notification feature) is in it,
+    // and before the database closes. The client is destroyed last so
+    // nothing tries to talk to a dead gateway.
     if (config.SHUTDOWN_FINAL_BACKUP) {
       steps.push({
         name: 'Final backup',
@@ -141,13 +225,9 @@ export function createApp(
       });
     }
 
-    // The final backup runs first because it needs the database still open;
-    // the client is destroyed last so nothing tries to talk to a dead gateway.
     steps.push(
-      { name: 'Backup service', run: () => deps.backup.stop() },
-      { name: 'Audit retention', run: () => deps.stopAuditRetention() },
-      { name: 'Features', run: () => deps.stopAllFeatures() },
       { name: 'Cooldown store', run: () => deps.clearCooldowns() },
+      { name: 'Runtime metrics', run: () => deps.stopRuntimeMetrics(client) },
       { name: 'Database', run: () => deps.closeDatabase() },
       { name: 'Discord client', run: () => client.destroy() }
     );

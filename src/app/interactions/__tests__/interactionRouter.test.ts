@@ -20,19 +20,31 @@ import {
   PermissionFlagsBits,
   PermissionsBitField,
   SlashCommandBuilder,
-  StringSelectMenuInteraction,
   UserContextMenuCommandInteraction,
   type EmbedBuilder,
   type Interaction,
 } from 'discord.js';
+import { performance } from 'node:perf_hooks';
 import type { ExtendedClient } from '../../../client.js';
 import type { Command } from '../../../shared/types/index.js';
-import { routeInteraction } from '../interactionRouter.js';
-import { clearCooldown, runMiddleware } from '../../../middleware/index.js';
+import { COMPONENT_GRACE_MS, routeInteraction } from '../interactionRouter.js';
+import { releaseCooldown, runMiddleware } from '../../../middleware/index.js';
 import { cooldownStore } from '../../../middleware/cooldown/cooldownStore.js';
 import { metrics } from '../../../infrastructure/metrics/index.js';
 import { t, type Locale } from '../../../locales/index.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
+import {
+  clearComponentHandlers,
+  clearLiveComponents,
+  registerComponentHandler,
+  setComponentRoutingReady,
+  SETTLED_COMPONENT_MEMORY_MS,
+  trackLiveComponents,
+} from '../../../shared/interactions/index.js';
+import {
+  clearCommandIds,
+  setCommandIds,
+} from '../../../shared/utils/commandMentions.js';
 
 /**
  * The router is the single entry point for every interaction the gateway
@@ -66,7 +78,7 @@ vi.mock('../../../middleware/index.js', async (importOriginal) => {
   return {
     ...actual,
     runMiddleware: vi.fn(actual.runMiddleware),
-    clearCooldown: vi.fn(actual.clearCooldown),
+    releaseCooldown: vi.fn(actual.releaseCooldown),
   };
 });
 
@@ -98,6 +110,7 @@ interface ChatInputStub {
 function chatInput(
   options: {
     commandName?: string;
+    subcommand?: string;
     deferred?: boolean;
     replied?: boolean;
     permissions?: bigint[];
@@ -113,7 +126,12 @@ function chatInput(
     {
       type: InteractionType.ApplicationCommand,
       commandType: ApplicationCommandType.ChatInput,
+      id: '1300000000000000000',
       commandName: options.commandName ?? 'ping',
+      options: {
+        getSubcommandGroup: () => null,
+        getSubcommand: () => options.subcommand ?? null,
+      },
       user: { id: USER_ID, tag: 'tester#0001' },
       guildId: 'guild-1',
       guild: { id: 'guild-1' },
@@ -186,6 +204,13 @@ function responsesSent(stub: ChatInputStub): number {
   );
 }
 
+/** The error id an unexpected-error embed shows, checked against the log. */
+function errorIdIn(description: string | undefined): string {
+  const id = /`([0-9a-f]{6})`/.exec(description ?? '')?.[1];
+  expect(id, `no error id in: ${description}`).toBeDefined();
+  return id!;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   resolveLocale.mockReturnValue('en');
@@ -195,6 +220,9 @@ beforeEach(() => {
 
 afterEach(() => {
   cooldownStore.clearAll();
+  clearComponentHandlers();
+  clearLiveComponents();
+  clearCommandIds();
   vi.useRealTimers();
 });
 
@@ -300,10 +328,11 @@ describe('routeInteraction: slash commands', () => {
     expect(stub.reply).toHaveBeenCalledTimes(1);
     expect(stub.reply.mock.calls[0][0].flags).toBe(MessageFlags.Ephemeral);
     expect(embedOf(stub.reply)).toMatchObject({
-      title: t('common.commandBlocked', 'en'),
+      title: t('common.permissionDeniedTitle', 'en'),
       description: t('common.permissionsRequired', 'en', {
-        permissions: 'BanMembers',
+        permissions: 'Ban Members',
       }),
+      color: COLORS.WARNING,
     });
   });
 
@@ -381,13 +410,60 @@ describe('routeInteraction: slash commands', () => {
         expect(stub.reply).toHaveBeenCalledTimes(1);
         expect(responsesSent(stub)).toBe(1);
         expect(stub.reply.mock.calls[0][0].flags).toBe(MessageFlags.Ephemeral);
-        expect(embedOf(stub.reply)).toMatchObject({
+        const embed = embedOf(stub.reply);
+        const id = errorIdIn(embed.description);
+        expect(embed).toMatchObject({
           title: t('common.error', locale),
-          description: t('common.unexpectedError', locale),
+          description: t('common.unexpectedError', locale, { id }),
           color: COLORS.ERROR,
         });
       }
     );
+
+    it('logs the same error id it shows, with the stack', async () => {
+      const ping = command();
+      ping.execute.mockRejectedValue(new Error('boom'));
+      const stub = chatInput();
+
+      await routeInteraction(clientWith(ping), stub.interaction);
+
+      const id = errorIdIn(embedOf(stub.reply).description);
+      expect(logger.error).toHaveBeenCalledWith(
+        `[${id}] Error executing command ping:`,
+        expect.stringMatching(/^Error: boom\n\s+at /)
+      );
+    });
+
+    it('gives each failure its own id', async () => {
+      const ping = command();
+      ping.execute.mockRejectedValue(new Error('boom'));
+      const first = chatInput();
+      const second = chatInput();
+
+      await routeInteraction(clientWith(ping), first.interaction);
+      await routeInteraction(clientWith(ping), second.interaction);
+
+      expect(errorIdIn(embedOf(first.reply).description)).not.toBe(
+        errorIdIn(embedOf(second.reply).description)
+      );
+    });
+
+    it('names the full subcommand path in the log', async () => {
+      const voice = command({ name: 'voice' });
+      voice.execute.mockRejectedValue(new Error('boom'));
+
+      await routeInteraction(
+        clientWith(voice),
+        chatInput({ commandName: 'voice', subcommand: 'record' }).interaction
+      );
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /^\[[0-9a-f]{6}\] Error executing command voice record:$/
+        ),
+        expect.any(String)
+      );
+    });
 
     it('edits the deferred reply instead of replying again', async () => {
       const ping = command();
@@ -406,11 +482,12 @@ describe('routeInteraction: slash commands', () => {
       expect(embedOf(stub.editReply).title).toBe(t('common.error', 'en'));
     });
 
-    it('edits the existing reply when the command already replied', async () => {
+    it('edits the existing private reply when the command already replied', async () => {
       const ping = command();
       const stub = chatInput();
       ping.execute.mockImplementation(async (interaction) => {
         interaction.replied = true; // what reply() does
+        interaction.ephemeral = true;
         throw new Error('boom after reply');
       });
 
@@ -419,9 +496,43 @@ describe('routeInteraction: slash commands', () => {
       expect(stub.reply).not.toHaveBeenCalled();
       expect(stub.editReply).toHaveBeenCalledTimes(1);
       expect(responsesSent(stub)).toBe(1);
-      expect(embedOf(stub.editReply).description).toBe(
-        t('common.unexpectedError', 'en')
+      const description = embedOf(stub.editReply).description;
+      expect(description).toBe(
+        t('common.unexpectedError', 'en', { id: errorIdIn(description) })
       );
+    });
+
+    it('keeps a public result in place and apologises privately beside it', async () => {
+      const ping = command();
+      const stub = chatInput();
+      ping.execute.mockImplementation(async (interaction) => {
+        interaction.deferred = true; // a public deferReply()
+        interaction.ephemeral = false;
+        interaction.replied = true; // ...then editReply() posted the result
+        throw new Error('boom mid-animation');
+      });
+
+      await routeInteraction(clientWith(ping), stub.interaction);
+
+      expect(stub.editReply).not.toHaveBeenCalled();
+      expect(stub.followUp).toHaveBeenCalledTimes(1);
+      expect(stub.followUp.mock.calls[0][0].flags).toBe(MessageFlags.Ephemeral);
+      expect(embedOf(stub.followUp).title).toBe(t('common.error', 'en'));
+    });
+
+    it('replaces a public "thinking..." that never got a result', async () => {
+      const ping = command();
+      const stub = chatInput();
+      ping.execute.mockImplementation(async (interaction) => {
+        interaction.deferred = true;
+        interaction.ephemeral = false;
+        throw new Error('boom while thinking');
+      });
+
+      await routeInteraction(clientWith(ping), stub.interaction);
+
+      expect(stub.followUp).not.toHaveBeenCalled();
+      expect(stub.editReply).toHaveBeenCalledTimes(1);
     });
 
     it('records the error in metrics and the log, not as a success', async () => {
@@ -434,10 +545,7 @@ describe('routeInteraction: slash commands', () => {
       expect(snapshot.commands.executed).toBe(0);
       expect(snapshot.commands.errors).toBe(1);
       expect(snapshot.commands.byName).toEqual({ 'ping:error': 1 });
-      expect(logger.error).toHaveBeenCalledWith(
-        'Error executing command ping:',
-        'boom'
-      );
+      expect(logger.error).toHaveBeenCalledTimes(1);
     });
 
     it('swallows a failed error reply', async () => {
@@ -493,7 +601,7 @@ describe('routeInteraction: slash commands', () => {
 
       await routeInteraction(clientWith(ping), chatInput().interaction);
 
-      expect(clearCooldown).not.toHaveBeenCalled();
+      expect(releaseCooldown).not.toHaveBeenCalled();
     });
   });
 
@@ -530,11 +638,12 @@ describe('routeInteraction: slash commands', () => {
       expect(cmd.execute).toHaveBeenCalledTimes(1);
       expect(blocked.reply).toHaveBeenCalledTimes(1);
       expect(embedOf(blocked.reply)).toMatchObject({
-        title: t('common.commandBlocked', 'en'),
+        title: t('common.cooldownTitle', 'en'),
         description: t('common.cooldown', 'en', {
-          time: '3.0',
-          command: 'slow',
+          seconds: 3,
+          command: '`/slow`',
         }),
+        color: COLORS.WARNING,
       });
 
       await vi.advanceTimersByTimeAsync(3_000);
@@ -556,7 +665,6 @@ describe('routeInteraction: slash commands', () => {
         chatInput({ commandName: 'slow' }).interaction
       );
 
-      expect(clearCooldown).toHaveBeenCalledWith('slow', USER_ID);
       expect(cooldownStore.isOnCooldown('slow', USER_ID)).toBe(false);
 
       const retry = chatInput({ commandName: 'slow' });
@@ -564,6 +672,50 @@ describe('routeInteraction: slash commands', () => {
 
       expect(cmd.execute).toHaveBeenCalledTimes(2);
       expect(responsesSent(retry)).toBe(0);
+    });
+
+    it('keeps sibling subcommands apart and refunds only the failed path', async () => {
+      const voice = command({
+        name: 'voice',
+        middleware: ['cooldown'],
+        options: { cooldown: 10_000 },
+      });
+      const client = clientWith(voice);
+      voice.execute.mockImplementationOnce(async () => undefined);
+      voice.execute.mockRejectedValueOnce(new Error('transient'));
+
+      await routeInteraction(
+        client,
+        chatInput({ commandName: 'voice', subcommand: 'status' }).interaction
+      );
+      await routeInteraction(
+        client,
+        chatInput({ commandName: 'voice', subcommand: 'record' }).interaction
+      );
+
+      // status ran and keeps its cooldown; record failed and was refunded.
+      expect(voice.execute).toHaveBeenCalledTimes(2);
+      expect(cooldownStore.isOnCooldown('voice status', USER_ID)).toBe(true);
+      expect(cooldownStore.isOnCooldown('voice record', USER_ID)).toBe(false);
+    });
+
+    it('lets a handler hand back its cooldown after turning the request down', async () => {
+      const cmd = slow();
+      cmd.execute.mockImplementationOnce(async (interaction) => {
+        // e.g. "join a voice channel first"
+        await interaction.reply({ content: 'join a VC first' });
+        releaseCooldown(interaction);
+      });
+      const client = clientWith(cmd);
+
+      await routeInteraction(
+        client,
+        chatInput({ commandName: 'slow' }).interaction
+      );
+      const retry = chatInput({ commandName: 'slow' });
+      await routeInteraction(client, retry.interaction);
+
+      expect(cmd.execute).toHaveBeenCalledTimes(2);
     });
   });
 });
@@ -683,13 +835,507 @@ describe('routeInteraction: autocomplete', () => {
   });
 });
 
+describe('routeInteraction: buttons and selects', () => {
+  const MESSAGE_ID = 'message-1';
+
+  interface ComponentStub {
+    interaction: ButtonInteraction;
+    update: Mock;
+    reply: Mock;
+    followUp: Mock;
+    deferUpdate: Mock;
+  }
+
+  function row() {
+    return {
+      toJSON: () => ({
+        type: ComponentType.ActionRow,
+        components: [
+          { type: ComponentType.Button, custom_id: 'a', style: 1, label: 'A' },
+          { type: ComponentType.Button, custom_id: 'b', style: 2, label: 'B' },
+        ],
+      }),
+    };
+  }
+
+  function button(
+    options: {
+      customId?: string;
+      createdTimestamp?: number;
+      origin?: string | null;
+      originType?: InteractionType;
+      components?: unknown[];
+      update?: Mock;
+    } = {}
+  ): ComponentStub {
+    const update = options.update ?? vi.fn().mockResolvedValue(undefined);
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const followUp = vi.fn().mockResolvedValue(undefined);
+    const deferUpdate = vi.fn().mockResolvedValue(undefined);
+    const interaction = onPrototype<ButtonInteraction>(
+      ButtonInteraction.prototype,
+      {
+        id: '1300000000000000001',
+        type: InteractionType.MessageComponent,
+        componentType: ComponentType.Button,
+        customId: options.customId ?? 'settings-panel:audit',
+        user: { id: USER_ID },
+        guildId: 'guild-1',
+        locale: 'en-US',
+        replied: false,
+        deferred: false,
+        message: {
+          id: MESSAGE_ID,
+          createdTimestamp: options.createdTimestamp ?? Date.now(),
+          components: options.components ?? [row()],
+          interaction:
+            options.origin === null
+              ? null
+              : {
+                  type:
+                    options.originType ?? InteractionType.ApplicationCommand,
+                  commandName: options.origin ?? 'admin settings view',
+                },
+        },
+        update,
+        reply,
+        followUp,
+        deferUpdate,
+      }
+    );
+    return { interaction, update, reply, followUp, deferUpdate };
+  }
+
+  function answers(stub: ComponentStub): number {
+    return (
+      stub.update.mock.calls.length +
+      stub.reply.mock.calls.length +
+      stub.followUp.mock.calls.length +
+      stub.deferUpdate.mock.calls.length
+    );
+  }
+
+  const beforeBoot = () => performance.timeOrigin - 60_000;
+
+  beforeEach(() => {
+    // Every feature has started; the startup window has its own block below.
+    setComponentRoutingReady(true);
+  });
+
+  it('leaves a message with a live collector to that collector', async () => {
+    vi.useFakeTimers();
+    trackLiveComponents(MESSAGE_ID);
+    const handle = vi.fn();
+    registerComponentHandler('settings-panel:', handle);
+    const stub = button({ createdTimestamp: beforeBoot() });
+
+    const routing = routeInteraction(clientWith(), stub.interaction);
+    await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS * 2);
+    await routing;
+
+    expect(answers(stub)).toBe(0);
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  describe('persistent handlers', () => {
+    it('dispatches by customId prefix, also on messages from before a restart', async () => {
+      const handle = vi.fn().mockResolvedValue(undefined);
+      registerComponentHandler('voice-optout:', handle);
+      const stub = button({
+        customId: 'voice-optout:123',
+        createdTimestamp: beforeBoot(),
+      });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(handle).toHaveBeenCalledWith(stub.interaction);
+      expect(answers(stub)).toBe(0);
+    });
+
+    it('reports a failing handler privately, with the logged error id', async () => {
+      registerComponentHandler(
+        'voice-optout:',
+        vi.fn().mockRejectedValue(new Error('db down'))
+      );
+      const stub = button({ customId: 'voice-optout:123' });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.reply).toHaveBeenCalledTimes(1);
+      const payload = stub.reply.mock.calls[0][0];
+      expect(payload.flags).toBe(MessageFlags.Ephemeral);
+      const id = errorIdIn(payload.content);
+      expect(payload.content).toBe(t('common.actionFailed', 'en', { id }));
+      expect(logger.error).toHaveBeenCalledWith(
+        `[${id}] Component handler voice-optout: failed:`,
+        expect.stringContaining('db down')
+      );
+    });
+
+    it('follows up instead when the failing handler had already answered', async () => {
+      registerComponentHandler('voice-optout:', async (interaction) => {
+        interaction.deferred = true;
+        throw new Error('after defer');
+      });
+      const stub = button({ customId: 'voice-optout:123' });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.reply).not.toHaveBeenCalled();
+      expect(stub.followUp).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('components nothing answers', () => {
+    it('answers a message from before this process started at once', async () => {
+      setCommandIds([{ name: 'admin', id: '42' }]);
+      const stub = button({ createdTimestamp: beforeBoot() });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      // Greyed out for everyone...
+      expect(stub.update).toHaveBeenCalledTimes(1);
+      const rows = stub.update.mock.calls[0][0].components;
+      expect(rows).toHaveLength(1);
+      expect(
+        rows[0].components.map((c: { disabled: boolean }) => c.disabled)
+      ).toEqual([true, true]);
+      expect(rows[0].components[0]).toMatchObject({
+        custom_id: 'a',
+        label: 'A',
+      });
+      // ...and the clicker is told what to run again.
+      expect(stub.followUp).toHaveBeenCalledWith({
+        content: t('common.componentExpired', 'en', {
+          command: '</admin settings view:42>',
+        }),
+        flags: MessageFlags.Ephemeral,
+      });
+    });
+
+    it('waits for anything else to answer a recent message before stepping in', async () => {
+      vi.useFakeTimers();
+      const stub = button();
+      let settled = false;
+
+      const routing = routeInteraction(clientWith(), stub.interaction).then(
+        () => {
+          settled = true;
+        }
+      );
+      await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS - 1);
+      expect(answers(stub)).toBe(0);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await routing;
+      expect(stub.update).toHaveBeenCalledTimes(1);
+      expect(stub.followUp).toHaveBeenCalledTimes(1);
+    });
+
+    it('stays silent when something else acknowledged the click in time', async () => {
+      vi.useFakeTimers();
+      const stub = button();
+
+      const routing = routeInteraction(clientWith(), stub.interaction);
+      await vi.advanceTimersByTimeAsync(500);
+      stub.interaction.deferred = true; // an untracked collector answered
+      await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS);
+      await routing;
+
+      expect(answers(stub)).toBe(0);
+    });
+
+    it('uses generic wording when the message replied to a button press, not a command', async () => {
+      // Discord names a component reply after the button's customId.
+      const stub = button({
+        createdTimestamp: beforeBoot(),
+        origin: 'admin-panel:backup',
+        originType: InteractionType.MessageComponent,
+      });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.followUp).toHaveBeenCalledWith({
+        content: t('common.componentExpiredGeneric', 'en'),
+        flags: MessageFlags.Ephemeral,
+      });
+    });
+
+    it('uses generic wording when the message came from no command', async () => {
+      const stub = button({ createdTimestamp: beforeBoot(), origin: null });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.followUp).toHaveBeenCalledWith({
+        content: t('common.componentExpiredGeneric', 'en'),
+        flags: MessageFlags.Ephemeral,
+      });
+    });
+
+    it('replies privately without editing a message that is not plain rows', async () => {
+      const stub = button({
+        createdTimestamp: beforeBoot(),
+        components: [{ toJSON: () => ({ type: ComponentType.Container }) }],
+      });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.update).not.toHaveBeenCalled();
+      expect(stub.reply).toHaveBeenCalledWith(
+        expect.objectContaining({ flags: MessageFlags.Ephemeral })
+      );
+    });
+
+    it('falls back to a private reply when the message cannot be edited', async () => {
+      const stub = button({
+        createdTimestamp: beforeBoot(),
+        update: vi.fn().mockRejectedValue(new Error('Unknown Message')),
+      });
+
+      await expect(
+        routeInteraction(clientWith(), stub.interaction)
+      ).resolves.toBeUndefined();
+
+      expect(stub.reply).toHaveBeenCalledTimes(1);
+      expect(stub.reply.mock.calls[0][0].content).toBe(
+        t('common.componentExpired', 'en', {
+          command: '`/admin settings view`',
+        })
+      );
+    });
+
+    it('answers in the resolved locale', async () => {
+      resolveLocale.mockReturnValue('ja');
+      const stub = button({ createdTimestamp: beforeBoot() });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.followUp.mock.calls[0][0].content).toBe(
+        t('common.componentExpired', 'ja', {
+          command: '`/admin settings view`',
+        })
+      );
+    });
+  });
+
+  describe('a panel or prompt that has just settled', () => {
+    /** A collector that ran on MESSAGE_ID and has just ended. */
+    function settle(): void {
+      trackLiveComponents(MESSAGE_ID)();
+    }
+
+    it('acknowledges a late click at once, without touching the message', async () => {
+      vi.useFakeTimers();
+      settle();
+      const stub = button();
+
+      const routing = routeInteraction(clientWith(), stub.interaction);
+      // No grace wait: nothing else will answer, and the owner is editing.
+      await flushMicrotasks();
+      expect(stub.deferUpdate).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS);
+      await routing;
+      expect(answers(stub)).toBe(1);
+    });
+
+    it('acknowledges quietly when the collector settles during the grace wait', async () => {
+      vi.useFakeTimers();
+      const stub = button();
+
+      const routing = routeInteraction(clientWith(), stub.interaction);
+      await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS / 2);
+      settle(); // e.g. the panel's idle timer fired just now
+      await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS);
+      await routing;
+
+      expect(stub.deferUpdate).toHaveBeenCalledTimes(1);
+      expect(answers(stub)).toBe(1);
+    });
+
+    it('treats the message as expired again once the memory has passed', async () => {
+      vi.useFakeTimers();
+      settle();
+      vi.advanceTimersByTime(SETTLED_COMPONENT_MEMORY_MS);
+      const stub = button({ createdTimestamp: beforeBoot() });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.deferUpdate).not.toHaveBeenCalled();
+      expect(stub.update).toHaveBeenCalledTimes(1);
+      expect(stub.followUp).toHaveBeenCalledTimes(1);
+    });
+
+    it('still leaves the message to a collector that opened on it again', async () => {
+      settle();
+      trackLiveComponents(MESSAGE_ID);
+      const stub = button({ createdTimestamp: beforeBoot() });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(answers(stub)).toBe(0);
+    });
+  });
+
+  describe('while features are starting or stopping', () => {
+    beforeEach(() => {
+      setComponentRoutingReady(false);
+    });
+
+    it('asks the user to retry and leaves a message from before the restart untouched', async () => {
+      // e.g. a persistent button whose feature has not registered yet
+      const stub = button({
+        customId: 'voice-optout:123',
+        createdTimestamp: beforeBoot(),
+      });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.update).not.toHaveBeenCalled();
+      expect(stub.followUp).not.toHaveBeenCalled();
+      expect(stub.reply).toHaveBeenCalledTimes(1);
+      expect(stub.reply).toHaveBeenCalledWith({
+        content: t('common.componentNotReady', 'en'),
+        flags: MessageFlags.Ephemeral,
+      });
+    });
+
+    it('routes the button normally once its feature has registered', async () => {
+      const handle = vi.fn().mockResolvedValue(undefined);
+      registerComponentHandler('voice-optout:', handle);
+      const stub = button({
+        customId: 'voice-optout:123',
+        createdTimestamp: beforeBoot(),
+      });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(handle).toHaveBeenCalledWith(stub.interaction);
+      expect(answers(stub)).toBe(0);
+    });
+
+    it('still gives a recent message the grace period during shutdown', async () => {
+      vi.useFakeTimers();
+      const stub = button();
+
+      const routing = routeInteraction(clientWith(), stub.interaction);
+      await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS - 1);
+      expect(answers(stub)).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await routing;
+
+      expect(stub.update).not.toHaveBeenCalled();
+      expect(stub.reply).toHaveBeenCalledWith({
+        content: t('common.componentNotReady', 'en'),
+        flags: MessageFlags.Ephemeral,
+      });
+    });
+
+    it('swallows a failed retry note', async () => {
+      const stub = button({ createdTimestamp: beforeBoot() });
+      stub.reply.mockRejectedValue(new Error('Unknown interaction'));
+
+      await expect(
+        routeInteraction(clientWith(), stub.interaction)
+      ).resolves.toBeUndefined();
+      expect(stub.update).not.toHaveBeenCalled();
+    });
+
+    it('answers in the resolved locale', async () => {
+      resolveLocale.mockReturnValue('ja');
+      const stub = button({ createdTimestamp: beforeBoot() });
+
+      await routeInteraction(clientWith(), stub.interaction);
+
+      expect(stub.reply.mock.calls[0][0].content).toBe(
+        t('common.componentNotReady', 'ja')
+      );
+    });
+  });
+});
+
+describe('routeInteraction: submitted forms', () => {
+  function modalSubmit(fields: Record<string, unknown> = {}) {
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const interaction = onPrototype<ModalSubmitInteraction>(
+      ModalSubmitInteraction.prototype,
+      {
+        id: '1300000000000000005',
+        type: InteractionType.ModalSubmit,
+        customId: 'poll-create:1300000000000000004',
+        user: { id: USER_ID },
+        locale: 'en-US',
+        replied: false,
+        deferred: false,
+        reply,
+        ...fields,
+      }
+    );
+    return { interaction, reply };
+  }
+
+  it('leaves a form to whoever opened it, when they answer in time', async () => {
+    vi.useFakeTimers();
+    const { interaction, reply } = modalSubmit();
+
+    const routing = routeInteraction(clientWith(), interaction);
+    // The opener's awaitModalSubmit answers it within the grace period.
+    await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS - 1);
+    Object.assign(interaction, { replied: true });
+    await vi.advanceTimersByTimeAsync(1);
+    await routing;
+
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('tells the user a form nobody is waiting for was not saved', async () => {
+    vi.useFakeTimers();
+    const { interaction, reply } = modalSubmit();
+
+    const routing = routeInteraction(clientWith(), interaction);
+    await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS - 1);
+    expect(reply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await routing;
+
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledWith({
+      content: t('common.formExpired', 'en'),
+      flags: MessageFlags.Ephemeral,
+    });
+  });
+
+  it('stays silent when the opener deferred the submission', async () => {
+    vi.useFakeTimers();
+    const { interaction, reply } = modalSubmit({ deferred: true });
+
+    const routing = routeInteraction(clientWith(), interaction);
+    await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS);
+    await routing;
+
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('answers in the resolved locale and swallows a failed reply', async () => {
+    vi.useFakeTimers();
+    resolveLocale.mockReturnValue('ja');
+    const { interaction, reply } = modalSubmit();
+    reply.mockRejectedValueOnce(new Error('Unknown interaction'));
+
+    const routing = routeInteraction(clientWith(), interaction);
+    await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS);
+
+    await expect(routing).resolves.toBeUndefined();
+    expect(reply).toHaveBeenCalledWith({
+      content: t('common.formExpired', 'ja'),
+      flags: MessageFlags.Ephemeral,
+    });
+  });
+});
+
 describe('routeInteraction: other interaction types', () => {
-  /**
-   * Buttons, selects and modals are not routed here: each panel or dialog
-   * awaits its own components on the message it sent (customId-scoped
-   * collectors). The router must leave them untouched so it never answers an
-   * interaction a collector is about to handle.
-   */
+  /** Context menus are owned by whoever registered them. */
   function responders() {
     return {
       reply: vi.fn(),
@@ -704,36 +1350,6 @@ describe('routeInteraction: other interaction types', () => {
 
   const cases: [string, () => Interaction & Record<string, Mock>][] = [
     [
-      'button',
-      () =>
-        onPrototype(ButtonInteraction.prototype, {
-          type: InteractionType.MessageComponent,
-          componentType: ComponentType.Button,
-          customId: 'confirm_123',
-          ...responders(),
-        }),
-    ],
-    [
-      'string select',
-      () =>
-        onPrototype(StringSelectMenuInteraction.prototype, {
-          type: InteractionType.MessageComponent,
-          componentType: ComponentType.StringSelect,
-          customId: 'settings:language',
-          values: ['ja'],
-          ...responders(),
-        }),
-    ],
-    [
-      'modal submit',
-      () =>
-        onPrototype(ModalSubmitInteraction.prototype, {
-          type: InteractionType.ModalSubmit,
-          customId: 'ping:modal',
-          ...responders(),
-        }),
-    ],
-    [
       'user context menu named like a slash command',
       () =>
         onPrototype(UserContextMenuCommandInteraction.prototype, {
@@ -746,10 +1362,13 @@ describe('routeInteraction: other interaction types', () => {
   ];
 
   it.each(cases)('ignores a %s interaction', async (_label, build) => {
+    vi.useFakeTimers();
     const ping = command({ name: 'ping', autocomplete: vi.fn() });
     const interaction = build();
 
-    await routeInteraction(clientWith(ping), interaction);
+    const routing = routeInteraction(clientWith(ping), interaction);
+    await vi.advanceTimersByTimeAsync(COMPONENT_GRACE_MS * 2);
+    await routing;
 
     expect(ping.execute).not.toHaveBeenCalled();
     expect(ping.autocomplete).not.toHaveBeenCalled();
@@ -757,5 +1376,40 @@ describe('routeInteraction: other interaction types', () => {
     for (const name of Object.keys(responders())) {
       expect(interaction[name]).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('routeInteraction: time-to-acknowledge labels', () => {
+  it('labels a slash command by its full path for the acknowledgement metric', async () => {
+    const voice = command({ name: 'voice' });
+    const stub = chatInput({ commandName: 'voice', subcommand: 'record' });
+
+    await routeInteraction(clientWith(voice), stub.interaction);
+    metrics.recordAcknowledgement(stub.interaction.id, true);
+
+    expect(
+      metrics.getAcknowledgementStats().slowest.map((s) => s.label)
+    ).toEqual(['voice record']);
+  });
+
+  it('labels components by their customId family', async () => {
+    trackLiveComponents('message-1');
+    const interaction = onPrototype<ButtonInteraction>(
+      ButtonInteraction.prototype,
+      {
+        id: '1300000000000000002',
+        type: InteractionType.MessageComponent,
+        componentType: ComponentType.Button,
+        customId: 'settings-panel:audit',
+        message: { id: 'message-1', createdTimestamp: Date.now() },
+      }
+    );
+
+    await routeInteraction(clientWith(), interaction);
+    metrics.recordAcknowledgement(interaction.id, true);
+
+    expect(metrics.getAcknowledgementStats().slowest[0].label).toBe(
+      'component:settings-panel'
+    );
   });
 });

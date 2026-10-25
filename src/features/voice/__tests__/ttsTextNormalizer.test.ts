@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   applyDictionary,
   buildMessageSpeech,
+  compileDictionary,
   isMarkedSilent,
+  joinSpeech,
   MAX_NAME_LENGTH,
   MAX_SPEECH_LENGTH,
   normalizeForSpeech,
@@ -109,6 +111,88 @@ describe('applyDictionary', () => {
         { word: 'bot', reading: 'ぼと' },
       ])
     ).toBe('ぼっと');
+  });
+});
+
+describe('compileDictionary', () => {
+  const RULES: DictionaryRule[] = [
+    { word: '東京', reading: 'とうきょう' },
+    { word: '東京タワー', reading: 'とうきょうたわー' },
+    { word: 'BOT', reading: 'ぼっと' },
+    { word: 'bot', reading: 'ぼと' },
+    { word: 'a', reading: 'b' },
+    { word: 'b', reading: 'c' },
+    { word: 'C++', reading: 'しーぷら' },
+    { word: '', reading: 'never' },
+  ];
+
+  it.each([
+    '東京タワーと東京',
+    'Bot bot BOT',
+    'ab',
+    'C++ と C',
+    'nothing to replace',
+    '',
+  ])('reads %j exactly as the uncompiled rules do', (text) => {
+    expect(applyDictionary(text, compileDictionary(RULES))).toBe(
+      applyDictionary(text, RULES)
+    );
+  });
+
+  it('can be applied again and again with the same result', () => {
+    const compiled = compileDictionary(RULES);
+    const first = applyDictionary('東京 bot 東京', compiled);
+    expect(applyDictionary('東京 bot 東京', compiled)).toBe(first);
+    expect(first).toBe('とうきょう ぼっと とうきょう');
+  });
+
+  it('has no pattern when no rule has a word', () => {
+    const compiled = compileDictionary([{ word: '', reading: 'x' }]);
+    expect(compiled.pattern).toBeNull();
+    expect(applyDictionary('abc', compiled)).toBe('abc');
+  });
+
+  it('works through a speech context', () => {
+    const compiled = compileDictionary([{ word: 'w', reading: 'だぶりゅー' }]);
+    expect(
+      normalizeForSpeech('w', {
+        resolveUser: () => undefined,
+        resolveRole: () => undefined,
+        resolveChannel: () => undefined,
+        dictionary: compiled,
+      })
+    ).toBe('だぶりゅー');
+  });
+});
+
+describe('joinSpeech', () => {
+  it('joins two lines with 、', () => {
+    expect(joinSpeech('おはよう', '元気？')).toBe('おはよう、元気？');
+  });
+
+  it(`refuses a join over ${MAX_SPEECH_LENGTH} characters, so nothing is cut off`, () => {
+    // Cutting the joined text would lose words two separate lines keep.
+    expect(joinSpeech('あ'.repeat(60), 'い'.repeat(60))).toBeNull();
+    expect(joinSpeech('あ'.repeat(50), 'い'.repeat(50))).toBeNull();
+  });
+
+  it('keeps a joined line of exactly the limit whole', () => {
+    const joined = joinSpeech('あ'.repeat(49), 'い'.repeat(50));
+    expect(joined).toBe(`${'あ'.repeat(49)}、${'い'.repeat(50)}`);
+  });
+
+  it('counts characters, not UTF-16 units, against the limit', () => {
+    // 𠮷 is one character but two UTF-16 code units.
+    const joined = joinSpeech('𠮷'.repeat(49), 'い'.repeat(50));
+    expect(joined).toBe(`${'𠮷'.repeat(49)}、${'い'.repeat(50)}`);
+  });
+
+  it('refuses to read on after a line that was already cut short', () => {
+    const cut = normalizeForSpeech(
+      'あ'.repeat(MAX_SPEECH_LENGTH + 1),
+      context()
+    );
+    expect(joinSpeech(cut, 'つづき')).toBeNull();
   });
 });
 

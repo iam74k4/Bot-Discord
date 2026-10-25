@@ -55,6 +55,7 @@ import {
   COMMAND_POLICY,
   KNOWN_HELP_OVERREACH,
   commandPaths,
+  declaredCooldown,
   effectiveCooldown,
   featuresWithCommandFiles,
   helpEntryOf,
@@ -63,6 +64,7 @@ import {
   loadCommands,
   pathPrefixes,
   type CommandJSON,
+  type CommandPath,
   type LoadedCommand,
   type Localizations,
   type LooseOption,
@@ -71,9 +73,9 @@ import {
 /**
  * Load the configuration first and forget what it reported: its warnings
  * describe the environment (under Vitest, `NODE_ENV=test` always warns), and
- * importing the backup service would otherwise trigger them mid-discovery -
- * see the eager-config bug in the test report. After this, anything logged
- * is discovery's own.
+ * a command module that reads configuration while discovery imports it would
+ * otherwise log them mid-discovery. After this, anything logged is
+ * discovery's own.
  */
 loadConfig();
 logger.warn.mockClear();
@@ -754,9 +756,14 @@ describe('each command matches its declared policy', () => {
         : String(policy.defaultMemberPermissions)
     );
     expect(entry.json.contexts ?? null, 'contexts').toEqual(policy.contexts);
-    expect(effectiveCooldown(entry.command), 'cooldown (ms)').toBe(
-      policy.cooldownMs
-    );
+    const cooldowns = (resolve: (path: CommandPath) => number | null) =>
+      Object.fromEntries(
+        commandPaths([entry]).map((path) => [path.label, resolve(path)])
+      );
+    expect(
+      cooldowns((path) => effectiveCooldown(entry.command, path.label)),
+      'cooldown (ms) per path'
+    ).toEqual(cooldowns(declaredCooldown));
     expect(autocompleteOptions(entry), 'autocomplete options').toEqual(
       policy.autocomplete
     );
@@ -785,6 +792,7 @@ describe('the help catalog built from these commands', () => {
     'everyone',
     'manageGuild',
     'manageRoles',
+    'administrator',
     'owner',
   ]);
   const levels = (info: CommandInfo) =>
@@ -924,6 +932,27 @@ describe('command shapes no current command uses yet', () => {
             description: { en: 'Repeat some text', ja: 'テキストを繰り返す' },
             usage: '/echo',
             requiredPermission: 'manageRoles',
+            // Its options, for the help detail page; untranslated text
+            // falls back to English in both languages.
+            leaves: [
+              {
+                path: 'echo',
+                description: {
+                  en: 'Repeat some text',
+                  ja: 'テキストを繰り返す',
+                },
+                options: [
+                  {
+                    name: { en: 'text', ja: 'text' },
+                    description: {
+                      en: 'Text to repeat',
+                      ja: 'Text to repeat',
+                    },
+                    required: true,
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -951,14 +980,12 @@ describe('command shapes no current command uses yet', () => {
 
 describe('translations that point users at a command', () => {
   /**
-   * Known stale references, keyed by translation key. Production bug: the
-   * recording command moved under `/voice record`, but the split-delivery
-   * failure text still tells users to run `/record`. Remove the entry once
-   * the text is fixed.
+   * Known stale references, keyed by translation key, each pinning a
+   * production bug until its text is fixed. Empty since the split-delivery
+   * failure text names the command through `{command}` instead of a stale
+   * `/record`.
    */
-  const KNOWN_STALE: Record<string, string[]> = {
-    'record.errors.deliveryIncompleteDesc': ['/record'],
-  };
+  const KNOWN_STALE: Record<string, string[]> = {};
   const known = pathPrefixes(commandPaths(commands));
   const valueAt = (dictionary: unknown, key: string): string =>
     String(

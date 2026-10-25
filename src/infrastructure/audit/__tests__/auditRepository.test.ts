@@ -124,6 +124,43 @@ describe('auditRepository', () => {
         [NOW + 4, NOW + 3]
       );
     });
+
+    it('skips `offset` entries, so every page is reachable', () => {
+      for (let i = 0; i < 5; i++) logAt(NOW + i);
+
+      expect(
+        auditRepository.getLogs('g1', 2, 2).map((l) => l.created_at)
+      ).toEqual([NOW + 2, NOW + 1]);
+      expect(
+        auditRepository.getLogs('g1', 2, 4).map((l) => l.created_at)
+      ).toEqual([NOW]);
+      expect(auditRepository.getLogs('g1', 2, 5)).toEqual([]);
+    });
+
+    it('treats a negative offset as the first page', () => {
+      for (let i = 0; i < 3; i++) logAt(NOW + i);
+
+      expect(
+        auditRepository.getLogs('g1', 1, -10).map((l) => l.created_at)
+      ).toEqual([NOW + 2]);
+    });
+
+    it('pages entries written in the same millisecond without repeats or gaps', () => {
+      for (let i = 0; i < 5; i++) logAt(NOW, 'g1', `same ms #${i}`);
+
+      const pages = [0, 2, 4].flatMap((offset) =>
+        auditRepository.getLogs('g1', 2, offset).map((log) => log.details)
+      );
+
+      // Newest first by id among equal timestamps.
+      expect(pages).toEqual([
+        'same ms #4',
+        'same ms #3',
+        'same ms #2',
+        'same ms #1',
+        'same ms #0',
+      ]);
+    });
   });
 
   describe('getLogsCount', () => {

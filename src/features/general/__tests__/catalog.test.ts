@@ -1,16 +1,30 @@
 import {
   ApplicationCommandOptionType,
   PermissionFlagsBits,
+  PermissionsBitField,
   SlashCommandBuilder,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from 'discord.js';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildHelpCatalog,
   type CommandHelp,
 } from '../../../shared/help/catalog.js';
 import type { Command, SlashCommandData } from '../../../shared/types/index.js';
+import {
+  canUserSeeCommandWithContext,
+  formatPermissionAlternatives,
+} from '../application/visibility.js';
+import { t } from '../../../locales/index.js';
 import { helpCommand } from './general.helpers.js';
+
+// The real config, so owner checks have a known owner.
+vi.mock('../../../config/env.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../../config/env.js')>();
+  actual.loadConfig({ BOT_OWNER_IDS: 'owner-1' });
+  return actual;
+});
 
 /**
  * What `/general help` lists is derived from the command definitions. The
@@ -52,6 +66,13 @@ describe('catalog entries', () => {
         name: 'bare',
         description: { en: 'Bare', ja: 'Bare' },
         usage: '/bare',
+        leaves: [
+          {
+            path: 'bare',
+            description: { en: 'Bare', ja: 'Bare' },
+            options: [],
+          },
+        ],
         requiredPermission: 'everyone',
       },
     ]);
@@ -63,8 +84,23 @@ describe('catalog entries', () => {
         .setName('search')
         .setDescription('Search')
         .setDescriptionLocalizations({ ja: '検索' })
-        .addStringOption((o) => o.setName('query').setDescription('q'))
-        .addIntegerOption((o) => o.setName('limit').setDescription('l')),
+        .addStringOption((o) =>
+          o
+            .setName('query')
+            .setNameLocalizations({ ja: '言葉' })
+            .setDescription('q')
+            .setDescriptionLocalizations({ ja: '検索語' })
+            .setRequired(true)
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName('limit')
+            .setDescription('l')
+            .addChoices(
+              { name: 'Ten', value: 10, name_localizations: { ja: '10件' } },
+              { name: 'All', value: 0 }
+            )
+        ),
       { category: DEMO }
     );
 
@@ -73,8 +109,103 @@ describe('catalog entries', () => {
         name: 'search',
         description: { en: 'Search', ja: '検索' },
         usage: '/search',
+        leaves: [
+          {
+            path: 'search',
+            description: { en: 'Search', ja: '検索' },
+            options: [
+              {
+                name: { en: 'query', ja: '言葉' },
+                description: { en: 'q', ja: '検索語' },
+                required: true,
+              },
+              {
+                name: { en: 'limit', ja: 'limit' },
+                description: { en: 'l', ja: 'l' },
+                required: false,
+                choices: [
+                  { en: 'Ten', ja: '10件' },
+                  { en: 'All', ja: 'All' },
+                ],
+              },
+            ],
+          },
+        ],
         requiredPermission: 'everyone',
       },
+    ]);
+  });
+
+  it('gives a group one leaf per subcommand, each with its own options', () => {
+    const cfg = helpCommand(
+      new SlashCommandBuilder()
+        .setName('cfg')
+        .setDescription('c')
+        .addSubcommandGroup((group) =>
+          group
+            .setName('set')
+            .setDescription('Set things')
+            .addSubcommand((sub) =>
+              sub
+                .setName('name')
+                .setDescription('Rename')
+                .setDescriptionLocalizations({ ja: '名前を変える' })
+                .addStringOption((o) =>
+                  o
+                    .setName('value')
+                    .setDescription('New name')
+                    .setRequired(true)
+                )
+            )
+            .addSubcommand((sub) =>
+              sub.setName('reset').setDescription('Reset')
+            )
+        ),
+      { category: DEMO }
+    );
+
+    const [entry] = entriesOf(cfg);
+
+    expect(entry.leaves).toEqual([
+      {
+        path: 'cfg set name',
+        description: { en: 'Rename', ja: '名前を変える' },
+        options: [
+          {
+            name: { en: 'value', ja: 'value' },
+            description: { en: 'New name', ja: 'New name' },
+            required: true,
+          },
+        ],
+      },
+      {
+        path: 'cfg set reset',
+        description: { en: 'Reset', ja: 'Reset' },
+        options: [],
+      },
+    ]);
+  });
+
+  it('attaches declared examples to the leaf they demonstrate', () => {
+    const example = { en: '`/ex run` go', ja: '`/ex run` 実行' };
+    const ex = helpCommand(
+      new SlashCommandBuilder()
+        .setName('ex')
+        .setDescription('e')
+        .addSubcommand((sub) => sub.setName('run').setDescription('Run'))
+        .addSubcommand((sub) => sub.setName('stop').setDescription('Stop')),
+      {
+        category: DEMO,
+        // A key that names no leaf is ignored rather than shown somewhere.
+        examples: { 'ex run': [example], 'ex gone': [example] },
+      }
+    );
+
+    const entries = entriesOf(ex);
+
+    expect(entries.map((e) => e.leaves?.[0].examples)).toEqual([
+      [example],
+      undefined,
     ]);
   });
 
@@ -262,19 +393,40 @@ describe('catalog permissions', () => {
     expect(entriesOf(kick)[0].requiredPermission).toBe('everyone');
   });
 
-  // BUG (reported, catalog.ts:150): Discord reads a default permission of "0"
-  // as administrators only, but "0" sets no bit, so help lists the command to
-  // every member. Characterized until fixed; a fix should make this entry
-  // invisible to a member without permissions.
-  it('currently treats default permission 0 (administrators only) as open to everyone', () => {
+  // Regression: Discord reads a default permission of "0" as administrators
+  // only, but "0" sets no bit, so help used to list the command to every
+  // member.
+  it('treats default permission 0 as administrators only', () => {
     const adminOnly = helpCommand(base().setDefaultMemberPermissions(0), {
       category: DEMO,
     });
+    const [entry] = entriesOf(adminOnly);
+    const seenBy = (permissions: bigint) =>
+      canUserSeeCommandWithContext(entry, {
+        userId: 'member-1',
+        guild: { id: 'guild-1' },
+        member: { permissions: new PermissionsBitField(permissions) },
+      });
 
     expect(
       (adminOnly.data.toJSON() as CommandJSON).default_member_permissions
     ).toBe('0');
-    expect(entriesOf(adminOnly)[0].requiredPermission).toBe('everyone');
+    expect(entry.requiredPermission).toBe('administrator');
+    expect(seenBy(0n)).toBe(false);
+    expect(seenBy(PermissionFlagsBits.ManageGuild)).toBe(false);
+    expect(seenBy(PermissionFlagsBits.Administrator)).toBe(true);
+    expect(formatPermissionAlternatives(entry, 'ja')).toBe(
+      t('help.permission.administrator', 'ja')
+    );
+  });
+
+  it('keeps an explicit owner-only declaration over default permission 0', () => {
+    const ownerOnly = helpCommand(base().setDefaultMemberPermissions(0), {
+      category: DEMO,
+      permission: 'owner',
+    });
+
+    expect(entriesOf(ownerOnly)[0].requiredPermission).toBe('owner');
   });
 
   it('lets an explicit permission override the derived one', () => {

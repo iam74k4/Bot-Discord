@@ -106,6 +106,7 @@ export function insertAuditLogs(
     guildId?: string;
     action?: string;
     targetId?: string | null;
+    details?: string | null;
     baseTime?: number;
   } = {}
 ): void {
@@ -119,7 +120,7 @@ export function insertAuditLogs(
       `actor-${i}`,
       options.action ?? 'SETTINGS_CHANGE',
       options.targetId ?? null,
-      null,
+      options.details ?? null,
       (options.baseTime ?? 1_700_000_000_000) + i * 1000
     );
   }
@@ -136,14 +137,23 @@ export function clientStub(guilds: Guild[] = []): Client {
   } as unknown as Client;
 }
 
+/** What the bot needs to post an embed: see, send, and embed links. */
+export const POSTING_PERMISSIONS = [
+  PermissionFlagsBits.ViewChannel,
+  PermissionFlagsBits.SendMessages,
+  PermissionFlagsBits.EmbedLinks,
+];
+
 /**
- * A real `TextChannel` prototype so `instanceof` checks in
- * `getSendableTextChannel` pass. `canSend` controls the bot's SendMessages.
+ * A real `TextChannel` prototype so `instanceof` checks pass. The bot holds
+ * `permissions` there (default: everything needed to post an embed);
+ * `canSend: false` is shorthand for none at all.
  */
 export function textChannelStub(options: {
   id: string;
   name?: string;
   canSend?: boolean;
+  permissions?: bigint[];
   send?: Mock;
 }): TextChannel & { send: Mock } {
   const channel = {
@@ -152,7 +162,9 @@ export function textChannelStub(options: {
     permissionsFor: vi.fn(
       () =>
         new PermissionsBitField(
-          options.canSend === false ? [] : [PermissionFlagsBits.SendMessages]
+          options.canSend === false
+            ? []
+            : (options.permissions ?? POSTING_PERMISSIONS)
         )
     ),
     send: options.send ?? vi.fn().mockResolvedValue({}),
@@ -173,12 +185,18 @@ export function guildStub(
     memberCount?: number;
     channels?: TextChannel[];
     withBot?: boolean;
+    /** Discord's server language, e.g. 'en-US' (its default). */
+    preferredLocale?: string;
+    /** e.g. ['COMMUNITY']: only Community servers may set a language. */
+    features?: string[];
   } = {}
 ): Guild {
   return {
     id: options.id ?? GUILD_ID,
     name: options.name ?? 'Test Guild',
     memberCount: options.memberCount ?? 0,
+    preferredLocale: options.preferredLocale ?? 'en-US',
+    features: options.features ?? [],
     channels: {
       cache: new Collection(
         (options.channels ?? []).map((channel) => [channel.id, channel])
@@ -236,11 +254,14 @@ export interface ComponentStub {
   user: { id: string };
   client: Client;
   guildId: string;
+  /** The clicking user's Discord client language. */
+  locale: string;
   isButton: () => boolean;
   isStringSelectMenu: () => boolean;
   isChannelSelectMenu: () => boolean;
   update: Mock;
   reply: Mock;
+  followUp: Mock;
   deferUpdate: Mock;
 }
 
@@ -248,7 +269,12 @@ export interface ComponentStub {
 export function componentStub(
   kind: ComponentKind,
   customId: string,
-  options: { values?: string[]; userId?: string; client?: Client } = {}
+  options: {
+    values?: string[];
+    userId?: string;
+    client?: Client;
+    locale?: string;
+  } = {}
 ): ComponentStub & MessageComponentInteraction {
   const stub: ComponentStub = {
     customId,
@@ -256,11 +282,13 @@ export function componentStub(
     user: { id: options.userId ?? USER_ID },
     client: options.client ?? clientStub(),
     guildId: GUILD_ID,
+    locale: options.locale ?? 'en-US',
     isButton: () => kind === 'button',
     isStringSelectMenu: () => kind === 'string',
     isChannelSelectMenu: () => kind === 'channel',
     update: vi.fn().mockResolvedValue(undefined),
     reply: vi.fn().mockResolvedValue(undefined),
+    followUp: vi.fn().mockResolvedValue(undefined),
     deferUpdate: vi.fn().mockResolvedValue(undefined),
   };
   return stub as ComponentStub & MessageComponentInteraction;
@@ -284,6 +312,8 @@ export interface SerialisedComponent {
   disabled?: boolean;
   placeholder?: string;
   channel_types?: number[];
+  default_values?: Array<{ id: string; type: string }>;
+  emoji?: { name?: string };
   options?: Array<{ label: string; value: string; default?: boolean }>;
 }
 

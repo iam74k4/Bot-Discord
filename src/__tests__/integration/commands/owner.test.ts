@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MessageFlags } from 'discord.js';
 import { createMockInteraction } from '../../helpers/discord.js';
 import { t } from '../../../locales/index.js';
+import { commandMention } from '../../../shared/utils/commandMentions.js';
 
 vi.mock('../../../infrastructure/database/connection.js', () => ({
   database: {
@@ -34,8 +35,7 @@ vi.mock('../../../infrastructure/backup/index.js', () => ({
       size: 1024,
       timestamp: new Date(),
     }),
-    listBackups: vi.fn().mockReturnValue([]),
-    formatBackupList: vi.fn().mockReturnValue('No backups found.'),
+    listBackups: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -51,12 +51,19 @@ vi.mock('../../../infrastructure/metrics/index.js', () => ({
   },
 }));
 
-vi.mock('../../../config/env.js', () => ({
+vi.mock('../../../config/env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../config/env.js')>()),
   isBotOwner: vi.fn((id: string) => id === '987654321098765432'),
 }));
 
+/** The owner's press on "Back up", answered once by the command. */
+const confirmPress = vi.hoisted(() => ({ update: vi.fn() }));
+
 vi.mock('../../../shared/utils/confirm.js', () => ({
-  awaitConfirmation: vi.fn().mockResolvedValue(true),
+  awaitConfirmationResult: vi.fn(async () => ({
+    outcome: 'confirmed',
+    response: confirmPress,
+  })),
 }));
 
 describe('Owner Command', () => {
@@ -185,18 +192,20 @@ describe('Owner Command', () => {
 
       const { command } =
         await import('../../../features/admin/commands/owner.js');
-      const { awaitConfirmation } =
+      const { awaitConfirmationResult } =
         await import('../../../shared/utils/confirm.js');
       await command.execute(interaction);
 
-      expect(awaitConfirmation).not.toHaveBeenCalled();
+      expect(awaitConfirmationResult).not.toHaveBeenCalled();
       expect(interaction.reply).toHaveBeenCalledWith(
         expect.objectContaining({
           flags: MessageFlags.Ephemeral,
           embeds: [
             expect.objectContaining({
               data: expect.objectContaining({
-                description: t('owner.broadcast.noChannel', 'en'),
+                description: t('owner.broadcast.noChannel', 'en', {
+                  command: commandMention('admin settings announcements'),
+                }),
               }),
             }),
           ],
@@ -252,6 +261,9 @@ describe('Owner Command', () => {
             expect.objectContaining({
               data: expect.objectContaining({
                 title: t('admin.panel.backupsTitle', 'en'),
+                description: expect.stringContaining(
+                  t('admin.panel.noBackups', 'en')
+                ),
               }),
             }),
           ]),
@@ -271,14 +283,22 @@ describe('Owner Command', () => {
         await import('../../../features/admin/commands/owner.js');
       await command.execute(interaction);
 
+      // The press is answered at once with a "running" state, then the
+      // result replaces it.
+      expect(confirmPress.update).toHaveBeenCalledTimes(1);
+      expect(confirmPress.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: t('owner.backup.running', 'en'),
+          components: [],
+        })
+      );
       expect(interaction.editReply).toHaveBeenCalledWith(
         expect.objectContaining({
           content: '',
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
-                // owner.ts hard-codes this title per locale (no locale key).
-                title: 'Backup Complete',
+                title: t('owner.backup.completeTitle', 'en'),
               }),
             }),
           ]),

@@ -22,6 +22,16 @@ vi.mock('../recording/connectionManager.js', () => ({
     connect,
     disconnect,
     getAllConnections,
+    getConnectedChannelInGuild: (guildId: string) => {
+      for (const info of getAllConnections().values()) {
+        const { guildId: owner, channelId } = info as {
+          guildId: string;
+          channelId: string;
+        };
+        if (owner === guildId) return channelId;
+      }
+      return undefined;
+    },
     isAtLimit,
   },
 }));
@@ -94,6 +104,11 @@ async function reconcile(client: never) {
   const { reconcileOccupiedVoiceChannels } =
     await import('../application/reconcile.js');
   await reconcileOccupiedVoiceChannels(client);
+}
+
+async function reconcileOne(guild: unknown) {
+  const { reconcileGuild } = await import('../application/reconcile.js');
+  return reconcileGuild(guild as never);
 }
 
 describe('reconcileOccupiedVoiceChannels', () => {
@@ -431,5 +446,86 @@ describe('reconcileOccupiedVoiceChannels', () => {
     await reconcile(makeClient([]));
 
     expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("joins the next guild without waiting for the first guild's notice to be posted", async () => {
+    // A notice that never finishes sending (a slow REST call).
+    announceBuffering.mockReturnValue(new Promise(() => undefined));
+    const first = makeGuild('guild-1', [
+      makeVoiceChannel('ch-1', 'One', [makeMember('u1')]),
+    ]);
+    const second = makeGuild('guild-2', [
+      makeVoiceChannel('ch-2', 'Two', [makeMember('u2')]),
+    ]);
+
+    await reconcile(makeClient([first, second]));
+
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(announceBuffering).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('reconcileGuild', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    getAllConnections.mockReturnValue(new Map());
+    isAtLimit.mockReturnValue(false);
+    isAutoJoinEnabled.mockReturnValue(true);
+    isChannelExcluded.mockReturnValue(false);
+    connect.mockResolvedValue({ id: 'connection' });
+    disconnect.mockResolvedValue(undefined);
+    announceBuffering.mockResolvedValue(undefined);
+  });
+
+  it('reports the channel it joined', async () => {
+    const general = makeVoiceChannel('ch-1', 'General', [makeMember('u1')]);
+
+    await expect(
+      reconcileOne(makeGuild('guild-1', [general]))
+    ).resolves.toEqual({ status: 'joined', channelId: 'ch-1' });
+  });
+
+  it('reports the channel it is already in, without joining another', async () => {
+    getAllConnections.mockReturnValue(
+      new Map([['ch-9', { guildId: 'guild-1', channelId: 'ch-9' }]])
+    );
+    const general = makeVoiceChannel('ch-1', 'General', [makeMember('u1')]);
+
+    await expect(
+      reconcileOne(makeGuild('guild-1', [general]))
+    ).resolves.toEqual({ status: 'already', channelId: 'ch-9' });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['nobody is in voice', [], 'none'],
+    ['the only people are in an excluded channel', ['excluded'], 'none'],
+  ])('reports that %s', async (_label, flags, status) => {
+    isChannelExcluded.mockReturnValue(flags.includes('excluded'));
+    const channel = makeVoiceChannel(
+      'ch-1',
+      'General',
+      flags.length > 0 ? [makeMember('u1')] : []
+    );
+
+    await expect(
+      reconcileOne(makeGuild('guild-1', [channel]))
+    ).resolves.toEqual({ status });
+  });
+
+  it('reports auto-join off, the limit, and a failed join', async () => {
+    const guild = makeGuild('guild-1', [
+      makeVoiceChannel('ch-1', 'General', [makeMember('u1')]),
+    ]);
+
+    isAutoJoinEnabled.mockReturnValueOnce(false);
+    await expect(reconcileOne(guild)).resolves.toEqual({ status: 'disabled' });
+
+    isAtLimit.mockReturnValueOnce(true);
+    await expect(reconcileOne(guild)).resolves.toEqual({ status: 'limit' });
+
+    connect.mockResolvedValueOnce(null);
+    await expect(reconcileOne(guild)).resolves.toEqual({ status: 'failed' });
   });
 });

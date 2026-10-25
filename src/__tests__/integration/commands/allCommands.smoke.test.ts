@@ -26,14 +26,18 @@ import {
  * edits before acknowledging, logs no error, reads only options it
  * declares, sends nothing Discord would reject, and shows no raw translation
  * key or unfilled `{placeholder}`. In a fully set-up server it must also
- * reach a non-error response, with ordinary values and at the limits of every
- * option. On top of that:
+ * reach a response that is neither an error nor a refusal (missing
+ * permission, cooldown, server only), with ordinary values and at the limits
+ * of every option. On top of that:
  * - who is served or refused follows the declared policy, not whatever the
- *   code currently enforces (and `/general help` shows exactly that);
+ *   code currently enforces (and `/general help` shows exactly that); a
+ *   refusal is a private "missing permission" warning;
  * - every path either proves it did its work (`REACHES`) or proves it
  *   changed nothing (`READ_ONLY`);
- * - cooldowns refuse a repeat for exactly as long as declared;
- * - a Discord failure mid-command is answered privately by the router.
+ * - cooldowns refuse a repeat of the same path for exactly as long as
+ *   declared, and never hold up a sibling path;
+ * - a Discord failure mid-command is answered privately by the router, with
+ *   the error ID it logged.
  * A path that only succeeds with some prior state (something to remove, a
  * poll to end) gets it from `SCENARIOS`.
  */
@@ -91,6 +95,12 @@ const voice = vi.hoisted(() => {
     player,
     manager: {
       getConnection: vi.fn((channelId: string) => connections.get(channelId)),
+      getConnectedChannelInGuild: vi.fn(
+        (guildId: string) =>
+          [...connections.values()].find(
+            (connection) => connection.guildId === guildId
+          )?.channelId
+      ),
       getAllConnections: vi.fn(() => new Map(connections)),
       getConnectionCount: vi.fn(() => connections.size),
       isAtLimit: vi.fn(() => false),
@@ -120,6 +130,9 @@ const voice = vi.hoisted(() => {
       disconnect: vi.fn(async (channelId: string) => {
         connections.delete(channelId);
       }),
+      // Hooks run before the bot leaves (clearing its voice channel status);
+      // nothing here sets one.
+      onBeforeDisconnect: vi.fn(() => () => {}),
     },
     recordAudio: vi.fn(async (options: { duration: number }) => ({
       filePath: `recordings/smoke-${options.duration}s.wav`,
@@ -145,9 +158,14 @@ const voicevox = vi.hoisted(() => {
     client: {
       isAvailable: vi.fn(async () => true),
       listVoices: vi.fn(async () => [...voices]),
+      // The voice list is already cached, as after the bot-ready warm-up.
+      peekVoices: vi.fn(() => [...voices]),
       findVoice: vi.fn(async (id: number) => voices.find((v) => v.id === id)),
+      audioQuery: vi.fn(async () => ({ accent_phrases: [] })),
       // 20 ms of 48 kHz stereo s16le silence.
+      renderQuery: vi.fn(async () => Buffer.alloc(3840)),
       synthesize: vi.fn(async () => Buffer.alloc(3840)),
+      initializeSpeaker: vi.fn(async () => true),
     },
   };
 });
@@ -159,7 +177,6 @@ const backup = vi.hoisted(() => ({
     size: 4096,
     timestamp: new Date(0),
   })),
-  formatBackupList: vi.fn(async () => 'No backups found.'),
   listBackups: vi.fn(async () => []),
 }));
 
@@ -223,7 +240,7 @@ import {
   type PermissionsBitField,
 } from 'discord.js';
 import type { Mock } from 'vitest';
-import { awaitConfirmation } from '../../../shared/utils/confirm.js';
+import { awaitConfirmationResult } from '../../../shared/utils/confirm.js';
 import {
   buildHelpCatalog,
   type PermissionLevel,
@@ -249,6 +266,7 @@ import { ttsSessions } from '../../../features/voice/tts/sessionManager.js';
 import {
   COMMAND_POLICY,
   DISCORD_OPTION_BOUNDS,
+  declaredCooldown,
   IDS,
   INJECTED_FAILURE,
   KNOWN_HELP_OVERREACH,
@@ -433,6 +451,8 @@ beforeEach(() => {
     )
     .all() as Array<{ name: string }>;
   for (const { name } of tables) db.exec(`DELETE FROM "${name}"`);
+  // The repository caches dictionaries and voice choices per process.
+  ttsRepository.clearCache();
 
   world = createWorld(OWNER_ID);
   world.client.commands = buildCommandCollection(commands);
@@ -503,6 +523,50 @@ function errorEmbeds(run: Invocation): APIEmbed[] {
     .filter((embed) => embed.color === COLORS.ERROR);
 }
 
+/**
+ * Embeds that turn the user away: errors, and warnings. Being asked to wait,
+ * lacking a permission or using a server-only command in a DM is not
+ * something that went wrong, so those refusals are warnings, not errors.
+ */
+function refusalEmbeds(run: Invocation): APIEmbed[] {
+  return run.sent
+    .flatMap((entry) => embedsOf(entry.payload))
+    .filter(
+      (embed) => embed.color === COLORS.ERROR || embed.color === COLORS.WARNING
+    );
+}
+
+/** Titles of the refusals the middleware and permission checks send. */
+const REFUSAL_TITLES = new Set(
+  (
+    [
+      'common.permissionDeniedTitle',
+      'common.cooldownTitle',
+      'common.serverOnlyTitle',
+    ] as const
+  ).flatMap((key) => [t(key, 'en'), t(key, 'ja')])
+);
+
+/**
+ * What a run in a server set up for it must not send: an error, or one of
+ * the standard refusals (missing permission, cooldown, server only).
+ */
+function problemEmbeds(run: Invocation): string[] {
+  return run.sent
+    .flatMap((entry) => embedsOf(entry.payload))
+    .filter(
+      (embed) =>
+        embed.color === COLORS.ERROR ||
+        (embed.color === COLORS.WARNING && REFUSAL_TITLES.has(embed.title!))
+    )
+    .map((embed) => `${embed.title}: ${embed.description}`);
+}
+
+/** The error ID an "unexpected error" apology quotes, if any. */
+function errorIdIn(embed: APIEmbed | undefined): string | undefined {
+  return /`([0-9a-f]{6})`/.exec(embed?.description ?? '')?.[1];
+}
+
 /** The invariants every invocation must hold, whatever its outcome. */
 function expectWellBehaved(run: Invocation, error: unknown): void {
   expect(error, 'execute() threw').toBeUndefined();
@@ -533,17 +597,19 @@ function isEphemeral(payload: unknown): boolean {
 }
 
 /**
- * A refusal: one private error, sent either as a reply or as a private
- * deferral followed by an edit.
+ * A refusal: one private error or warning, sent either as a reply or as a
+ * private deferral followed by an edit. Returns the refusal embed.
  */
-function expectRefusal(run: Invocation): void {
+function expectRefusal(run: Invocation): APIEmbed {
   expect([['reply'], ['deferReply', 'editReply']]).toContainEqual(
     run.sent.map((entry) => entry.via)
   );
   expect(isEphemeral(run.sent[0]!.payload), 'the refusal is private').toBe(
     true
   );
-  expect(errorEmbeds(run)).toHaveLength(1);
+  const refusals = refusalEmbeds(run);
+  expect(refusals).toHaveLength(1);
+  return refusals[0]!;
 }
 
 /** Row-for-row contents of every table, to prove a run changed nothing. */
@@ -656,8 +722,8 @@ describe('every command path in a fully set-up server', () => {
 
     expectWellBehaved(run, error);
     expect(
-      errorEmbeds(run).map((embed) => `${embed.title}: ${embed.description}`),
-      'error responses in a server set up for this command (add a SCENARIOS entry if it needs prior state)'
+      problemEmbeds(run),
+      'error or refusal responses in a server set up for this command (add a SCENARIOS entry if it needs prior state)'
     ).toEqual([]);
   });
 });
@@ -699,7 +765,7 @@ describe('every command path routed like production', () => {
       );
 
       expectWellBehaved(run, error);
-      expect(errorEmbeds(run)).toEqual([]);
+      expect(problemEmbeds(run)).toEqual([]);
       expect(executions(name)).toBe(before + 1);
     }
   );
@@ -774,9 +840,13 @@ describe.each(ACTORS)(
 
         expectWellBehaved(run, error);
         if (allowed) {
-          expect(errorEmbeds(run), 'served without an error').toEqual([]);
+          expect(problemEmbeds(run), 'served without a refusal').toEqual([]);
         } else {
-          expectRefusal(run);
+          // Turned away for the permission it lacks, saying so.
+          expect(expectRefusal(run)).toMatchObject({
+            title: t('common.permissionDeniedTitle', 'en'),
+            color: COLORS.WARNING,
+          });
           expectNoSideEffects(before);
         }
 
@@ -827,7 +897,7 @@ async function runWithin(
 }
 
 const COOLDOWN_CASES = paths.flatMap((path) => {
-  const cooldownMs = COMMAND_POLICY[path.entry.json.name]?.cooldownMs;
+  const cooldownMs = declaredCooldown(path);
   return cooldownMs
     ? [[`/${path.label} (${cooldownMs}ms)`, { path, cooldownMs }] as const]
     : [];
@@ -862,10 +932,11 @@ describe('every command path with a declared cooldown', () => {
       }: Awaited<ReturnType<typeof invoke>>) => {
         expect(error).toBeUndefined();
         expect(executed, 'execute() ran despite the cooldown').toBe(0);
-        expectRefusal(run);
-        expect(errorEmbeds(run)[0]!.title).toBe(
-          t('common.commandBlocked', 'en')
-        );
+        const refusal = expectRefusal(run);
+        expect(refusal.color).toBe(COLORS.WARNING);
+        expect(refusal.title).toBe(t('common.cooldownTitle', 'en'));
+        // Names the path that is cooling down, not just the command.
+        expect(refusal.description).toContain(`/${path.label}`);
       };
 
       const first = await invoke();
@@ -887,32 +958,47 @@ describe('every command path with a declared cooldown', () => {
     }
   );
 
-  it('covers every command whose middleware enforces a cooldown', () => {
-    const enforced = commands
-      .filter((entry) => effectiveCooldown(entry.command) !== null)
-      .map((entry) => entry.json.name);
+  it('covers every path whose middleware enforces a cooldown', () => {
+    const enforced = paths
+      .filter(
+        (path) => effectiveCooldown(path.entry.command, path.label) !== null
+      )
+      .map((path) => path.label);
 
     expect(COOLDOWN_CASES.length).toBeGreaterThan(0);
-    expect([
-      ...new Set(COOLDOWN_CASES.map(([, { path }]) => path.entry.json.name)),
-    ]).toEqual(enforced);
+    expect(COOLDOWN_CASES.map(([, { path }]) => path.label)).toEqual(enforced);
+  });
+
+  it('cools each path down on its own', async () => {
+    // Asking for help right after a ping is not "too fast": cooldowns are
+    // keyed by the full path, not by the command.
+    const labels = ['general ping', 'general about', 'general help'];
+    for (const label of labels) {
+      const path = paths.find((candidate) => candidate.label === label)!;
+      const run = invokeCommand(world, path, {
+        fill: 'all',
+        locale: 'en-US',
+        inGuild: true,
+        suggestions: await suggestionsFor(path),
+      });
+      const before = executions(path.entry.json.name);
+
+      await runWithin(routeInteraction(world.client, run.interaction), 3_000);
+
+      expect(problemEmbeds(run), `/${label}`).toEqual([]);
+      expect(executions(path.entry.json.name), `/${label}`).toBe(before + 1);
+    }
   });
 });
 
 /**
  * Paths that catch a failed response themselves instead of leaving it to the
- * router, with what they had already done by then. Production bug: role.ts
- * wraps the confirmation reply in the same `try` as the role change, so a
- * lost confirmation is reported as "Failed to modify role." although the
- * change went through (and was audited). A retry then says the member
- * already has the role.
+ * router, with what they had already done by then. Empty: `/admin role`
+ * used to report a lost confirmation as "Failed to modify role." although
+ * the change had gone through; only the role change is inside its `try`
+ * now, so the router reports the lost reply like any other.
  */
-const HANDLES_OWN_FAILURE: Record<string, (world: SmokeWorld) => void> = {
-  'admin role add': (w) =>
-    expect(w.target.roles.add).toHaveBeenCalledWith(w.role.id),
-  'admin role remove': (w) =>
-    expect(w.target.roles.remove).toHaveBeenCalledWith(w.role.id),
-};
+const HANDLES_OWN_FAILURE: Record<string, (world: SmokeWorld) => void> = {};
 
 /**
  * Paths known to defer or confirm and then edit their reply, so the router's
@@ -928,13 +1014,22 @@ const KNOWN_EDITORS = new Set([
   'voice record',
 ]);
 
+/**
+ * Paths that retry an edit Discord failed with a 5xx or a network error (the
+ * injected failure is neither a 4xx nor permanent): the recording is
+ * delivered on the second attempt instead of being reported as lost.
+ */
+const RETRIES_FAILED_EDIT = new Set(['voice record']);
+
 describe('every command path when Discord rejects a response', () => {
   it('keeps its path lists attached to real paths', () => {
     const labels = new Set(paths.map((path) => path.label));
     expect(
-      [...Object.keys(HANDLES_OWN_FAILURE), ...KNOWN_EDITORS].filter(
-        (label) => !labels.has(label)
-      )
+      [
+        ...Object.keys(HANDLES_OWN_FAILURE),
+        ...KNOWN_EDITORS,
+        ...RETRIES_FAILED_EDIT,
+      ].filter((label) => !labels.has(label))
     ).toEqual([]);
   });
 
@@ -953,7 +1048,7 @@ describe('every command path when Discord rejects a response', () => {
       const before = { executed: executions(name), failed: failures(name) };
       // Step the clock rather than run every timer, so a cooldown the
       // failure left behind is still in force for the retry below.
-      const budget = COMMAND_POLICY[name]?.cooldownMs ?? 60_000;
+      const budget = declaredCooldown(path) ?? 60_000;
 
       const error = await runWithin(
         routeInteraction(world.client, run.interaction),
@@ -979,18 +1074,21 @@ describe('every command path when Discord rejects a response', () => {
         return;
       }
 
+      // The apology quotes the reference the log has next to the stack.
+      const id = errorIdIn(embedsOf(run.sent[0]!.payload)[0]);
+      expect(id, 'the apology carries an error ID').toBeDefined();
       expect(embedsOf(run.sent[0]!.payload)).toEqual([
         expect.objectContaining({
           title: t('common.error', 'en'),
-          description: t('common.unexpectedError', 'en'),
+          description: t('common.unexpectedError', 'en', { id: id! }),
           color: COLORS.ERROR,
         }),
       ]);
       expect(executions(name)).toBe(before.executed);
       expect(failures(name)).toBe(before.failed + 1);
       expect(logger.error).toHaveBeenCalledWith(
-        `Error executing command ${name}:`,
-        INJECTED_FAILURE
+        `[${id}] Error executing command ${path.label}:`,
+        expect.stringContaining(INJECTED_FAILURE)
       );
 
       // A failed run must not leave the user locked out by a cooldown.
@@ -1042,14 +1140,32 @@ describe('every command path when Discord rejects a response', () => {
         return;
       }
 
+      if (RETRIES_FAILED_EDIT.has(path.label)) {
+        // The same edit went out again and was delivered: no apology, no
+        // failure counted.
+        const edits = run.sent.filter((entry) => entry.via === 'editReply');
+        expect(edits).toHaveLength(1);
+        expect(run.sent.at(-1)!.via).toBe('editReply');
+        expect(run.interaction.editReply).toHaveBeenCalledTimes(2);
+        expect(errorEmbeds(run)).toEqual([]);
+        expect(failures(name)).toBe(failedBefore);
+        return;
+      }
+
       const last = run.sent.at(-1)!;
       expect(last.via).toBe('editReply');
+      const id = errorIdIn(embedsOf(last.payload)[0]);
+      expect(id, 'the apology carries an error ID').toBeDefined();
       expect(embedsOf(last.payload)).toEqual([
         expect.objectContaining({
-          description: t('common.unexpectedError', 'en'),
+          description: t('common.unexpectedError', 'en', { id: id! }),
           color: COLORS.ERROR,
         }),
       ]);
+      expect(logger.error).toHaveBeenCalledWith(
+        `[${id}] Error executing command ${path.label}:`,
+        expect.stringContaining(INJECTED_FAILURE)
+      );
       expect(failures(name)).toBe(failedBefore + 1);
     }
   );
@@ -1311,6 +1427,8 @@ const REACHES: Array<{
   },
   {
     label: 'community poll create',
+    // With fewer than two options it opens a form instead (see below).
+    fill: 'all',
     reached: (w) =>
       expect(
         pollRepository.findActiveByCreator(w.actor.id, w.textChannel.id)
@@ -1522,7 +1640,7 @@ describe('the smoke world reaches the real work', () => {
       const error = await settle(path!.entry.command.execute(run.interaction));
 
       expect(error).toBeUndefined();
-      expect(errorEmbeds(run)).toEqual([]);
+      expect(problemEmbeds(run)).toEqual([]);
       reached(world);
     }
   );
@@ -1738,14 +1856,19 @@ describe('the smoke harness itself', () => {
   });
 
   it('presses the confirm button of a real confirmation prompt', async () => {
-    let confirmed: boolean | undefined;
+    let outcome: string | undefined;
     const { run } = await runFake(
       fakePath(async (interaction) => {
-        confirmed = await awaitConfirmation(interaction, 'Proceed?');
+        const result = await awaitConfirmationResult(interaction, 'Proceed?');
+        outcome = result.outcome;
+        // The command answers the press itself, once.
+        if (result.outcome === 'confirmed') {
+          await result.response.update({ content: 'Done', components: [] });
+        }
       })
     );
 
-    expect(confirmed).toBe(true);
+    expect(outcome).toBe('confirmed');
     expect(run.sent.map((entry) => entry.via)).toEqual([
       'reply',
       'component.update',
@@ -1806,6 +1929,56 @@ describe('the smoke harness itself', () => {
         ],
       })
     ).toEqual(['button "No id" has no custom_id']);
+  });
+
+  it('checks a form against Discord’s form limits, not a message’s', () => {
+    expect(
+      messageLimitProblems({
+        custom_id: 'form',
+        title: 't'.repeat(46),
+        components: [
+          {
+            type: 18,
+            label: 'l'.repeat(46),
+            component: {
+              type: 4,
+              custom_id: 'a',
+              value: 'v'.repeat(11),
+              max_length: 10,
+            },
+          },
+          {
+            type: 18,
+            label: 'Again',
+            component: {
+              type: 4,
+              custom_id: 'a',
+              placeholder: 'p'.repeat(101),
+            },
+          },
+        ],
+      })
+    ).toEqual([
+      'form title is 46 chars (max 45)',
+      'form label is 46 chars (max 45)',
+      'form prefilled value is 11 chars (max 10)',
+      'form custom_id "a" is used twice',
+      'form placeholder is 101 chars (max 100)',
+    ]);
+    expect(
+      textsOf({
+        custom_id: 'form',
+        title: 'Title',
+        components: [
+          {
+            type: 18,
+            label: 'Label',
+            description: 'Hint {name}',
+            component: { type: 4, custom_id: 'a', placeholder: 'Type here' },
+          },
+        ],
+      })
+    ).toEqual(['Title', 'Label', 'Hint {name}', 'Type here']);
   });
 
   it('flags raw translation keys and unfilled placeholders', () => {

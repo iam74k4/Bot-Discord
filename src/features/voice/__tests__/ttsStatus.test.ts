@@ -1,126 +1,71 @@
-import {
-  type ChatInputCommandInteraction,
-  type EmbedBuilder,
-  MessageFlags,
-} from 'discord.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * A connection made only to read chat aloud keeps no audio, so `/voice status`
  * must not tell people their channel is being buffered because of it.
+ *
+ * The status panel's own output is covered in status.test.ts; this pins the
+ * predicate it relies on, so a text-to-speech join can never be mistaken
+ * for one that keeps audio.
  */
 const getConnection = vi.hoisted(() => vi.fn());
+const getConnectedChannelInGuild = vi.hoisted(() => vi.fn());
 
 vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: {
     getConnection,
-    getConnectionCount: vi.fn(() => 1),
+    getConnectedChannelInGuild,
+    isAtLimit: vi.fn(() => false),
   },
 }));
-
-const isChannelExcluded = vi.hoisted(() => vi.fn(() => false));
 
 vi.mock('../repositories/voiceSettingsRepository.js', () => ({
   voiceSettingsRepository: {
     isAutoJoinEnabled: vi.fn(() => true),
-    listExclusions: vi.fn(() => []),
-    isChannelExcluded,
+    isChannelExcluded: vi.fn(() => false),
   },
 }));
 
-vi.mock('../../../locales/guildLocale.js', () => ({
-  resolveLocale: (interaction: { locale: string }) =>
-    interaction.locale === 'ja' ? 'ja' : 'en',
-}));
+const { isBuffering, diagnoseBufferingGap } =
+  await import('../application/diagnose.js');
 
-vi.mock('../../../config/index.js', () => ({
-  env: { MAX_CONCURRENT_VC_CONNECTIONS: 3, AUDIO_BUFFER_DURATION: 600 },
-}));
-
-const { executeStatusCommand } = await import('../application/status.js');
-const { t } = await import('../../../locales/index.js');
-
+const GUILD = 'guild-1';
 const VC = 'vc-1';
-
-function interaction(locale = 'en-US') {
-  return {
-    guildId: 'guild-1',
-    locale,
-    member: { voice: { channelId: VC } },
-    reply: vi.fn(async () => undefined),
-  };
-}
-
-function currentChannelLine(
-  fake: ReturnType<typeof interaction>,
-  locale: 'en' | 'ja' = 'en'
-): string {
-  expect(fake.reply).toHaveBeenCalledTimes(1);
-  const [payload] = fake.reply.mock.calls[0] as unknown as [
-    { embeds: EmbedBuilder[]; flags: number },
-  ];
-  expect(payload.flags).toBe(MessageFlags.Ephemeral);
-  const description = payload.embeds[0].toJSON().description ?? '';
-  const prefix = `${t('record.statusHint', locale)}\n\n`;
-  expect(description.startsWith(prefix)).toBe(true);
-  return description.slice(prefix.length);
-}
-
-const run = (fake: ReturnType<typeof interaction>) =>
-  executeStatusCommand(fake as unknown as ChatInputCommandInteraction);
 
 describe('/voice status with text-to-speech connections', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    isChannelExcluded.mockReturnValue(false);
   });
 
-  it('does not report a text-to-speech-only connection as buffering', async () => {
+  it('does not count a text-to-speech-only connection as buffering', () => {
     getConnection.mockReturnValue({ channelId: VC, receiving: false });
-    const fake = interaction();
 
-    await run(fake);
-
+    expect(isBuffering(VC)).toBe(false);
     expect(getConnection).toHaveBeenCalledWith(VC);
-    expect(currentChannelLine(fake)).toBe(
-      t('record.autojoin.currentChannelNone', 'en')
-    );
   });
 
   it.each([
     ['a receiving connection', { channelId: VC, receiving: true }],
     ['a connection without the flag', { channelId: VC }],
-  ])('reports %s as buffering', async (_label, connection) => {
+  ])('counts %s as buffering', (_label, connection) => {
     getConnection.mockReturnValue(connection);
-    const fake = interaction();
 
-    await run(fake);
-
-    expect(currentChannelLine(fake)).toBe(
-      t('record.autojoin.currentChannelBuffered', 'en')
-    );
+    expect(isBuffering(VC)).toBe(true);
   });
 
-  it('reports nothing kept when there is no connection', async () => {
+  it('counts nothing as buffering without a connection', () => {
     getConnection.mockReturnValue(undefined);
-    const fake = interaction();
 
-    await run(fake);
-
-    expect(currentChannelLine(fake)).toBe(
-      t('record.autojoin.currentChannelNone', 'en')
-    );
+    expect(isBuffering(VC)).toBe(false);
   });
 
-  it('still reports an excluded channel as excluded', async () => {
-    isChannelExcluded.mockReturnValue(true);
-    getConnection.mockReturnValue({ channelId: VC, receiving: false });
-    const fake = interaction('ja');
+  it('explains a text-to-speech-only connection as reading aloud, not as missing', () => {
+    getConnectedChannelInGuild.mockReturnValue(VC);
+    const guild = { id: GUILD, members: { me: null } };
+    const channel = { id: VC, permissionsFor: vi.fn(() => null) };
 
-    await run(fake);
-
-    expect(currentChannelLine(fake, 'ja')).toBe(
-      t('record.autojoin.currentChannelExcluded', 'ja')
-    );
+    expect(
+      diagnoseBufferingGap(guild as never, channel as never)
+    ).toStrictEqual({ reason: 'readOnly' });
   });
 });

@@ -113,6 +113,8 @@ export interface ChatInteractionOptions extends AskerOptions {
   subcommand?: string | null;
   /** Value of the `command` string option of `/general help`. */
   commandOption?: string | null;
+  /** Value of the `public` boolean option of `/general help`. */
+  publicOption?: boolean | null;
   createdTimestamp?: number;
   wsPing?: number;
   reply?: MockFn;
@@ -140,6 +142,7 @@ export function chatInteraction(
   const interaction = {
     id: 'interaction-1',
     ...asker(options),
+    commandName: 'general',
     locale: 'en-US',
     createdTimestamp: options.createdTimestamp ?? 0,
     client: { commands, ws: { ping: options.wsPing ?? 0 } },
@@ -147,6 +150,9 @@ export function chatInteraction(
       getSubcommand: vi.fn().mockReturnValue(options.subcommand ?? null),
       getString: vi.fn((name: string) =>
         name === 'command' ? (options.commandOption ?? null) : null
+      ),
+      getBoolean: vi.fn((name: string) =>
+        name === 'public' ? (options.publicOption ?? null) : null
       ),
     },
     reply,
@@ -181,25 +187,42 @@ export function autocompleteInteraction(
   return { interaction, respond };
 }
 
-/** A component interaction arriving on the help panel's collector. */
-export function selectComponent(values: string[], userId = USER_ID) {
+/**
+ * A select-menu interaction arriving on the help panel's collector: the
+ * category menu by default, or the command menu (`help_command`).
+ */
+export function selectComponent(
+  values: string[],
+  userId = USER_ID,
+  customId = 'help_category'
+) {
   return {
     user: { id: userId },
-    customId: 'help_category',
+    customId,
     values,
+    replied: false,
+    deferred: false,
     isStringSelectMenu: () => true,
+    isButton: () => false,
     update: vi.fn().mockResolvedValue({}),
     reply: vi.fn().mockResolvedValue({}),
+    followUp: vi.fn().mockResolvedValue({}),
     deferUpdate: vi.fn().mockResolvedValue({}),
   };
 }
 
-/** A non-select component (e.g. a stray button) on the same message. */
-export function buttonComponent(userId = USER_ID) {
+/** A pick in the panel's command menu. */
+export function commandSelect(value: string, userId = USER_ID) {
+  return selectComponent([value], userId, 'help_command');
+}
+
+/** A button on the same message: the panel's back button, or a stray one. */
+export function buttonComponent(userId = USER_ID, customId = 'help_button') {
   return {
     ...selectComponent([], userId),
-    customId: 'help_button',
+    customId,
     isStringSelectMenu: () => false,
+    isButton: () => true,
   };
 }
 
@@ -232,6 +255,31 @@ export function selectMenuAt(mock: MockFn, call = 0): APIStringSelectComponent {
   const rows = payloadAt(mock, call).components;
   if (!rows?.length) throw new Error(`call ${call} sent no components`);
   return rows[0].toJSON().components[0] as APIStringSelectComponent;
+}
+
+/** Every component of the payload passed in `call`, row by row, as JSON. */
+export function componentsAt(
+  mock: MockFn,
+  call = 0
+): Array<{ custom_id?: string; disabled?: boolean } & Record<string, unknown>> {
+  const rows = payloadAt(mock, call).components ?? [];
+  return rows.flatMap(
+    (row) =>
+      row.toJSON().components as Array<
+        { custom_id?: string; disabled?: boolean } & Record<string, unknown>
+      >
+  );
+}
+
+/** The component with `customId` in the payload passed in `call`. */
+export function componentAt<T = APIStringSelectComponent>(
+  mock: MockFn,
+  customId: string,
+  call = 0
+): T | undefined {
+  return componentsAt(mock, call).find(
+    (component) => component.custom_id === customId
+  ) as T | undefined;
 }
 
 /** Character count Discord applies to its 6000-per-embed limit. */

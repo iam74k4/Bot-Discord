@@ -1,11 +1,17 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { Events, GatewayIntentBits } from 'discord.js';
+import {
+  Events,
+  GatewayIntentBits,
+  RESTEvents,
+  SnowflakeUtil,
+} from 'discord.js';
 import type { AppConfig } from '../../config/index.js';
 import type { ExtendedClient } from '../../client.js';
 import {
   createApp,
   defaultDependencies,
+  liveComponentShutdownBudget,
   type AppDependencies,
 } from '../composition.js';
 import { loadCommands } from '../../handlers/commandHandler.js';
@@ -25,6 +31,12 @@ import {
   stopAuditRetention,
 } from '../../infrastructure/audit/index.js';
 import { cooldownStore } from '../../middleware/cooldown/cooldownStore.js';
+import { metrics } from '../../infrastructure/metrics/index.js';
+import {
+  clearComponentHandlers,
+  isComponentRoutingReady,
+  trackLiveComponents,
+} from '../../shared/interactions/index.js';
 
 const logger = vi.hoisted(() => ({
   error: vi.fn(),
@@ -83,6 +95,11 @@ function harness(overrides: Partial<AppDependencies> = {}) {
     startAuditRetention: record('startAuditRetention'),
     stopAuditRetention: record('stopAuditRetention'),
     clearCooldowns: record('clearCooldowns'),
+    startRuntimeMetrics: record('startRuntimeMetrics'),
+    stopRuntimeMetrics: record('stopRuntimeMetrics'),
+    stopLiveComponents: async () => void order.push('stopLiveComponents'),
+    setComponentRoutingReady: (ready) =>
+      void order.push(`componentRouting:${ready ? 'ready' : 'off'}`),
     ...overrides,
   };
 
@@ -108,9 +125,14 @@ describe('composition root', () => {
       'loadFeatures',
       'loadCommands',
       'loadEvents',
+      // Measuring starts before the gateway can deliver an interaction.
+      'startRuntimeMetrics',
       'login',
       'awaitReady',
       'startAllFeatures',
+      // Unclaimed clicks count as expired only once every persistent
+      // handler is registered.
+      'componentRouting:ready',
       'backup.start',
       'startAuditRetention',
     ]);
@@ -129,17 +151,24 @@ describe('composition root', () => {
     });
   });
 
-  it('takes the final backup before closing the database', async () => {
+  it('takes the final backup after features stop and before closing the database', async () => {
     const { order, deps } = harness();
 
     await createApp(config(), deps).stop();
 
     expect(order).toEqual([
-      'backup.runBackup',
+      // Features unregister their buttons below; stop calling clicks expired.
+      'componentRouting:off',
+      // Open panels close while the gateway and REST still work.
+      'stopLiveComponents',
       'backup.stop',
       'stopAuditRetention',
+      // Features write on the way out (open VC sessions are closed); the
+      // final backup must include those rows.
       'stopAllFeatures',
+      'backup.runBackup',
       'clearCooldowns',
+      'stopRuntimeMetrics',
       'closeDatabase',
       'client.destroy',
     ]);
@@ -151,7 +180,11 @@ describe('composition root', () => {
     await createApp(config({ SHUTDOWN_FINAL_BACKUP: false }), deps).stop();
 
     expect(order).not.toContain('backup.runBackup');
-    expect(order[0]).toBe('backup.stop');
+    expect(order.slice(0, 3)).toEqual([
+      'componentRouting:off',
+      'stopLiveComponents',
+      'backup.stop',
+    ]);
   });
 
   it('still closes the database when an earlier step throws', async () => {
@@ -189,7 +222,13 @@ describe('composition root', () => {
     ['loadCommands', ['initializeDatabase', 'loadFeatures']],
     [
       'login',
-      ['initializeDatabase', 'loadFeatures', 'loadCommands', 'loadEvents'],
+      [
+        'initializeDatabase',
+        'loadFeatures',
+        'loadCommands',
+        'loadEvents',
+        'startRuntimeMetrics',
+      ],
     ],
     [
       'awaitReady',
@@ -198,7 +237,21 @@ describe('composition root', () => {
         'loadFeatures',
         'loadCommands',
         'loadEvents',
+        'startRuntimeMetrics',
         'login',
+      ],
+    ],
+    [
+      // Routing is never marked ready when a feature failed to start.
+      'startAllFeatures',
+      [
+        'initializeDatabase',
+        'loadFeatures',
+        'loadCommands',
+        'loadEvents',
+        'startRuntimeMetrics',
+        'login',
+        'awaitReady',
       ],
     ],
   ])(
@@ -229,10 +282,13 @@ describe('composition root', () => {
         'Final backup failed: disk full'
       );
       expect(order).toEqual([
+        'componentRouting:off',
+        'stopLiveComponents',
         'backup.stop',
         'stopAuditRetention',
         'stopAllFeatures',
         'clearCooldowns',
+        'stopRuntimeMetrics',
         'closeDatabase',
         'client.destroy',
       ]);
@@ -291,12 +347,56 @@ describe('composition root', () => {
       'already destroyed'
     );
     expect(order).toEqual([
-      'backup.runBackup',
+      'componentRouting:off',
+      'stopLiveComponents',
       'backup.stop',
       'stopAuditRetention',
       'stopAllFeatures',
+      'backup.runBackup',
       'clearCooldowns',
+      'stopRuntimeMetrics',
     ]);
+  });
+
+  it.each([
+    [10_000, 2_000],
+    [5_000, 1_000],
+    [30_000, 3_000],
+    [120_000, 3_000],
+  ])(
+    'gives closing the open panels a fifth of a %i ms shutdown, at most 3 s (%i ms)',
+    async (shutdownTimeoutMs, budget) => {
+      const stopLiveComponents = vi.fn().mockResolvedValue(undefined);
+      const { deps } = harness({ stopLiveComponents });
+
+      await createApp(
+        config({ SHUTDOWN_TIMEOUT_MS: shutdownTimeoutMs }),
+        deps
+      ).stop();
+
+      expect(stopLiveComponents).toHaveBeenCalledWith(budget);
+      expect(liveComponentShutdownBudget(shutdownTimeoutMs)).toBe(budget);
+    }
+  );
+
+  it('falls back to 3 s for closing panels when no shutdown budget is configured', () => {
+    expect(liveComponentShutdownBudget(Number.NaN)).toBe(3_000);
+    expect(liveComponentShutdownBudget(0)).toBe(3_000);
+  });
+
+  it('keeps shutting down when closing the open panels fails', async () => {
+    const { order, deps } = harness({
+      stopLiveComponents: vi.fn().mockRejectedValue(new Error('gateway gone')),
+    });
+
+    await createApp(config(), deps).stop();
+
+    expect(logger.error).toHaveBeenCalledWith(
+      'Failed to stop Live components:',
+      'gateway gone'
+    );
+    expect(order).toContain('closeDatabase');
+    expect(order).toContain('client.destroy');
   });
 });
 
@@ -397,6 +497,59 @@ describe('defaultDependencies', () => {
     await waiting;
 
     expect(ready).toBe(true);
+  });
+
+  it('measures the event loop and interaction callbacks while running', () => {
+    const deps = defaultDependencies();
+    const rest = new EventEmitter();
+    const client = { rest } as unknown as ExtendedClient;
+    const id = SnowflakeUtil.generate({
+      timestamp: Date.now() - 40,
+    }).toString();
+    metrics.reset();
+    metrics.noteInteraction(id, 'general ping');
+
+    deps.startRuntimeMetrics(client);
+    try {
+      expect(metrics.getEventLoopStats()).not.toBeNull();
+      rest.emit(
+        RESTEvents.Response,
+        {
+          route: '/interactions/:id/:token/callback',
+          path: `/interactions/${id}/token/callback`,
+        },
+        { status: 204 }
+      );
+      expect(metrics.getAcknowledgementStats().count).toBe(1);
+    } finally {
+      deps.stopRuntimeMetrics(client);
+    }
+
+    expect(metrics.getEventLoopStats()).toBeNull();
+    expect(rest.listenerCount(RESTEvents.Response)).toBe(0);
+    metrics.reset();
+  });
+
+  it('closes open panels on shutdown', async () => {
+    const stop = vi.fn();
+    const untrack = trackLiveComponents('message-1', { stop });
+
+    await defaultDependencies().stopLiveComponents(1_000);
+
+    expect(stop).toHaveBeenCalledWith('shutdown');
+    untrack();
+  });
+
+  it('drives the shared component routing flag', () => {
+    const deps = defaultDependencies();
+    try {
+      deps.setComponentRoutingReady(true);
+      expect(isComponentRoutingReady()).toBe(true);
+      deps.setComponentRoutingReady(false);
+      expect(isComponentRoutingReady()).toBe(false);
+    } finally {
+      clearComponentHandlers();
+    }
   });
 
   it('clears the shared cooldown store', () => {

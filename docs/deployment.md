@@ -33,7 +33,8 @@ In Railway dashboard, add the following variables:
 | `BOT_OWNER_IDS`                 | Bot owner Discord IDs (comma-separated); **required when `NODE_ENV=production`**          | Yes in production |
 | `DISCORD_GUILD_ID`              | Development guild for faster slash command updates                                        | No                |
 | `NODE_ENV`                      | Set to `production`                                                                       | No                |
-| `TZ`                            | Timezone used by cron jobs and timestamps                                                 | No                |
+| `TZ`                            | Timezone for the backup cron and log timestamps; VC stats follow `STATS_TIMEZONE`         | No                |
+| `STATS_TIMEZONE`                | IANA zone whose midnight starts a VC stats day (default: `TZ` if set, else `Asia/Tokyo`)  | No                |
 | `MAX_RECORDING_DURATION`        | Max recording time in seconds (default: 300)                                              | No                |
 | `AUDIO_BUFFER_DURATION`         | In-memory ring buffer length in seconds (default: 300, ~0.27MB/s per channel)             | No                |
 | `MEMORY_LIMIT_MB`               | Memory budget in MB (default: 512); warns at 70% RSS, sheds connections at 85%            | No                |
@@ -42,7 +43,7 @@ In Railway dashboard, add the following variables:
 | `VOICE_SESSION_RETENTION_DAYS`  | Days to keep raw VC session rows (default: 30); stats totals survive via the daily rollup | No                |
 | `AUDIT_LOG_RETENTION_DAYS`      | Days to keep audit logs (default: 90)                                                     | No                |
 | `BACKUP_RETENTION_DAYS`         | Days to keep backups (default: 7)                                                         | No                |
-| `BACKUP_CRON`                   | Backup schedule cron expression (default: `0 4 * * *`)                                    | No                |
+| `BACKUP_CRON`                   | Backup schedule cron expression in `TZ` (default: `0 4 * * *`; UTC unless `TZ` is set)    | No                |
 | `SHUTDOWN_FINAL_BACKUP`         | Run final backup before shutdown (default: true)                                          | No                |
 | `SHUTDOWN_TIMEOUT_MS`           | Shutdown timeout in ms (default: 10000, range: 5000–120000)                               | No                |
 | `ALERT_WEBHOOK_URL`             | Discord webhook URL for alerts (`https://` only)                                          | No                |
@@ -52,10 +53,31 @@ In Railway dashboard, add the following variables:
 | `RECORDINGS_DIR`                | Generated recording files directory (must stay relative to repo root)                     | No                |
 | `BACKUP_DIR`                    | Backup output directory (must stay relative to repo root)                                 | No                |
 | `VOICEVOX_URL`                  | VOICEVOX engine URL; enables `/tts` and the Message Content intent (see below)            | No                |
+| `FORCE_COMMAND_SYNC`            | `true` re-uploads the slash commands at startup even when they look unchanged (see below) | No                |
+| `NODE_COMPILE_CACHE`            | Node's compile cache directory, e.g. `/app/data/.node-compile-cache` (see below)          | No                |
 
 If you enable voice recording in production, remember that `/voice record` now requires `Manage Server`, and generated files are delivered ephemerally and cleaned up automatically according to `RECORDING_RETENTION_HOURS`.
 
 Size the instance from `AUDIO_BUFFER_DURATION × 0.27MB × MAX_CONCURRENT_VC_CONNECTIONS` — about 410MB at the defaults — plus the bot's baseline, and set `MEMORY_LIMIT_MB` to the memory the host actually grants. That is the worst case, not the steady state: a channel's buffer is allocated on its first decoded audio chunk, so idle connections cost nothing. Servers that do not want the bot buffering their voice channels can turn it off per guild or per channel with `/voice autojoin`.
+
+### Slash command registration
+
+At startup the bot compares the commands it is about to register with what
+it registered last time (a hash in `DATA_DIR/command-sync.json`) and skips
+the upload when nothing changed, so a plain restart does not spend Discord's
+daily command-update budget. It still reads the registered command IDs, which
+turn command names in replies into clickable mentions. Set
+`FORCE_COMMAND_SYNC=true` for one start if commands were changed or deleted
+outside the bot (for example with `npm run cleanup-commands`), or delete
+`command-sync.json`.
+
+### Startup cache
+
+In production the bot turns on Node's compile cache under
+`DATA_DIR/.node-compile-cache` (on the volume), which takes about 18% off
+loading its modules on a restart. Setting the service variable
+`NODE_COMPILE_CACHE=/app/data/.node-compile-cache` also covers the few modules
+loaded before the bot enables it; it is optional.
 
 ### Shutdown and restarts
 
@@ -65,6 +87,13 @@ closing open VC sessions, leaving voice channels) was skipped on every
 redeploy. `drainingSeconds = 15` gives that shutdown time to finish before
 Railway sends SIGKILL; keep it above `SHUTDOWN_TIMEOUT_MS / 1000`. A crash
 exits with code 1 so the `ON_FAILURE` restart policy brings the bot back.
+
+The shutdown first closes open panels and confirmation prompts, so users see
+them end ("the bot is restarting, nothing was done") instead of buttons that
+fail after the restart; that step gets at most 3 seconds, or a fifth of
+`SHUTDOWN_TIMEOUT_MS` if that is less. A button pressed while the bot is
+starting or stopping gets a private "restarting, try again in a few seconds"
+note and the message is left as it is.
 
 After a redeploy, the old deployment's logs should end with
 `Received SIGTERM, initiating graceful shutdown...` and
@@ -77,7 +106,13 @@ runs as its own service next to the bot:
 
 1. In the same Railway project, add a service from the Docker image
    `voicevox/voicevox_engine:cpu-latest`. It listens on port `50021` and needs
-   no volume.
+   no volume. Set `VV_CPU_NUM_THREADS` on the engine service to the number of
+   vCPUs it is allowed (usually `1` or `2`), never more: left unset, the engine
+   starts one thread per core it can _see_, which inside a container can be
+   far more than its CPU limit. Measured on a 2-vCPU limit, 4 threads made
+   every line 1.4× slower and 8 threads 2.4× slower; on 1 vCPU the automatic
+   choice was 12–16% slower than `1`. Run `nproc` in the engine service's
+   shell to see what it sees.
 2. Set `VOICEVOX_URL` on the bot to the engine's private address, e.g.
    `http://voicevox.railway.internal:50021`. Keeping the engine on private
    networking means it is never exposed to the internet.
@@ -93,6 +128,17 @@ Playback needs no ffmpeg: the bot asks VOICEVOX for 48 kHz stereo audio and
 encodes it to Opus with the bundled encoder. VOICEVOX requires a credit for the
 voices used (for example `VOICEVOX:ずんだもん`); the bot shows it in `/tts`
 replies, and each character's own terms apply.
+
+One engine serves every server, so the bot sends it one request at a time and
+servers take turns line by line; a burst of chat in one server cannot make
+lines time out in another. Lines are rendered clause by clause and start
+playing as soon as the first clause is ready (a clause more than 3 seconds late
+ends that line instead of leaving silence), and announced names are cached. When chat outruns the
+engine, a speaker's consecutive messages are read as one, and a message still
+waiting 25 seconds after it was posted is skipped. The bot also asks the engine
+to load each voice model in use (`/initialize_speaker`) when reading starts, and
+loads the voice list and the default voice once the bot is up, so nobody's
+first line waits for its model.
 
 Where a server has turned auto-join off (`/voice autojoin disable` or an
 excluded channel), `/tts start` still joins, but deafened and without buffering

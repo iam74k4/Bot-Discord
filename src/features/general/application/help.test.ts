@@ -191,6 +191,28 @@ describe('canUserSeeCommandWithContext permission matrix', () => {
       visible: false,
     },
     {
+      title: 'Administrator unlocks administrator',
+      requiredPermission: 'administrator',
+      member: memberWith(PermissionsBitField.Flags.Administrator),
+      visible: true,
+    },
+    {
+      title: 'Manage Server does not unlock administrator',
+      requiredPermission: 'administrator',
+      member: memberWith(
+        PermissionsBitField.Flags.ManageGuild,
+        PermissionsBitField.Flags.ManageRoles
+      ),
+      visible: false,
+    },
+    {
+      title: 'administrator does not count outside a guild',
+      requiredPermission: 'administrator',
+      guild: null,
+      member: memberWith(PermissionsBitField.Flags.Administrator),
+      visible: false,
+    },
+    {
       title: 'raw API permission strings are not trusted',
       requiredPermission: 'manageGuild',
       member: {

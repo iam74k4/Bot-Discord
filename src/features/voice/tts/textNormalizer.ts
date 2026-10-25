@@ -16,11 +16,21 @@ export interface DictionaryRule {
   reading: string;
 }
 
+/**
+ * A server's dictionary ready to apply: one pattern for every word, longest
+ * first, and the reading for each word's lower-case form. Build it once per
+ * dictionary change (`compileDictionary`), not once per message.
+ */
+export interface CompiledDictionary {
+  readonly pattern: RegExp | null;
+  readonly readings: ReadonlyMap<string, string>;
+}
+
 export interface SpeechContext {
   resolveUser(id: string): string | undefined;
   resolveRole(id: string): string | undefined;
   resolveChannel(id: string): string | undefined;
-  dictionary: readonly DictionaryRule[];
+  dictionary: readonly DictionaryRule[] | CompiledDictionary;
 }
 
 export interface MessageForSpeech {
@@ -48,32 +58,56 @@ function escapeRegExp(value: string): string {
 }
 
 /**
- * Apply every dictionary rule in one pass, longest word first, so a reading
- * is never itself rewritten by a later rule.
+ * Prepare a dictionary for `applyDictionary`. Words are matched longest first
+ * and case-insensitively; among case variants of one word the first rule
+ * wins. The global pattern is only ever used with `String.replace`, which
+ * resets `lastIndex`, so one instance is safe to share.
  */
-export function applyDictionary(
-  text: string,
+export function compileDictionary(
   dictionary: readonly DictionaryRule[]
-): string {
-  if (dictionary.length === 0 || text.length === 0) return text;
-
-  const byWord = new Map<string, string>();
+): CompiledDictionary {
+  const readings = new Map<string, string>();
   const words = [...dictionary]
     .filter((rule) => rule.word.length > 0)
     .sort((a, b) => b.word.length - a.word.length);
   for (const rule of words) {
     const key = rule.word.toLowerCase();
-    if (!byWord.has(key)) byWord.set(key, rule.reading);
+    if (!readings.has(key)) readings.set(key, rule.reading);
   }
-  if (byWord.size === 0) return text;
+  if (readings.size === 0) return { pattern: null, readings };
 
   const pattern = new RegExp(
-    words.map((r) => escapeRegExp(r.word)).join('|'),
+    words.map((rule) => escapeRegExp(rule.word)).join('|'),
     'gi'
   );
+  return { pattern, readings };
+}
+
+function isCompiled(
+  dictionary: readonly DictionaryRule[] | CompiledDictionary
+): dictionary is CompiledDictionary {
+  return !Array.isArray(dictionary);
+}
+
+/**
+ * Apply every dictionary rule in one pass, longest word first, so a reading
+ * is never itself rewritten by a later rule.
+ */
+export function applyDictionary(
+  text: string,
+  dictionary: readonly DictionaryRule[] | CompiledDictionary
+): string {
+  if (text.length === 0) return text;
+  if (!isCompiled(dictionary) && dictionary.length === 0) return text;
+
+  const { pattern, readings } = isCompiled(dictionary)
+    ? dictionary
+    : compileDictionary(dictionary);
+  if (!pattern) return text;
+
   return text.replace(
     pattern,
-    (match) => byWord.get(match.toLowerCase()) ?? match
+    (match) => readings.get(match.toLowerCase()) ?? match
   );
 }
 
@@ -86,11 +120,26 @@ const EMOJI_PATTERN =
  */
 type Overflow = 'ellipsis' | 'truncate';
 
+const OMITTED_SUFFIX = '、以下略';
+
 function cutOff(text: string, maxLength: number, overflow: Overflow): string {
   const chars = Array.from(text);
   if (chars.length <= maxLength) return text;
   const head = chars.slice(0, maxLength).join('');
-  return overflow === 'ellipsis' ? `${head}、以下略` : head;
+  return overflow === 'ellipsis' ? `${head}${OMITTED_SUFFIX}` : head;
+}
+
+/**
+ * Two lines from the same speaker read as one, joined with 、. Null when
+ * they do not fit in one message's length limit, so the second stays a line
+ * of its own and is read in full instead of being cut off, and when the
+ * first line was already cut short: reading on after 以下略 would make no
+ * sense.
+ */
+export function joinSpeech(first: string, second: string): string | null {
+  if (first.endsWith(OMITTED_SUFFIX)) return null;
+  const joined = `${first}、${second}`;
+  return Array.from(joined).length <= MAX_SPEECH_LENGTH ? joined : null;
 }
 
 /**

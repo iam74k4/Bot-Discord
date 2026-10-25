@@ -8,80 +8,162 @@ import {
   MessageFlags,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
+  type EmbedBuilder,
+  type Guild,
 } from 'discord.js';
 import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
-import { type Locale, t } from '../../../locales/index.js';
-import { LANGUAGE_AUTO } from '../../../locales/guildLocale.js';
+import { type Locale, t, type TranslationKey } from '../../../locales/index.js';
+import {
+  LANGUAGE_AUTO,
+  resolveBackgroundLocale,
+  resolveLocale,
+} from '../../../locales/guildLocale.js';
 import { guildSettingsRepository } from '../../../infrastructure/guildSettings/index.js';
 import {
+  auditActionLabel,
   auditRepository,
   type AuditLogRecord,
   logAuditAction,
 } from '../../../infrastructure/audit/index.js';
-import { formatAuditTarget } from '../../../infrastructure/audit/format.js';
-import { getSendableTextChannel } from '../../../shared/utils/discord.js';
-import { runComponentPanel } from '../../../shared/utils/panel.js';
+import {
+  formatAuditTarget,
+  shortenAuditDetails,
+} from '../../../infrastructure/audit/format.js';
+import { collectSettingsSummaries } from '../../../shared/settingsSummary/index.js';
+import {
+  runComponentPanel,
+  type PanelPayload,
+} from '../../../shared/utils/panel.js';
+import {
+  checkPostableChannel,
+  describeChannelProblem,
+} from './channelCheck.js';
+import {
+  ANNOUNCEMENT_CHANNEL_SETTING,
+  AUDIT_CHANNEL_SETTING,
+  saveChannelSetting,
+  type ChannelSetting,
+} from './channelSettings.js';
+import {
+  automaticPostLocale,
+  isSupportedLanguageValue,
+  languageDisplayName,
+} from './languages.js';
 
-type SettingsPanelView = 'overview' | 'language' | 'audit' | 'logs';
+type SettingsPanelView =
+  | 'overview'
+  | 'language'
+  | 'audit'
+  | 'announcements'
+  | 'logs';
 
 const PANEL_TIMEOUT = 120_000;
 const LOGS_PAGE_SIZE = 10;
+/** Discord's limit on fields per embed. */
+const MAX_EMBED_FIELDS = 25;
 
-const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
-  ja: '日本語',
-  en: 'English',
+/** The tab row: five buttons, the most one row holds. */
+const TABS: ReadonlyArray<{
+  view: SettingsPanelView;
+  label: TranslationKey;
+  emoji: string;
+}> = [
+  { view: 'overview', label: 'settings.panel.tabOverview', emoji: '🏠' },
+  { view: 'language', label: 'settings.panel.tabLanguage', emoji: '🌐' },
+  { view: 'audit', label: 'settings.panel.tabAudit', emoji: '🛡️' },
+  {
+    view: 'announcements',
+    label: 'settings.panel.tabAnnouncements',
+    emoji: '📢',
+  },
+  { view: 'logs', label: 'settings.panel.tabLogs', emoji: '📜' },
+];
+
+const TAB_BY_ID = new Map<string, SettingsPanelView>(
+  TABS.map((tab) => [`settings-panel:${tab.view}`, tab.view])
+);
+
+/** A channel setting's tab: what its select and clear button change. */
+interface ChannelTab {
+  setting: ChannelSetting;
+  selectId: string;
+  clearId: string;
+  titleKey: TranslationKey;
+  notSetKey: TranslationKey;
+  placeholderKey: TranslationKey;
+  clearKey: TranslationKey;
+  footerKey: TranslationKey;
+}
+
+const CHANNEL_TABS: Record<'audit' | 'announcements', ChannelTab> = {
+  audit: {
+    setting: AUDIT_CHANNEL_SETTING,
+    selectId: 'settings-panel:audit-channel',
+    clearId: 'settings-panel:audit-clear',
+    titleKey: 'settings.audit.name',
+    notSetKey: 'settings.audit.notSet',
+    placeholderKey: 'settings.panel.auditPlaceholder',
+    clearKey: 'settings.panel.clearAudit',
+    footerKey: 'settings.panel.auditFooter',
+  },
+  announcements: {
+    setting: ANNOUNCEMENT_CHANNEL_SETTING,
+    selectId: 'settings-panel:announcement-channel',
+    clearId: 'settings-panel:announcement-clear',
+    titleKey: 'settings.announcements.name',
+    notSetKey: 'settings.announcements.notSet',
+    placeholderKey: 'settings.panel.announcementPlaceholder',
+    clearKey: 'settings.panel.clearAnnouncements',
+    footerKey: 'settings.panel.announcementsFooter',
+  },
 };
 
-const SUPPORTED_LANGUAGES = ['ja', 'en', LANGUAGE_AUTO] as const;
+type ChannelTabView = keyof typeof CHANNEL_TABS;
+
+const CHANNEL_TAB_BY_SELECT = new Map(
+  (Object.keys(CHANNEL_TABS) as ChannelTabView[]).map(
+    (view) => [CHANNEL_TABS[view].selectId, view] as const
+  )
+);
+const CHANNEL_TAB_BY_CLEAR = new Map(
+  (Object.keys(CHANNEL_TABS) as ChannelTabView[]).map(
+    (view) => [CHANNEL_TABS[view].clearId, view] as const
+  )
+);
+
+type PanelRow = ActionRowBuilder<
+  ButtonBuilder | StringSelectMenuBuilder | ChannelSelectMenuBuilder
+>;
 
 /** Stored NULL means "follow the viewer"; the panel shows it as `auto`. */
 function currentLanguageValue(guildId: string): string {
   return guildSettingsRepository.get(guildId)?.language ?? LANGUAGE_AUTO;
 }
 
-function languageDisplayName(value: string, locale: Locale): string {
-  if (value === LANGUAGE_AUTO) return t('settings.language.auto', locale);
-  return LANGUAGE_DISPLAY_NAMES[value] ?? value;
-}
-
 function buildTabRow(
   locale: Locale,
   view: SettingsPanelView,
-  disabled: boolean = false
+  disabled: boolean
 ): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId('settings-panel:overview')
-      .setLabel(t('settings.overview', locale))
-      .setStyle(
-        view === 'overview' ? ButtonStyle.Primary : ButtonStyle.Secondary
-      )
-      .setDisabled(disabled),
-    new ButtonBuilder()
-      .setCustomId('settings-panel:language')
-      .setLabel(t('settings.language.name', locale))
-      .setStyle(
-        view === 'language' ? ButtonStyle.Primary : ButtonStyle.Secondary
-      )
-      .setDisabled(disabled),
-    new ButtonBuilder()
-      .setCustomId('settings-panel:audit')
-      .setLabel(t('settings.audit.name', locale))
-      .setStyle(view === 'audit' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-      .setDisabled(disabled),
-    new ButtonBuilder()
-      .setCustomId('settings-panel:logs')
-      .setLabel(t('settings.logs.title', locale))
-      .setStyle(view === 'logs' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-      .setDisabled(disabled)
+    TABS.map((tab) =>
+      new ButtonBuilder()
+        .setCustomId(`settings-panel:${tab.view}`)
+        .setLabel(t(tab.label, locale))
+        .setEmoji({ name: tab.emoji })
+        .setStyle(
+          view === tab.view ? ButtonStyle.Primary : ButtonStyle.Secondary
+        )
+        .setDisabled(disabled)
+    )
   );
 }
 
 function buildLanguageRow(
   locale: Locale,
   currentLanguage: string,
-  disabled: boolean = false
+  disabled: boolean
 ): ActionRowBuilder<StringSelectMenuBuilder> {
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
     new StringSelectMenuBuilder()
@@ -105,44 +187,49 @@ function buildLanguageRow(
   );
 }
 
-function buildAuditSelectRow(
+function buildChannelRows(
+  tab: ChannelTab,
+  guild: Guild,
   locale: Locale,
-  disabled: boolean = false
-): ActionRowBuilder<ChannelSelectMenuBuilder> {
-  return new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
-    new ChannelSelectMenuBuilder()
-      .setCustomId('settings-panel:audit-channel')
-      .setPlaceholder(t('settings.panel.auditPlaceholder', locale))
-      .setChannelTypes(ChannelType.GuildText)
-      .setMinValues(1)
-      .setMaxValues(1)
-      .setDisabled(disabled)
-  );
-}
+  current: string | null,
+  disabled: boolean
+): PanelRow[] {
+  const select = new ChannelSelectMenuBuilder()
+    .setCustomId(tab.selectId)
+    .setPlaceholder(t(tab.placeholderKey, locale))
+    .setChannelTypes(ChannelType.GuildText)
+    .setMinValues(1)
+    .setMaxValues(1)
+    .setDisabled(disabled);
+  // Preselect only a channel that still exists: a default pointing at a
+  // deleted channel could make Discord reject the whole panel, on the very
+  // tab an admin opens to pick a new channel or clear the old one.
+  if (current && guild.channels.cache.has(current)) {
+    select.setDefaultChannels(current);
+  }
 
-function buildAuditActionsRow(
-  locale: Locale,
-  hasAuditChannel: boolean,
-  disabled: boolean = false
-): ActionRowBuilder<ButtonBuilder> {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId('settings-panel:audit-clear')
-      .setLabel(t('settings.panel.clearAudit', locale))
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(disabled || !hasAuditChannel)
-  );
+  return [
+    new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(select),
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(tab.clearId)
+        .setLabel(t(tab.clearKey, locale))
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(disabled || !current)
+    ),
+  ];
 }
 
 function buildLogsPaginationRow(
+  locale: Locale,
   page: number,
   totalPages: number,
-  disabled: boolean = false
+  disabled: boolean
 ): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId('settings-panel:logs-prev')
-      .setLabel('<')
+      .setLabel(t('settings.panel.prevPage', locale))
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(disabled || page === 0),
     new ButtonBuilder()
@@ -152,24 +239,27 @@ function buildLogsPaginationRow(
       .setDisabled(true),
     new ButtonBuilder()
       .setCustomId('settings-panel:logs-next')
-      .setLabel('>')
+      .setLabel(t('settings.panel.nextPage', locale))
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(disabled || page >= totalPages - 1)
   );
 }
 
-function buildOverviewEmbed(guildId: string, locale: Locale) {
-  const guildSettings = guildSettingsRepository.get(guildId);
-  const languageDisplay = languageDisplayName(
-    guildSettings?.language ?? LANGUAGE_AUTO,
-    locale
-  );
-  const auditChannel = guildSettings?.audit_channel_id
-    ? `<#${guildSettings.audit_channel_id}>`
-    : t('settings.audit.notSet', locale);
-  const announcementChannel = guildSettings?.announcement_channel_id
-    ? `<#${guildSettings.announcement_channel_id}>`
-    : t('settings.announcements.notSet', locale);
+/**
+ * The whole setup on one screen: this panel's own settings, then whatever
+ * other features registered (notification channels, VC auto-join), each
+ * pointing at the command that changes it.
+ */
+async function buildOverviewEmbed(
+  guild: Guild,
+  locale: Locale
+): Promise<EmbedBuilder> {
+  const guildSettings = guildSettingsRepository.get(guild.id);
+  const others = await collectSettingsSummaries({
+    guildId: guild.id,
+    guild,
+    locale,
+  });
 
   return createEmbed({
     title: t('settings.title', locale),
@@ -177,27 +267,35 @@ function buildOverviewEmbed(guildId: string, locale: Locale) {
     fields: [
       {
         name: t('settings.language.name', locale),
-        value: languageDisplay,
+        value: languageDisplayName(
+          guildSettings?.language ?? LANGUAGE_AUTO,
+          locale
+        ),
         inline: true,
       },
       {
         name: t('settings.audit.name', locale),
-        value: auditChannel,
+        value: guildSettings?.audit_channel_id
+          ? `<#${guildSettings.audit_channel_id}>`
+          : t('settings.audit.notSet', locale),
         inline: true,
       },
       {
         name: t('settings.announcements.name', locale),
-        value: announcementChannel,
+        value: guildSettings?.announcement_channel_id
+          ? `<#${guildSettings.announcement_channel_id}>`
+          : t('settings.announcements.notSet', locale),
         inline: true,
       },
-    ],
+      ...others,
+    ].slice(0, MAX_EMBED_FIELDS),
     footer: t('settings.panel.overviewFooter', locale),
   });
 }
 
-function buildLanguageEmbed(guildId: string, locale: Locale) {
+function buildLanguageEmbed(guild: Guild, locale: Locale): EmbedBuilder {
   const languageDisplay = languageDisplayName(
-    currentLanguageValue(guildId),
+    currentLanguageValue(guild.id),
     locale
   );
 
@@ -205,124 +303,112 @@ function buildLanguageEmbed(guildId: string, locale: Locale) {
     title: t('settings.language.name', locale),
     description:
       `${t('settings.language.current', locale)}: **${languageDisplay}**` +
-      `\n\n${t('settings.language.autoHint', locale)}`,
+      `\n\n${t('settings.language.autoHint', locale, {
+        lang: languageDisplayName(automaticPostLocale(guild), locale),
+      })}`,
     color: COLORS.INFO,
     footer: t('settings.panel.languageFooter', locale),
   });
 }
 
-function buildAuditEmbed(guildId: string, locale: Locale) {
-  const auditChannel = guildSettingsRepository.get(guildId)?.audit_channel_id;
-
+function buildChannelEmbed(
+  tab: ChannelTab,
+  current: string | null,
+  locale: Locale
+): EmbedBuilder {
   return createEmbed({
-    title: t('settings.audit.name', locale),
-    description: auditChannel
-      ? `<#${auditChannel}>`
-      : t('settings.audit.notSet', locale),
+    title: t(tab.titleKey, locale),
+    description: current ? `<#${current}>` : t(tab.notSetKey, locale),
     color: COLORS.INFO,
-    footer: t('settings.panel.auditFooter', locale),
+    footer: t(tab.footerKey, locale),
   });
 }
 
-function formatLog(log: AuditLogRecord): string {
+/**
+ * One entry: when, who, what, to whom; then the stored details, which name
+ * the role, channel or language involved.
+ */
+function formatLog(log: AuditLogRecord, locale: Locale): string {
   const timestamp = Math.floor(log.created_at / 1000);
-  const action = log.action.replace('_', ' ');
   const targetDisplay = formatAuditTarget(log.action, log.target_id);
   const target = targetDisplay ? ` → ${targetDisplay}` : '';
-  return `<t:${timestamp}:R> <@${log.user_id}> **${action}**${target}`;
+  const line = `<t:${timestamp}:R> <@${log.user_id}> **${auditActionLabel(
+    log.action,
+    locale
+  )}**${target}`;
+  return log.details ? `${line}\n└ ${shortenAuditDetails(log.details)}` : line;
 }
 
-function buildLogsEmbed(
+interface LogsView {
+  embed: EmbedBuilder;
+  /** The page shown, clamped to the pages that exist. */
+  page: number;
+  totalPages: number;
+  total: number;
+}
+
+/**
+ * One page of the audit log, read with a count and a single page query, so
+ * every entry kept is reachable and each render reads only what it shows.
+ */
+function buildLogsView(
   guildId: string,
   locale: Locale,
   page: number
-): {
-  embed: ReturnType<typeof createEmbed>;
-  totalPages: number;
-  totalLogs: number;
-} {
-  const logs = auditRepository.getLogs(guildId, 50);
-  const totalCount = auditRepository.getLogsCount(guildId);
+): LogsView {
+  const total = auditRepository.getLogsCount(guildId);
 
-  if (logs.length === 0) {
+  if (total === 0) {
     return {
       embed: createEmbed({
         title: t('settings.logs.title', locale),
         description: t('settings.logs.noLogs', locale),
         color: COLORS.INFO,
       }),
+      page: 0,
       totalPages: 1,
-      totalLogs: 0,
+      total: 0,
     };
   }
 
-  const totalPages = Math.max(1, Math.ceil(logs.length / LOGS_PAGE_SIZE));
-  const safePage = Math.min(page, totalPages - 1);
-  const pageLogs = logs.slice(
-    safePage * LOGS_PAGE_SIZE,
-    (safePage + 1) * LOGS_PAGE_SIZE
+  const totalPages = Math.ceil(total / LOGS_PAGE_SIZE);
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const logs = auditRepository.getLogs(
+    guildId,
+    LOGS_PAGE_SIZE,
+    safePage * LOGS_PAGE_SIZE
   );
+  const from = safePage * LOGS_PAGE_SIZE + 1;
 
   return {
     embed: createEmbed({
       title: t('settings.logs.title', locale),
-      description: pageLogs.map(formatLog).join('\n'),
+      description: logs.map((log) => formatLog(log, locale)).join('\n'),
       color: COLORS.INFO,
-      footer: `${t('settings.logs.showing', locale, {
-        count: logs.length,
-        total: totalCount,
-      })} | ${safePage + 1}/${totalPages}`,
+      footer: t('settings.logs.showingRange', locale, {
+        from,
+        to: from + Math.max(0, logs.length - 1),
+        total,
+      }),
     }),
+    page: safePage,
     totalPages,
-    totalLogs: logs.length,
+    total,
   };
-}
-
-function buildComponents(
-  guildId: string,
-  locale: Locale,
-  view: SettingsPanelView,
-  logsPage: number,
-  disabled: boolean = false
-) {
-  const rows: ActionRowBuilder<
-    ButtonBuilder | StringSelectMenuBuilder | ChannelSelectMenuBuilder
-  >[] = [buildTabRow(locale, view, disabled)];
-
-  if (view === 'language') {
-    rows.push(
-      buildLanguageRow(locale, currentLanguageValue(guildId), disabled)
-    );
-  }
-
-  if (view === 'audit') {
-    const hasAuditChannel =
-      !!guildSettingsRepository.get(guildId)?.audit_channel_id;
-    rows.push(buildAuditSelectRow(locale, disabled));
-    rows.push(buildAuditActionsRow(locale, hasAuditChannel, disabled));
-  }
-
-  if (view === 'logs') {
-    const { totalPages, totalLogs } = buildLogsEmbed(guildId, locale, logsPage);
-    if (totalLogs > 0) {
-      rows.push(buildLogsPaginationRow(logsPage, totalPages, disabled));
-    }
-  }
-
-  return rows;
 }
 
 export async function showSettingsPanel(
   interaction: ChatInputCommandInteraction,
-  locale: Locale,
+  initialLocale: Locale,
   initialView: SettingsPanelView = 'overview'
 ): Promise<void> {
-  if (!interaction.guild || !interaction.guildId) {
+  const guild = interaction.guild;
+  if (!guild || !interaction.guildId) {
     await interaction.reply({
       embeds: [
         createErrorEmbed(
-          t('common.error', locale),
-          t('common.guildOnly', locale)
+          t('common.error', initialLocale),
+          t('common.guildOnly', initialLocale)
         ),
       ],
       flags: MessageFlags.Ephemeral,
@@ -330,180 +416,169 @@ export async function showSettingsPanel(
     return;
   }
 
+  // Re-resolved after a language change, so the whole panel switches at once.
+  let locale = initialLocale;
   let currentView = initialView;
   let logsPage = 0;
+  /** The logs page last rendered; the expired panel reuses its pager. */
+  let lastLogs: Pick<LogsView, 'total' | 'totalPages'> | null = null;
 
-  const render = () => {
-    if (currentView === 'overview') {
-      return {
-        embed: buildOverviewEmbed(interaction.guildId!, locale),
-        components: buildComponents(
-          interaction.guildId!,
-          locale,
-          currentView,
-          logsPage
-        ),
-      };
-    }
+  const components = (
+    disabled: boolean,
+    logs: Pick<LogsView, 'total' | 'totalPages'> | null
+  ): PanelRow[] => {
+    const rows: PanelRow[] = [buildTabRow(locale, currentView, disabled)];
 
     if (currentView === 'language') {
-      return {
-        embed: buildLanguageEmbed(interaction.guildId!, locale),
-        components: buildComponents(
-          interaction.guildId!,
+      rows.push(
+        buildLanguageRow(locale, currentLanguageValue(guild.id), disabled)
+      );
+    } else if (currentView === 'audit' || currentView === 'announcements') {
+      const tab = CHANNEL_TABS[currentView];
+      rows.push(
+        ...buildChannelRows(
+          tab,
+          guild,
           locale,
-          currentView,
-          logsPage
-        ),
-      };
+          tab.setting.read(guild.id),
+          disabled
+        )
+      );
+    } else if (currentView === 'logs' && logs && logs.total > 0) {
+      rows.push(
+        buildLogsPaginationRow(locale, logsPage, logs.totalPages, disabled)
+      );
     }
 
-    if (currentView === 'audit') {
-      return {
-        embed: buildAuditEmbed(interaction.guildId!, locale),
-        components: buildComponents(
-          interaction.guildId!,
-          locale,
-          currentView,
-          logsPage
-        ),
-      };
+    return rows;
+  };
+
+  const render = async (): Promise<PanelPayload> => {
+    switch (currentView) {
+      case 'overview':
+        return {
+          embeds: [await buildOverviewEmbed(guild, locale)],
+          components: components(false, null),
+        };
+      case 'language':
+        return {
+          embeds: [buildLanguageEmbed(guild, locale)],
+          components: components(false, null),
+        };
+      case 'audit':
+      case 'announcements': {
+        const tab = CHANNEL_TABS[currentView];
+        return {
+          embeds: [buildChannelEmbed(tab, tab.setting.read(guild.id), locale)],
+          components: components(false, null),
+        };
+      }
+      case 'logs': {
+        const logs = buildLogsView(guild.id, locale, logsPage);
+        logsPage = logs.page;
+        lastLogs = logs;
+        return { embeds: [logs.embed], components: components(false, logs) };
+      }
     }
-
-    const logsState = buildLogsEmbed(interaction.guildId!, locale, logsPage);
-    const totalPages = Math.max(1, logsState.totalPages);
-    logsPage = Math.min(logsPage, totalPages - 1);
-
-    return {
-      embed: buildLogsEmbed(interaction.guildId!, locale, logsPage).embed,
-      components: buildComponents(
-        interaction.guildId!,
-        locale,
-        currentView,
-        logsPage
-      ),
-    };
   };
 
   await runComponentPanel({
     interaction,
-    locale,
+    // The language tab can switch the panel's language while it is open.
+    locale: () => locale,
     label: 'settings panel',
     timeout: PANEL_TIMEOUT,
-    render: () => {
-      const state = render();
-      return { embeds: [state.embed], components: state.components };
-    },
-    renderDisabled: () =>
-      buildComponents(
-        interaction.guildId!,
-        locale,
-        currentView,
-        logsPage,
-        true
-      ),
+    render,
+    renderDisabled: () => components(true, lastLogs),
     onComponent: async (componentInteraction) => {
+      const id = componentInteraction.customId;
+
       if (componentInteraction.isButton()) {
-        if (
-          componentInteraction.customId === 'settings-panel:overview' ||
-          componentInteraction.customId === 'settings-panel:language' ||
-          componentInteraction.customId === 'settings-panel:audit' ||
-          componentInteraction.customId === 'settings-panel:logs'
-        ) {
-          currentView = componentInteraction.customId.replace(
-            'settings-panel:',
-            ''
-          ) as SettingsPanelView;
-          if (currentView !== 'logs') {
-            logsPage = 0;
-          }
+        const tab = TAB_BY_ID.get(id);
+        if (tab) {
+          currentView = tab;
+          if (currentView !== 'logs') logsPage = 0;
         }
 
-        if (
-          currentView === 'logs' &&
-          componentInteraction.customId === 'settings-panel:logs-prev'
-        ) {
+        if (currentView === 'logs' && id === 'settings-panel:logs-prev') {
           logsPage = Math.max(0, logsPage - 1);
         }
-
-        if (
-          currentView === 'logs' &&
-          componentInteraction.customId === 'settings-panel:logs-next'
-        ) {
+        if (currentView === 'logs' && id === 'settings-panel:logs-next') {
           logsPage++;
         }
 
-        if (componentInteraction.customId === 'settings-panel:audit-clear') {
-          guildSettingsRepository.setAuditChannel(interaction.guildId!, null);
-          await logAuditAction(
-            interaction.client,
-            interaction.guildId!,
-            interaction.user.id,
-            'AUDIT_SETUP',
-            undefined,
-            'Audit channel disabled from settings panel'
-          );
-          currentView = 'audit';
+        const cleared = CHANNEL_TAB_BY_CLEAR.get(id);
+        if (cleared) {
+          saveChannelSetting(CHANNEL_TABS[cleared].setting, {
+            client: interaction.client,
+            guild,
+            userId: componentInteraction.user.id,
+            channelId: null,
+          });
+          currentView = cleared;
         }
       }
 
-      if (componentInteraction.isStringSelectMenu()) {
+      if (
+        componentInteraction.isStringSelectMenu() &&
+        id === 'settings-panel:language-select'
+      ) {
         const value = componentInteraction.values[0];
-        if (
-          componentInteraction.customId === 'settings-panel:language-select' &&
-          value &&
-          SUPPORTED_LANGUAGES.includes(
-            value as (typeof SUPPORTED_LANGUAGES)[number]
-          )
-        ) {
+        if (isSupportedLanguageValue(value)) {
           guildSettingsRepository.setLanguage(
-            interaction.guildId!,
+            guild.id,
             value === LANGUAGE_AUTO ? null : value
           );
-          await logAuditAction(
-            componentInteraction.client,
-            componentInteraction.guildId!,
+          const auditLocale = resolveBackgroundLocale(guild);
+          // Not awaited: posting to the audit channel can be slow or rate
+          // limited, and the click must be answered within 3 seconds. The
+          // row itself is written before this call returns.
+          void logAuditAction(
+            interaction.client,
+            guild.id,
             componentInteraction.user.id,
             'SETTINGS_CHANGE',
             undefined,
-            `Language changed to: ${value}`
+            t('audit.details.language', auditLocale, {
+              language: languageDisplayName(value, auditLocale),
+            })
           );
+          locale = resolveLocale(componentInteraction);
           currentView = 'language';
         }
       }
 
       if (componentInteraction.isChannelSelectMenu()) {
+        const view = CHANNEL_TAB_BY_SELECT.get(id);
         const channelId = componentInteraction.values[0];
-        const channel = await getSendableTextChannel(
-          interaction.guild!,
-          channelId
-        );
-        if (!channel) {
-          await componentInteraction.reply({
-            embeds: [
-              createErrorEmbed(
-                t('common.error', locale),
-                t('notification.errors.channelNotSendable', locale)
-              ),
-            ],
-            flags: MessageFlags.Ephemeral,
-          });
-          return 'handled';
-        }
+        if (view && channelId) {
+          const check = await checkPostableChannel(guild, channelId);
+          if (!check.ok) {
+            // Re-render first, so the select goes back to the stored channel
+            // instead of showing the rejected one as if it had been saved;
+            // then say why it was refused.
+            currentView = view;
+            await componentInteraction.update(await render());
+            await componentInteraction.followUp({
+              embeds: [
+                createErrorEmbed(
+                  t('common.error', locale),
+                  describeChannelProblem(check, locale)
+                ),
+              ],
+              flags: MessageFlags.Ephemeral,
+            });
+            return 'handled';
+          }
 
-        guildSettingsRepository.setAuditChannel(
-          interaction.guildId!,
-          channelId
-        );
-        await logAuditAction(
-          interaction.client,
-          interaction.guildId!,
-          interaction.user.id,
-          'AUDIT_SETUP',
-          channelId,
-          `Audit channel set to: #${channel.name}`
-        );
-        currentView = 'audit';
+          saveChannelSetting(CHANNEL_TABS[view].setting, {
+            client: interaction.client,
+            guild,
+            userId: componentInteraction.user.id,
+            channelId,
+          });
+          currentView = view;
+        }
       }
 
       return 'update';

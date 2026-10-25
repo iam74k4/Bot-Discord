@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { collectAnswers, MAX_ANSWER_LENGTH } from '../poll/application.js';
+import {
+  collectAnswers,
+  MAX_ANSWER_LENGTH,
+  parseAnswerLines,
+} from '../poll/application.js';
 
 /**
  * Discord rejects a malformed poll with an opaque API error, so the answers
@@ -68,5 +72,68 @@ describe('collectAnswers', () => {
     expect(collectAnswers(options(['Ramen', exact]))).toEqual({
       answers: [{ text: 'Ramen' }, { text: exact }],
     });
+  });
+});
+
+describe('parseAnswerLines', () => {
+  it('reads one answer per line, trimmed, in order', () => {
+    expect(parseAnswerLines('  Ramen\nCurry  \nSushi')).toEqual({
+      answers: [{ text: 'Ramen' }, { text: 'Curry' }, { text: 'Sushi' }],
+    });
+  });
+
+  it('accepts Windows line breaks', () => {
+    expect(parseAnswerLines('Ramen\r\nCurry\r\n')).toEqual({
+      answers: [{ text: 'Ramen' }, { text: 'Curry' }],
+    });
+  });
+
+  it('drops blank lines and repeated answers', () => {
+    expect(parseAnswerLines('Ramen\n\n   \nCurry\nRamen\n')).toEqual({
+      answers: [{ text: 'Ramen' }, { text: 'Curry' }],
+    });
+  });
+
+  it('names the line of an over-long answer, counting blank lines', () => {
+    const tooLong = 'x'.repeat(MAX_ANSWER_LENGTH + 1);
+
+    expect(parseAnswerLines(`Ramen\n\n${tooLong}\nCurry`)).toEqual({
+      error: 'lineTooLong',
+      line: 3,
+      length: MAX_ANSWER_LENGTH + 1,
+    });
+  });
+
+  it('measures an answer after trimming it', () => {
+    const exact = 'x'.repeat(MAX_ANSWER_LENGTH);
+
+    expect(parseAnswerLines(`  ${exact}  \nRamen`)).toEqual({
+      answers: [{ text: exact }, { text: 'Ramen' }],
+    });
+  });
+
+  it('accepts exactly ten answers and refuses eleven, saying how many', () => {
+    const lines = (n: number) =>
+      Array.from({ length: n }, (_, i) => `Choice ${i + 1}`).join('\n');
+
+    expect(parseAnswerLines(lines(10))).toHaveProperty('answers');
+    expect(parseAnswerLines(lines(11))).toEqual({
+      error: 'tooMany',
+      count: 11,
+    });
+  });
+
+  it('counts only distinct answers towards the limit', () => {
+    const text = [...Array(10).keys(), 0, 1].map((i) => `c${i}`).join('\n');
+
+    expect(parseAnswerLines(text)).toHaveProperty('answers');
+  });
+
+  it.each([
+    ['nothing', ''],
+    ['one answer', 'Ramen'],
+    ['one answer twice', 'Ramen\nRamen'],
+  ])('refuses %s as too few', (_, text) => {
+    expect(parseAnswerLines(text)).toEqual({ error: 'notEnough' });
   });
 });

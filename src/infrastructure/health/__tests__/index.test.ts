@@ -106,8 +106,31 @@ describe('health service', () => {
         database: { connected: true, tables: 5 },
         discord: { connected: true, ping: 50 },
         services: {},
+        eventLoop: null,
         timestamp: NOW,
       });
+    });
+
+    it('includes event-loop figures once the monitor runs', async () => {
+      const { metrics } = await import('../../metrics/index.js');
+      metrics.startEventLoopMonitor();
+      try {
+        const eventLoop = health.getHealthStatus(createMockClient()).eventLoop;
+
+        expect(eventLoop).toEqual({
+          p50Ms: expect.any(Number),
+          p99Ms: expect.any(Number),
+          maxMs: expect.any(Number),
+          utilization: expect.any(Number),
+          windowSeconds: expect.any(Number),
+        });
+        // Event-loop health is reported, never a reason to degrade.
+        expect(health.getHealthStatus(createMockClient()).status).toBe(
+          'healthy'
+        );
+      } finally {
+        metrics.stopEventLoopMonitor();
+      }
     });
 
     it('rounds memory figures to whole megabytes and percent', () => {
@@ -137,6 +160,37 @@ describe('health service', () => {
       services: {},
       timestamp: 1234567890000,
     };
+
+    it('shows the event loop with millisecond units when it is monitored', () => {
+      const lines = health
+        .formatHealthStatus({
+          ...baseHealth,
+          eventLoop: {
+            p50Ms: 1.5,
+            p99Ms: 42,
+            maxMs: 180,
+            utilization: 0.123,
+            windowSeconds: 600,
+          },
+        })
+        .split('\n');
+
+      const start = lines.indexOf('**Event loop**');
+      expect(start).toBeGreaterThan(lines.indexOf('**Database**'));
+      expect(lines.slice(start, start + 4)).toEqual([
+        '**Event loop**',
+        '├ Delay p50 / p99: 1.5 / 42 ms',
+        '├ Max delay: 180 ms',
+        '└ Utilization: 12%',
+      ]);
+    });
+
+    it('leaves the event loop out when it is not monitored', () => {
+      expect(health.formatHealthStatus(baseHealth)).not.toContain('Event loop');
+      expect(
+        health.formatHealthStatus({ ...baseHealth, eventLoop: null })
+      ).not.toContain('Event loop');
+    });
 
     it('returns formatted string with expected sections', () => {
       const formatted = health.formatHealthStatus(baseHealth);
