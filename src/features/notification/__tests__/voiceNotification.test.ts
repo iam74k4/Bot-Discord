@@ -45,6 +45,12 @@ vi.mock('../../../locales/index.js', () => ({
   t: (key: string) => key,
 }));
 
+// The real resolver reads guild_settings, which would open the on-disk test
+// database. These tests are about session order and batching, not language.
+vi.mock('../../../locales/guildLocale.js', () => ({
+  resolveGuildLocale: (_guildId: unknown, fallback: string) => fallback,
+}));
+
 function createVoiceState(overrides: {
   channelId?: string | null;
   channelName?: string;
