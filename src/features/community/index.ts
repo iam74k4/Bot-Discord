@@ -23,7 +23,10 @@ function prunePollPointers(): void {
 export function start(): void {
   if (cleanupInterval) return;
   prunePollPointers();
-  cleanupInterval = startDailyCleanup(prunePollPointers);
+  cleanupInterval = startDailyCleanup(
+    prunePollPointers,
+    'Poll pointer pruning'
+  );
   logger.info('Community feature started');
 }
 
