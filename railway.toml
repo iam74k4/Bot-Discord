@@ -1,9 +1,14 @@
 [build]
-builder = "nixpacks"
+# Build from the Dockerfile: it pins the exact Node release CI tests against.
+# (Nixpacks is deprecated on Railway, and Railpack resolves "engines" to
+# whatever 22.x it finds at build time.)
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-# Run node directly: `npm start` keeps SIGTERM from reaching the bot, so the
-# graceful shutdown (final backup, closing VC sessions) never ran.
+# With a Dockerfile, Railway runs this in exec form, so node itself receives
+# SIGTERM and the graceful shutdown (final backup, closing VC sessions) runs.
+# `npm start` or a shell wrapper would swallow the signal.
 startCommand = "node dist/index.js"
 # Time between SIGTERM and SIGKILL on redeploy. Must exceed
 # SHUTDOWN_TIMEOUT_MS (default 10s) so the shutdown can finish.
@@ -14,4 +19,3 @@ restartPolicyMaxRetries = 10
 # Volume: mount path = /app/data
 # Create a volume in the Railway dashboard and set mount path to /app/data.
 # This persists data/ (database, recordings, buffers, backups) across deploys.
-
