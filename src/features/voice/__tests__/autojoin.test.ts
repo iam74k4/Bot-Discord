@@ -5,7 +5,7 @@ import {
   type EmbedBuilder,
   MessageFlags,
 } from 'discord.js';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * `/voice autojoin` is the server's consent switch for the bot keeping
@@ -63,6 +63,7 @@ vi.mock('../../../config/index.js', async (importOriginal) => {
 });
 
 const { executeAutoJoinCommand } = await import('../application/autojoin.js');
+const { captionSessions } = await import('../captions/sessionManager.js');
 const { voiceSettingsRepository } =
   await import('../repositories/voiceSettingsRepository.js');
 const { guildSettingsRepository } =
@@ -97,9 +98,16 @@ function connectionOf(channelId: string) {
 function connectionInfo(
   channelId: string,
   guildId: string,
-  receiving?: boolean
+  receiving?: boolean,
+  buffering?: boolean
 ) {
-  return { channelId, guildId, receiving, connection: connectionOf(channelId) };
+  return {
+    channelId,
+    guildId,
+    receiving,
+    buffering,
+    connection: connectionOf(channelId),
+  };
 }
 
 /** A voice channel's own text chat, as the guild cache returns it. */
@@ -595,6 +603,66 @@ describe('/voice autojoin', () => {
       expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([]);
       expect(interaction.reply).not.toHaveBeenCalled();
       expect(disconnect).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('caption joins', () => {
+    function startCaptions(channelId: string) {
+      captionSessions.start({
+        guildId: GUILD,
+        voiceChannelId: channelId,
+        startedBy: 'someone',
+        post: async () => {},
+        nameOf: () => 'someone',
+      });
+    }
+
+    afterEach(() => {
+      captionSessions.stopAll();
+    });
+
+    it.each(['disable', 'exclude'])(
+      '%s leaves a join that only listens for captions connected: it keeps no audio',
+      async (subcommand) => {
+        const info = connectionInfo('voice-a', GUILD, true, false);
+        getAllConnections.mockReturnValue(new Map([['voice-a', info]]));
+        getConnection.mockReturnValue(info);
+        startCaptions('voice-a');
+        const chat = voiceChat();
+        const interaction = createInteraction({
+          subcommand,
+          channel: voiceChannel('voice-a'),
+          channels: { 'voice-a': chat },
+        });
+
+        await executeAutoJoinCommand(interaction);
+
+        expect(disconnect).not.toHaveBeenCalled();
+        expect(chat.send).not.toHaveBeenCalled();
+      }
+    );
+
+    it('disable drops a buffering connection being captioned, and tells the channel how to resume', async () => {
+      getAllConnections.mockReturnValue(
+        new Map([['voice-a', connectionInfo('voice-a', GUILD, true)]])
+      );
+      startCaptions('voice-a');
+      const chat = voiceChat();
+      const interaction = createInteraction({
+        subcommand: 'disable',
+        channels: { 'voice-a': chat },
+      });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
+      await vi.waitFor(() => expect(chat.send).toHaveBeenCalledTimes(1));
+      const notice = chat.send.mock.calls[0][0].embeds[0].toJSON();
+      expect(notice.title).toBe(t('captions.stopped', 'en'));
+      expect(notice.description).toBe(t('captions.stoppedByOptOut', 'en'));
     });
   });
 

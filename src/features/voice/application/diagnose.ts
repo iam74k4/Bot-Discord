@@ -8,6 +8,7 @@ import { env } from '../../../config/index.js';
 import { t, type Locale } from '../../../locales/index.js';
 import { commandMention } from '../../../shared/utils/commandMentions.js';
 import { connectionManager } from '../recording/connectionManager.js';
+import { keepsAudio } from '../recording/audioMode.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 
 /**
@@ -17,7 +18,8 @@ import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository
  * - `excluded`: this channel is on the exclusion list.
  * - `busyElsewhere`: the bot is in another voice channel of the same server
  *   (Discord allows one voice connection per server).
- * - `readOnly`: the bot is here only to read chat aloud and keeps nothing.
+ * - `readOnly`: the bot is here only to read chat aloud or caption, and
+ *   keeps nothing.
  * - `atLimit`: the bot is in as many channels as it may be, across servers.
  * - `noPermission`: the bot cannot see or connect to the channel.
  * - `notYetJoined`: nothing stops it; the bot simply has not joined yet
@@ -36,7 +38,7 @@ export type BufferingGap =
 /** True when the bot holds a connection here that buffers audio. */
 export function isBuffering(channelId: string): boolean {
   const connection = connectionManager.getConnection(channelId);
-  return connection !== undefined && connection.receiving !== false;
+  return connection !== undefined && keepsAudio(connection);
 }
 
 /**
@@ -62,7 +64,7 @@ export function diagnoseBufferingGap(
     return { reason: 'busyElsewhere', otherChannelId: connectedChannelId };
   }
   if (connectedChannelId === channel.id) {
-    // Connected here but not receiving: a text-to-speech-only join.
+    // Connected here but keeping nothing: a join for reading or captions.
     return { reason: 'readOnly' };
   }
 

@@ -13,6 +13,7 @@ import { t, type Locale } from '../../../locales/index.js';
 import { resolveLocale } from '../../../locales/guildLocale.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 import { connectionManager } from '../recording/connectionManager.js';
+import { keepsAudio } from '../recording/audioMode.js';
 import type { ReconcileOutcome } from './reconcile.js';
 import { auditVoiceSettingChange } from './settingsAudit.js';
 import {
@@ -34,15 +35,17 @@ export function describeReconcile(
       });
     case 'none':
       return t('record.autojoin.waitingForMembers', locale);
-    case 'already':
-      // A reading-only connection holds the guild's one voice slot without
-      // keeping anything; "turned on" alone would suggest otherwise.
-      return connectionManager.getConnection(outcome.channelId)?.receiving ===
-        false
+    case 'already': {
+      // A connection for reading or captions holds the guild's one voice
+      // slot without keeping anything; "turned on" alone would suggest
+      // otherwise.
+      const connection = connectionManager.getConnection(outcome.channelId);
+      return connection && !keepsAudio(connection)
         ? t('record.autojoin.alreadyReadOnly', locale, {
             channel: outcome.channelId,
           })
         : null;
+    }
     default:
       return null;
   }

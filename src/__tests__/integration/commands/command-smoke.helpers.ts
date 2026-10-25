@@ -257,6 +257,22 @@ export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
       'admin role': 'manageRoles',
     },
   },
+  caption: {
+    defaultMemberPermissions: null,
+    contexts: [InteractionContextType.Guild],
+    cooldownMs: 2_000,
+    autocomplete: [],
+    // Starting captions transcribes nobody by itself: only members who
+    // consented are captioned, so no permission gates it. Stopping needs the
+    // caller in the captioned channel or Manage Server, enforced (and
+    // unit-tested) in the application; the smoke scenario puts the caller on
+    // the allowed side. Consent is each member's own.
+    access: {
+      'caption start': 'everyone',
+      'caption stop': 'everyone',
+      'caption consent': 'everyone',
+    },
+  },
   community: {
     defaultMemberPermissions: null,
     contexts: [InteractionContextType.Guild],

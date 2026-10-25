@@ -48,6 +48,7 @@ import {
   type VoicevoxVoice,
 } from '../tts/voicevoxClient.js';
 import { announceBuffering } from './announce.js';
+import { resumeAutoJoin } from './listening.js';
 
 /**
  * `/tts` - read chat aloud in a voice channel with VOICEVOX.
@@ -161,10 +162,6 @@ function choiceName(text: string): string {
   const code = text.charCodeAt(CHOICE_NAME_MAX - 1);
   const isHighSurrogate = code >= 0xd800 && code <= 0xdbff;
   return text.slice(0, CHOICE_NAME_MAX - (isHighSurrogate ? 1 : 0));
-}
-
-function humanMembers(channel: VoiceBasedChannel) {
-  return channel.members.filter((member) => !member.user.bot);
 }
 
 /**
@@ -557,30 +554,6 @@ async function handleStop(
       }),
     ],
   });
-}
-
-/**
- * Turn a deafened reading connection into the listening one auto-join would
- * have made, if auto-join now covers the channel and people are in it.
- * In place: the bot does not leave, and members are told it is listening.
- */
-async function resumeAutoJoin(
-  guild: Guild,
-  voiceChannelId: string
-): Promise<boolean> {
-  const channel = guild.channels.cache.get(voiceChannelId);
-  if (
-    !channel?.isVoiceBased() ||
-    !voiceSettingsRepository.mayAutoJoin(guild.id, voiceChannelId) ||
-    humanMembers(channel).size === 0 ||
-    !connectionManager.enableReceive(voiceChannelId)
-  ) {
-    return false;
-  }
-  // Not awaited: a slow or rate-limited post must not hold up the reply past
-  // Discord's 3 s window. announceBuffering catches its own errors.
-  void announceBuffering(channel);
-  return true;
 }
 
 async function handleSkip(

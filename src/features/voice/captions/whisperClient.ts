@@ -1,3 +1,5 @@
+import { env } from '../../../config/index.js';
+
 /**
  * HTTP client for a self-hosted Whisper engine through the OpenAI-compatible
  * transcription endpoint (`POST /v1/audio/transcriptions`, multipart).
@@ -130,4 +132,25 @@ export class WhisperClient {
       : [];
     return { text: body.text, segments };
   }
+}
+
+let client: WhisperClient | null = null;
+let clientKey = '';
+
+/**
+ * The engine client, or null when captions are not configured. Built on
+ * first use so importing this module never reads configuration.
+ */
+export function getWhisperClient(): WhisperClient | null {
+  const url = env.WHISPER_URL;
+  if (!url) return null;
+  const key = [url, env.WHISPER_MODEL, env.WHISPER_LANGUAGE].join('\n');
+  if (!client || clientKey !== key) {
+    client = new WhisperClient(url, {
+      model: env.WHISPER_MODEL,
+      language: env.WHISPER_LANGUAGE,
+    });
+    clientKey = key;
+  }
+  return client;
 }

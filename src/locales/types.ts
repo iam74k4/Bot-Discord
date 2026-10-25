@@ -810,6 +810,56 @@ export interface TranslationKeys {
       invalid: string;
     };
   };
+  captions: {
+    errors: {
+      notConfigured: string;
+      notConfiguredDesc: string;
+      engineDown: string;
+      engineDownDesc: string;
+      /** {command}: mention of /caption start. */
+      notInVoice: string;
+      notInVoiceDesc: string;
+      busyElsewhere: string;
+      /** {channel}: the voice channel the bot is in. */
+      busyElsewhereDesc: string;
+      cannotJoin: string;
+      cannotJoinDesc: string;
+      notRunning: string;
+      notRunningDesc: string;
+      notInSameVoice: string;
+      /** {channel}: captioned channel; {permission}: localized name. */
+      notInSameVoiceDesc: string;
+    };
+    started: string;
+    /** {voice}: the captioned channel. */
+    startedDesc: string;
+    /** {consented} of {members} people in the channel. */
+    consentCount: string;
+    noPostPermission: string;
+    howToTitle: string;
+    /** {stopCommand}: mention of /caption stop. */
+    howTo: string;
+    stopped: string;
+    stoppedDesc: string;
+    stoppedByOptOut: string;
+    engineTrouble: string;
+    engineTroubleDesc: string;
+    /** Caption line name for someone no longer in the member cache. */
+    unknownSpeaker: string;
+    consent: {
+      title: string;
+      /** {command}: mention of /caption consent. */
+      explain: string;
+      statusAllowed: string;
+      statusNotAllowed: string;
+      allowButton: string;
+      revokeButton: string;
+      allowedTitle: string;
+      allowed: string;
+      revokedTitle: string;
+      revoked: string;
+    };
+  };
 }
 
 /**

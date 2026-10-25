@@ -571,7 +571,7 @@ export const en: TranslationKeys = {
         'Auto-join is still off for the whole server, though. Turn it on with {command}.',
       notExcluded: '<#{channel}> was not on the exclusion list.',
       alreadyReadOnly:
-        'The bot is in <#{channel}> only to read chat aloud, so no audio is kept yet. Once reading ends and the bot leaves, keeping starts the next time someone joins a voice channel.',
+        'The bot is in <#{channel}> only to read chat aloud or caption, so no audio is kept yet. Once that ends and the bot leaves, keeping starts the next time someone joins a voice channel.',
       statusEnabled: 'On',
       statusDisabled: 'Off',
       exclusions: 'Excluded channels',
@@ -610,7 +610,7 @@ export const en: TranslationKeys = {
       busyElsewhere:
         'The bot is keeping audio in <#{other}> on this server (it can be in one voice channel per server). Run this there, or wait until that channel empties.',
       readOnly:
-        'The bot is in <#{channel}> only to read chat aloud, so it keeps no audio. Once reading ends and the bot leaves, auto-join starts keeping audio the next time someone joins a voice channel.',
+        'The bot is in <#{channel}> only to read chat aloud or caption, so it keeps no audio. Once that ends and the bot leaves, auto-join starts keeping audio the next time someone joins a voice channel.',
       atLimit:
         'The bot is in as many voice channels as it may be ({max}), so it could not join this one. Try again in a while.',
       noPermission:
@@ -817,6 +817,63 @@ export const en: TranslationKeys = {
       invalidTitle: 'Check what you entered',
       invalid:
         'Words must be 1–{wordMax} characters and readings 1–{readingMax} characters.',
+    },
+  },
+  captions: {
+    errors: {
+      notConfigured: 'Captions are not set up',
+      notConfiguredDesc:
+        'This bot has no speech recognition engine (Whisper) configured. Ask the bot operator to set `WHISPER_URL`.',
+      engineDown: 'Cannot reach the speech recognition engine',
+      engineDownDesc:
+        'Whisper is not responding. Try again in a moment, and tell the bot operator if it keeps happening.',
+      notInVoice: 'Join a voice channel first',
+      notInVoiceDesc:
+        'Join the voice channel you want captioned, then run {command}.',
+      busyElsewhere: 'The bot is in another voice channel',
+      busyElsewhereDesc:
+        'The bot is in <#{channel}> (Discord allows a bot one voice channel per server). Use captions there, or wait until the bot leaves.',
+      cannotJoin: 'Could not join the voice channel',
+      cannotJoinDesc:
+        'Check that the bot has Connect in that channel and has not reached its connection limit.',
+      notRunning: 'Captions are not running',
+      notRunningDesc: 'Start them with {command}.',
+      notInSameVoice: 'You cannot do that',
+      notInSameVoiceDesc:
+        'Only people in the captioned voice channel (<#{channel}>) or members with {permission} can do this.',
+    },
+    started: 'Captions started',
+    startedDesc: 'What people say in <#{voice}> is shown as text in its chat.',
+    consentCount:
+      '{consented} of the {members} people in the channel have allowed captions.',
+    noPostPermission:
+      '⚠️ The bot lacks View Channel or Send Messages in <#{voice}>, so captions cannot be shown.',
+    howToTitle: 'How it works',
+    howTo:
+      '• Captions appear a few seconds after someone speaks\n• {stopCommand} ends them\n• They end on their own when the channel empties',
+    stopped: 'Captions stopped',
+    stoppedDesc: 'Run {command} to start them again.',
+    stoppedByOptOut:
+      'An admin stopped keeping audio, so the bot left. Run `/caption start` to caption again without keeping audio.',
+    engineTrouble: 'Captions are delayed',
+    engineTroubleDesc:
+      'The speech recognition engine is not responding, so no captions are being made. They resume on their own when it is back; tell the bot operator if this lasts.',
+    unknownSpeaker: 'Someone',
+    consent: {
+      title: 'Allowing captions',
+      explain:
+        'Only the voices of people who allowed captions are captioned. Once you allow it, while captions run your voice is sent to a speech recognition server the bot operator runs, and the text is posted in the voice channel chat. The audio itself is not kept. It applies to this server only, and you can withdraw it any time with {command} or the buttons.',
+      statusAllowed: '✅ You allow captions of your voice in this server.',
+      statusNotAllowed:
+        'Your voice is not captioned in this server (you have not allowed it).',
+      allowButton: 'Allow captions',
+      revokeButton: 'Withdraw',
+      allowedTitle: 'Captions allowed',
+      allowed:
+        'Whenever captions run in this server, what you say is shown as text in the voice channel chat. Use {command} to withdraw.',
+      revokedTitle: 'Captions withdrawn',
+      revoked:
+        'Your voice is no longer captioned in this server, and anything not yet shown was discarded. Use {command} to allow it again.',
     },
   },
 };

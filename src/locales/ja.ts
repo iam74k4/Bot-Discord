@@ -580,7 +580,7 @@ export const ja: TranslationKeys = {
         'ただし、今はサーバー全体で自動参加がオフです。{command} でオンにしてください。',
       notExcluded: '<#{channel}> は対象外に設定されていません。',
       alreadyReadOnly:
-        'Botは今 <#{channel}> に読み上げのためだけに参加しているため、まだ音声を保持していません。読み上げが終わってBotが退出したあと、誰かがVCに入ると保持が始まります。',
+        'Botは今 <#{channel}> に読み上げか字幕のためだけに参加しているため、まだ音声を保持していません。読み上げや字幕が終わってBotが退出したあと、誰かがVCに入ると保持が始まります。',
       statusEnabled: 'オン',
       statusDisabled: 'オフ',
       exclusions: '対象外のVC',
@@ -620,7 +620,7 @@ export const ja: TranslationKeys = {
       busyElsewhere:
         'Botは同じサーバーの <#{other}> で音声を保持しています（Botが同時に入れるVCは1サーバーにつき1つです）。そのVCで実行するか、そのVCが空くまでお待ちください。',
       readOnly:
-        'Botは <#{channel}> に読み上げのためだけに参加しているため、音声を保持していません。読み上げが終わってBotが退出したあと、誰かがVCに入ると自動参加で保持が始まります。',
+        'Botは <#{channel}> に読み上げか字幕のためだけに参加しているため、音声を保持していません。読み上げや字幕が終わってBotが退出したあと、誰かがVCに入ると自動参加で保持が始まります。',
       atLimit:
         'Botの同時接続数が上限（{max}）に達しているため、このVCには参加できていません。しばらくしてからもう一度お試しください。',
       noPermission:
@@ -826,6 +826,65 @@ export const ja: TranslationKeys = {
       invalidTitle: '入力内容を確認してください',
       invalid:
         '単語は1〜{wordMax}文字、読み方は1〜{readingMax}文字で入力してください。',
+    },
+  },
+  captions: {
+    errors: {
+      notConfigured: '字幕は設定されていません',
+      notConfiguredDesc:
+        'このBotには音声認識エンジン（Whisper）が設定されていません。Bot運営者に `WHISPER_URL` の設定を依頼してください。',
+      engineDown: '音声認識エンジンに接続できません',
+      engineDownDesc:
+        'Whisperが応答していません。少し待ってからもう一度お試しください。続く場合はBot運営者に連絡してください。',
+      notInVoice: 'VCに参加してください',
+      notInVoiceDesc:
+        '字幕を付けたいVCに先に参加してから、{command} を実行してください。',
+      busyElsewhere: 'Botは別のVCにいます',
+      busyElsewhereDesc:
+        'Botは今 <#{channel}> に参加しています（Discordの仕様で、1つのサーバーで同時に入れるVCは1つだけです）。そのVCで使うか、Botが抜けるまでお待ちください。',
+      cannotJoin: 'VCに参加できませんでした',
+      cannotJoinDesc:
+        'Botにそのチャンネルの「接続」権限があるか、同時接続数の上限に達していないか確認してください。',
+      notRunning: '字幕は動いていません',
+      notRunningDesc: '{command} で字幕を始められます。',
+      notInSameVoice: '操作できません',
+      notInSameVoiceDesc:
+        '字幕を表示しているVC（<#{channel}>）に参加している人か、{permission}の権限を持つ人だけが操作できます。',
+    },
+    started: '字幕を開始しました',
+    startedDesc:
+      '<#{voice}> での発言を文字にして、このVCのチャットに表示します。',
+    consentCount:
+      'VCにいる{members}人のうち、字幕を許可しているのは{consented}人です。',
+    noPostPermission:
+      '⚠️ Botに <#{voice}> の「チャンネルを見る」「メッセージを送信」権限がないため、字幕を表示できません。',
+    howToTitle: '使い方',
+    howTo:
+      '・字幕は話してから数秒遅れて表示されます\n・{stopCommand} で終了します\n・VCに誰もいなくなると自動で終了します',
+    stopped: '字幕を終了しました',
+    stoppedDesc: 'また使うときは {command} を実行してください。',
+    stoppedByOptOut:
+      '管理者が音声の保持を止めたため、Botは退出しました。`/caption start` を実行すると、音声を保持せずに字幕を再開できます。',
+    engineTrouble: '字幕が遅れています',
+    engineTroubleDesc:
+      '音声認識エンジンが応答しないため、字幕を作れていません。エンジンが戻ると自動で再開します。続く場合はBot運営者に連絡してください。',
+    unknownSpeaker: '参加者',
+    consent: {
+      title: '字幕の許可',
+      explain:
+        '字幕になるのは、許可した人の声だけです。許可すると、字幕の実行中にあなたの声がBot運営者の用意した音声認識サーバーに送られ、文字にしてVCのチャットに投稿されます。音声そのものは保存しません。許可はこのサーバーだけに適用され、{command} かボタンでいつでも取り消せます。',
+      statusAllowed:
+        '✅ このサーバーでは、あなたの声を字幕にすることを許可しています。',
+      statusNotAllowed:
+        'このサーバーでは、あなたの声は字幕になりません（許可していません）。',
+      allowButton: '字幕を許可する',
+      revokeButton: '許可を取り消す',
+      allowedTitle: '字幕を許可しました',
+      allowed:
+        'このサーバーで字幕が動いているときは、あなたの声も文字になってVCのチャットに表示されます。取り消すには {command} を使ってください。',
+      revokedTitle: '字幕の許可を取り消しました',
+      revoked:
+        'このサーバーでは、あなたの声は字幕になりません。まだ表示されていない分も破棄しました。また許可するには {command} を使ってください。',
     },
   },
 };

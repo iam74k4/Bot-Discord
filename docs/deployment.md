@@ -56,6 +56,9 @@ In Railway dashboard, add the following variables:
 | `RECORDINGS_DIR`                | Generated recording files directory (must stay relative to repo root)                     | No                |
 | `BACKUP_DIR`                    | Backup output directory (must stay relative to repo root)                                 | No                |
 | `VOICEVOX_URL`                  | VOICEVOX engine URL; enables `/tts` and the Message Content intent (see below)            | No                |
+| `WHISPER_URL`                   | Whisper engine URL (OpenAI-compatible API); enables `/caption` (see below)                | No                |
+| `WHISPER_MODEL`                 | Model id sent with each request, for engines that serve several (speaches)                | No                |
+| `WHISPER_LANGUAGE`              | Language spoken in voice channels (default: `ja`; `auto` lets Whisper detect it)          | No                |
 | `FORCE_COMMAND_SYNC`            | `true` re-uploads the slash commands at startup even when they look unchanged (see below) | No                |
 | `NODE_COMPILE_CACHE`            | Node's compile cache directory, e.g. `/app/data/.node-compile-cache` (see below)          | No                |
 
@@ -180,6 +183,62 @@ With `VOICEVOX_URL` set the bot receives every guild message, but it keeps no
 message cache (discord.js would otherwise hold the last 200 per channel).
 Members who post are still cached, as other events would cache them, so
 reading adds little memory beyond the sizing above.
+
+### Captions (optional)
+
+`/caption` transcribes what consenting members say with a self-hosted
+[Whisper](https://github.com/openai/whisper) engine and posts it in the voice
+channel's chat. The bot speaks the OpenAI-compatible transcription API
+(`POST /v1/audio/transcriptions`), so any engine that serves it works; audio
+goes only to the engine you run.
+
+1. In the same Railway project, add a speech recognition service. With
+   [speaches](https://github.com/speaches-ai/speaches) (faster-whisper), use
+   the image `ghcr.io/speaches-ai/speaches:latest-cpu`, which listens on port
+   `8000`, and give it a volume at `/home/ubuntu/.cache/huggingface/hub` so
+   models survive redeploys. Railway also lists ready-made speaches templates.
+   speaches does not download a model on first use: download it once with
+   `curl -X POST http://<engine>:8000/v1/models/<model-id>` from the engine's
+   shell (or list it in its `PRELOAD_MODELS` setting). A small model such as
+   `Systran/faster-whisper-small` keeps up with conversation on a couple of
+   vCPUs; larger ones are more accurate and slower. whisper.cpp's server works
+   too when started with `--inference-path /v1/audio/transcriptions`.
+2. Set `WHISPER_URL` on the bot to the engine's private address, for example
+   `http://speaches.railway.internal:8000`, and `WHISPER_MODEL` to the model
+   you downloaded (speaches needs it; whisper.cpp ignores it). As with
+   VOICEVOX, Railway environments created before October 16, 2025 have an
+   IPv6-only private network: if `/caption start` answers that it cannot reach
+   the engine, check that the engine listens on `::` as well as the domain.
+3. Set `WHISPER_LANGUAGE` if conversations are not in Japanese (`en`, …), or
+   `auto` to let Whisper detect the language of each utterance. A wrong
+   language makes Whisper translate instead of transcribe, so the bot refuses
+   to start with a value that is not a language code.
+4. Give the bot **View Channel** and **Send Messages** in voice channels where
+   captions will be used: captions are posted in the voice channel's own chat.
+
+No intent is added: captions use the voice connection the bot already has.
+
+How the bot uses the engine:
+
+- Each speaker's audio is cut into utterances where they pause (Discord stops
+  sending audio during silence), or every 15 seconds in a long monologue.
+  Utterances shorter than 0.4 s or near-silent are not sent. The rest are
+  resampled to 16 kHz mono WAV, a third of the bytes.
+- One request at a time, servers taking turns, through the same scheduler that
+  keeps the shared VOICEVOX engine fair. A server keeps at most six utterances
+  waiting (the oldest goes first), and one that waited 20 seconds is dropped:
+  late captions help nobody.
+- Whisper turns silence and noise into confident phantom lines learned from
+  subtitled video. Segments the engine itself rates as probably not speech,
+  bracketed annotations such as `(音楽)`, and known phantom lines are dropped.
+- After three failed requests in a row the channel is told once that captions
+  are delayed; they resume on their own when the engine answers again.
+
+Consent is stored per server and member in `caption_consent`
+([database.md](database.md)); a member who never consented, or withdrew, has no
+row. Where a server has turned auto-join off, `/caption start` joins listening
+but keeps no audio for `/voice record`, and turning auto-join off or excluding
+the channel later leaves such a join alone.
 
 ### 4. Choose how production deploys run
 
