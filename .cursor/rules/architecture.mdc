@@ -14,15 +14,13 @@ Architecture, coding standards, and CI expectations for this repository.
 Feature-based layout with auto-discovery. Each feature lives under `src/features/`.
 
 - **`src/features/`** — Feature modules (auto-discovered at startup)
-  - `steam/` — Steam integration (profile, games, playtime, notifications)
-  - `voice/` — Voice recording (mix ring + `/record`)
-  - `poll/` — Poll system
+  - `voice/` — The voice connection, recording (mix ring + `/voice record`), auto-join, text-to-speech (`/tts`)
   - `admin/` — Admin commands (`/admin`, `/owner`)
   - `general/` — General commands (ping, help)
-  - `github/` — GitHub integration
-  - `notification/` — Join/voice notifications
-  - `community/` — Community commands (roulette)
-- **`src/events/`** — Core event handlers (e.g. ready, interactionCreate)
+  - `notification/` — Join/voice notifications, VC stats
+  - `community/` — Community commands (native polls, roulette)
+- **`src/app/`** — Composition root, process handlers, interaction router, `ALLOWED_GUILD_IDS` check
+- **`src/events/`** — Core event handlers (ready, guildCreate, interactionCreate)
 - **`src/handlers/`** — Auto-loaders for commands and events
 - **`src/middleware/`** — Pre-execution checks (cooldown, permissions)
 - **`src/infrastructure/`** — Shared runtime infrastructure only

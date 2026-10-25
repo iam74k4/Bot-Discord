@@ -355,12 +355,14 @@ Feature-based architecture: each feature lives under `src/features/` and exports
 - `src/infrastructure/` contains shared runtime infrastructure such as database bootstrap, backup, health, and metrics.
 - `src/shared/` contains cross-feature utilities, shared types, and the shared help catalog.
 - `src/app-scripts/` contains TypeScript maintenance scripts, while root `scripts/` contains repo workflow shell scripts.
+- Dependency direction (features never import each other; lower layers never import features) is enforced by `src/__tests__/architecture.test.ts`.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full structure and lifecycle rules.
+See [`docs/architecture.md`](docs/architecture.md) for diagrams, the full directory tree and lifecycle rules.
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md): project structure and lifecycle
+- [`docs/architecture.md`](docs/architecture.md): system, runtime and dependency diagrams, directory structure, lifecycle
+- [`docs/operations.md`](docs/operations.md): staging (`develop`) and production (`main`) environments, releases, hotfixes, rollbacks
 - [`docs/development.md`](docs/development.md): command development, middleware, and local workflow scripts
 - [`docs/database.md`](docs/database.md): SQLite tables and persistence notes
 - [`docs/deployment.md`](docs/deployment.md): Railway deployment and CI/CD flow

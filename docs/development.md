@@ -193,7 +193,11 @@ const withParams = t('settings.language.changed', locale, {
 
 ## Develop Branch Cleanup (force-push workflow)
 
-When cleaning noisy history on `develop`, use a safe force-push sequence:
+Avoid this. `develop` deploys the staging bot and is the base of every open
+branch, and feature pull requests are squash merged, so its history stays
+clean without rewriting. Never rewrite `main`. If a rewrite of `develop` is
+truly needed, lift its force-push protection for the duration and use a safe
+sequence:
 
 1. Create a safety tag before rewriting:
    - `git tag -a backup/develop-before-cleanup -m "backup before cleanup"`
