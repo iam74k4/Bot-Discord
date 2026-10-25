@@ -290,6 +290,25 @@ export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
       'owner backup': 'owner',
     },
   },
+  tts: {
+    defaultMemberPermissions: null,
+    contexts: [InteractionContextType.Guild],
+    cooldownMs: 2_000,
+    autocomplete: ['tts voice speaker', 'tts dict remove word'],
+    // Reading is for people who cannot or would rather not speak, so no
+    // permission gates it. Narrower rules depend on state rather than on a
+    // permission, and are enforced (and unit-tested) in the application:
+    // stop/skip need the caller in the voice channel being read or Manage
+    // Server, and removing a dictionary word needs its author or Manage
+    // Server. The smoke scenarios put the caller on the allowed side.
+    access: {
+      'tts start': 'everyone',
+      'tts stop': 'everyone',
+      'tts skip': 'everyone',
+      'tts voice': 'everyone',
+      'tts dict': 'everyone',
+    },
+  },
   voice: {
     defaultMemberPermissions: null,
     contexts: null,
@@ -1130,6 +1149,10 @@ export function invokeCommand(
     commandGuildId: null,
     user: world.actor.user,
     member: inGuild ? world.actor : null,
+    // What Discord sends as the member's permissions in this channel.
+    memberPermissions: inGuild ? world.actor.permissions : null,
+    // And the bot's: it can see and post in the text channel.
+    appPermissions: new PermissionsBitField(TEXT_CHANNEL_PERMISSIONS),
     guild: inGuild ? world.guild : null,
     guildId: inGuild ? world.guild.id : null,
     channel,

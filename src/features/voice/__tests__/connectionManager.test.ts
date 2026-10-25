@@ -55,6 +55,7 @@ vi.mock('../recording/channelMixRing.js', () => ({
   channelMixRingManager: {
     getOrCreate: vi.fn(() => mockRing),
     remove: vi.fn(),
+    has: vi.fn(() => false),
   },
 }));
 
@@ -256,6 +257,7 @@ describe('VoiceConnectionManager', () => {
         guildId: 'guild-1',
         connectedAt: NOW,
         lastActivity: NOW,
+        receiving: true,
       });
       expect(manager.getConnectionCount()).toBe(1);
     });

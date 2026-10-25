@@ -12,8 +12,13 @@
 - `feature/<name>` or `feat/<name>` — new features
 - `fix/<name>` or `bugfix/<name>` — bug fixes
 - `docs/<name>` — documentation changes
+- `hotfix/<name>` — urgent production fixes, branched from `main`
 
-Branch from `main`, merge back to `main` when ready.
+Branch from `develop` and open the pull request against `develop` (squash
+merge). `develop` deploys to the staging bot; releases reach `main` - and
+production - through a `develop` → `main` pull request merged with a merge
+commit. Hotfixes branch from `main` and are merged back into `develop`
+afterwards. See [docs/operations.md](docs/operations.md).
 
 ## Commit Messages
 

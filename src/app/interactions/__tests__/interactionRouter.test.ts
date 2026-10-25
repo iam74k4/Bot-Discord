@@ -60,6 +60,18 @@ vi.mock('../../../shared/utils/logger.js', () => ({
 const resolveLocale = vi.hoisted(() => vi.fn());
 vi.mock('../../../locales/guildLocale.js', () => ({ resolveLocale }));
 
+// The real allowlist check, against a list each test sets (empty: every
+// server, which is production and every other test here).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../guildAllowlist.js')>();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+
 vi.mock('../../../middleware/index.js', async (importOriginal) => {
   const actual =
     await importOriginal<typeof import('../../../middleware/index.js')>();
@@ -103,6 +115,7 @@ function chatInput(
     permissions?: bigint[];
     reply?: Mock;
     editReply?: Mock;
+    guildId?: string | null;
   } = {}
 ): ChatInputStub {
   const reply = options.reply ?? vi.fn().mockResolvedValue(undefined);
@@ -115,7 +128,7 @@ function chatInput(
       commandType: ApplicationCommandType.ChatInput,
       commandName: options.commandName ?? 'ping',
       user: { id: USER_ID, tag: 'tester#0001' },
-      guildId: 'guild-1',
+      guildId: options.guildId === undefined ? 'guild-1' : options.guildId,
       guild: { id: 'guild-1' },
       member: { permissions: new PermissionsBitField(options.permissions) },
       locale: 'en-US',
@@ -188,6 +201,7 @@ function responsesSent(stub: ChatInputStub): number {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  allowlist.ids = [];
   resolveLocale.mockReturnValue('en');
   metrics.reset();
   cooldownStore.clearAll();
@@ -757,5 +771,71 @@ describe('routeInteraction: other interaction types', () => {
     for (const name of Object.keys(responders())) {
       expect(interaction[name]).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('routeInteraction: ALLOWED_GUILD_IDS', () => {
+  it('refuses a slash command from a server outside the list', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const ping = command();
+    const stub = chatInput();
+    resolveLocale.mockReturnValue('ja');
+
+    await routeInteraction(clientWith(ping), stub.interaction);
+
+    expect(ping.execute).not.toHaveBeenCalled();
+    expect(runMiddleware).not.toHaveBeenCalled();
+    expect(stub.reply).toHaveBeenCalledWith({
+      content: t('common.guildNotAllowed', 'ja'),
+      flags: MessageFlags.Ephemeral,
+    });
+    expect(metrics.getSnapshot().commands.executed).toBe(0);
+  });
+
+  it('runs commands in a listed server', async () => {
+    allowlist.ids = ['guild-1'];
+    const ping = command();
+    const stub = chatInput();
+
+    await routeInteraction(clientWith(ping), stub.interaction);
+
+    expect(ping.execute).toHaveBeenCalledTimes(1);
+    expect(responsesSent(stub)).toBe(0);
+  });
+
+  it('still serves direct messages when the list is set', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const ping = command();
+    const stub = chatInput({ guildId: null });
+
+    await routeInteraction(clientWith(ping), stub.interaction);
+
+    expect(ping.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers autocomplete outside the list with no choices', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const handler = vi.fn();
+    const search = command({ name: 'search', autocomplete: handler });
+    const { interaction, respond } = autocomplete('search');
+
+    await routeInteraction(clientWith(search), interaction);
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith([]);
+  });
+
+  it('settles even when the refusal cannot be delivered', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const stub = chatInput({
+      reply: vi.fn().mockRejectedValue(new Error('Unknown interaction')),
+    });
+
+    await expect(
+      routeInteraction(clientWith(command()), stub.interaction)
+    ).resolves.toBeUndefined();
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Failed to refuse a disallowed server: Unknown interaction'
+    );
   });
 });
