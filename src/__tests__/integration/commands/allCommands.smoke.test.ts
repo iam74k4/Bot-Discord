@@ -64,6 +64,8 @@ const voice = vi.hoisted(() => {
       connectedAt: number;
       /** False for a join made only to read aloud (nothing is buffered). */
       receiving?: boolean;
+      /** Stands in for the VoiceConnection; compared by identity. */
+      connection: object;
     }
   >();
   // Enough of an @discordjs/voice AudioPlayer for playback to start and be
@@ -101,19 +103,21 @@ const voice = vi.hoisted(() => {
           channel: { id: string },
           options: { receive?: boolean } = {}
         ) => {
-          const connection = {
+          const info = {
             channelId: channel.id,
             guildId: guild.id,
             connectedAt: Date.now(),
             receiving: options.receive !== false,
+            connection: {},
           };
-          connections.set(channel.id, connection);
-          return connection;
+          connections.set(channel.id, info);
+          return info.connection;
         }
       ),
       // The connection once ready, or null, like the real one.
       waitUntilReady: vi.fn(
-        async (channelId: string) => connections.get(channelId) ?? null
+        async (channelId: string) =>
+          connections.get(channelId)?.connection ?? null
       ),
       enableReceive: vi.fn((channelId: string) => {
         const connection = connections.get(channelId);
@@ -125,8 +129,10 @@ const voice = vi.hoisted(() => {
         connections.has(channelId) ? player : undefined
       ),
       setSelfMute: vi.fn((channelId: string) => connections.has(channelId)),
-      disconnect: vi.fn(async (channelId: string, expected?: unknown) => {
-        if (expected && connections.get(channelId) !== expected) return;
+      disconnect: vi.fn(async (channelId: string, expected?: object) => {
+        if (expected && connections.get(channelId)?.connection !== expected) {
+          return;
+        }
         connections.delete(channelId);
       }),
     },
@@ -394,6 +400,7 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
       guildId: world.guild.id,
       connectedAt: Date.now(),
       receiving: false,
+      connection: {},
     });
     startReading(world);
   },
@@ -453,6 +460,7 @@ beforeEach(() => {
     channelId: world.voiceChannel.id,
     guildId: world.guild.id,
     connectedAt: Date.now(),
+    connection: {},
   });
 });
 
@@ -1297,7 +1305,11 @@ const REACHES: Array<{
     label: 'voice autojoin disable',
     reached: (w) => {
       expect(voiceSettingsRepository.isAutoJoinEnabled(w.guild.id)).toBe(false);
-      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(
+        w.voiceChannel.id,
+        expect.any(Object)
+      );
+      expect(voice.connections.has(w.voiceChannel.id)).toBe(false);
     },
   },
   {
@@ -1306,7 +1318,11 @@ const REACHES: Array<{
       expect(voiceSettingsRepository.listExclusions(w.guild.id)).toEqual([
         w.voiceChannel.id,
       ]);
-      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(
+        w.voiceChannel.id,
+        expect.any(Object)
+      );
+      expect(voice.connections.has(w.voiceChannel.id)).toBe(false);
       expect(voiceSettingsRepository.isAutoJoinEnabled(w.guild.id)).toBe(true);
     },
   },

@@ -520,10 +520,13 @@ export class VoiceConnectionManager {
     const info = this.connections.get(channelId);
     if (!info) return false;
     const { connection } = info;
+    // Deafened exactly when not receiving: joinConfig can be rewritten by a
+    // late voice-state update from before enableReceive(), which would
+    // deafen a listening connection again.
     const apply = () =>
       connection.rejoin({
         channelId,
-        selfDeaf: change.selfDeaf ?? connection.joinConfig.selfDeaf,
+        selfDeaf: change.selfDeaf ?? info.receiving === false,
         selfMute: change.selfMute ?? connection.joinConfig.selfMute,
       });
 

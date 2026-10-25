@@ -8,7 +8,7 @@ import { env } from '../../../config/index.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
-import { mapDiscordLocale, t } from '../../../locales/index.js';
+import { mapDiscordLocale, t, type Locale } from '../../../locales/index.js';
 import {
   resolveGuildLocale,
   resolveLocale,
@@ -21,8 +21,8 @@ import { ttsSessions } from '../tts/sessionManager.js';
 /**
  * Stop the buffering in one channel. A deafened text-to-speech join keeps no
  * audio, so it is left alone and goes on reading. A listening connection is
- * dropped - the opt-out wins over reading through it - and if it was being
- * read through, the people there are told why and how to resume.
+ * dropped at once - the opt-out wins over reading through it - and if it was
+ * being read through, the people there are told why and how to resume.
  * True when that ended a reading session.
  */
 async function stopBuffering(
@@ -31,12 +31,28 @@ async function stopBuffering(
   info: VoiceConnectionInfo
 ): Promise<boolean> {
   if (info.receiving === false) return false;
+  // Checked first: the disconnect ends the session.
   const wasReading = ttsSessions.get(channelId) !== undefined;
+  // Only this connection: one that replaced it meanwhile (say, a deafened
+  // /tts start join) is not ours to remove.
+  await connectionManager.disconnect(channelId, info.connection);
   if (wasReading) {
-    await noticeReadingStopped(guild, channelId);
+    // Not awaited: a slow or rate-limited post must neither keep the bot
+    // buffering nor hold up the reply past Discord's 3 s window. It catches
+    // its own errors.
+    void noticeReadingStopped(guild, channelId);
   }
-  await connectionManager.disconnect(channelId);
   return wasReading;
+}
+
+/**
+ * The opt-outs stop auto-join, not reading - but only mention reading where
+ * the bot can read at all.
+ */
+function withTtsNote(description: string, locale: Locale): string {
+  return env.VOICEVOX_URL
+    ? `${description} ${t('record.autojoin.ttsStillReads', locale)}`
+    : description;
 }
 
 /** Best effort: a missing permission must not keep the bot buffering. */
@@ -113,7 +129,7 @@ export async function executeAutoJoinCommand(
 
     const description = enable
       ? t('record.autojoin.enabled', locale, { minutes })
-      : t('record.autojoin.disabled', locale);
+      : withTtsNote(t('record.autojoin.disabled', locale), locale);
     await interaction.reply({
       embeds: [
         createEmbed({
@@ -154,9 +170,10 @@ export async function executeAutoJoinCommand(
       info !== undefined &&
       (await stopBuffering(interaction.guild, channel.id, info));
 
-    const description = t('record.autojoin.excluded', locale, {
-      channel: channel.id,
-    });
+    const description = withTtsNote(
+      t('record.autojoin.excluded', locale, { channel: channel.id }),
+      locale
+    );
     await interaction.reply({
       embeds: [
         createEmbed({

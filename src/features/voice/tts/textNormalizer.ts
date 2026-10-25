@@ -48,8 +48,32 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * Fold compatibility forms (NFKC) so text reads and matches the same however
+ * it was typed: fullwidth ＡＢＣ and ｗ become ABC and w, halfwidth ｶﾀｶﾅ becomes
+ * カタカナ, ① becomes 1. Pictographs are left alone - NFKC would turn some
+ * emoji (™, ℹ, Ⓜ, ㊗) into letters to read out, and emoji are dropped instead.
+ */
+export function foldForSpeech(text: string): string {
+  return text.replace(SPEECH_PATTERNS.compatibilityRun, (run) =>
+    run.normalize('NFKC')
+  );
+}
+
+/**
+ * The one key a dictionary word is stored, looked up and matched by: folded
+ * like chat text, then lower-cased. SQLite's NOCASE folds only ASCII, so
+ * "ＡＬＩＣＥ" and "ａｌｉｃｅ" (or "CAFÉ" and "café") used to be two entries,
+ * and a second member could add a variant of someone else's word.
+ */
+export function dictionaryKey(word: string): string {
+  return foldForSpeech(word).toLowerCase();
+}
+
+/**
  * Apply every dictionary rule in one pass, longest word first, so a reading
- * is never itself rewritten by a later rule.
+ * is never itself rewritten by a later rule. Words match by dictionaryKey, so
+ * `text` should already be folded with foldForSpeech (normalizeForSpeech
+ * does that).
  */
 export function applyDictionary(
   text: string,
@@ -57,23 +81,23 @@ export function applyDictionary(
 ): string {
   if (dictionary.length === 0 || text.length === 0) return text;
 
-  const byWord = new Map<string, string>();
-  const words = [...dictionary]
-    .filter((rule) => rule.word.length > 0)
-    .sort((a, b) => b.word.length - a.word.length);
-  for (const rule of words) {
-    const key = rule.word.toLowerCase();
-    if (!byWord.has(key)) byWord.set(key, rule.reading);
+  const byKey = new Map<string, string>();
+  const rules = dictionary
+    .map((rule) => ({ key: dictionaryKey(rule.word), reading: rule.reading }))
+    .filter((rule) => rule.key.length > 0)
+    .sort((a, b) => b.key.length - a.key.length);
+  for (const rule of rules) {
+    if (!byKey.has(rule.key)) byKey.set(rule.key, rule.reading);
   }
-  if (byWord.size === 0) return text;
+  if (byKey.size === 0) return text;
 
   const pattern = new RegExp(
-    words.map((r) => escapeRegExp(r.word)).join('|'),
+    [...byKey.keys()].map(escapeRegExp).join('|'),
     'gi'
   );
   return text.replace(
     pattern,
-    (match) => byWord.get(match.toLowerCase()) ?? match
+    (match) => byKey.get(match.toLowerCase()) ?? match
   );
 }
 
@@ -89,6 +113,8 @@ export function applyDictionary(
  * them all against inputs where a quadratic pattern takes seconds).
  */
 export const SPEECH_PATTERNS = {
+  /** What foldForSpeech normalizes: any run without a pictograph. */
+  compatibilityRun: /[^\p{Extended_Pictographic}]+/gu,
   /** A fenced block; every ``` either closes one or is the last, so one scan. */
   codeBlock: /```[\s\S]*?```/g,
   /** Same shape as code blocks. */
@@ -141,10 +167,11 @@ export const SPEECH_PATTERNS = {
 } as const;
 
 /**
- * Text longer than this (in UTF-16 units) is cut before the rules run and
- * again before the dictionary. Discord caps a message at 4,000 characters, so
- * real chat never reaches it; it bounds the work for arbitrary input and how
- * far the dictionary can expand it.
+ * Text longer than this (in UTF-16 units) is cut before the rules run, again
+ * before the dictionary, and once more after it (see capExpanded). Discord
+ * caps a message at 4,000 characters, so real chat never reaches the first
+ * cut; together they bound the work for any input, however far mentions and
+ * the dictionary expand it.
  */
 export const MAX_INPUT_LENGTH = 8_000;
 
@@ -180,6 +207,21 @@ function capInput(text: string): string {
   return text.slice(0, MAX_INPUT_LENGTH - (isHighSurrogate ? 1 : 0));
 }
 
+/**
+ * Cap the dictionary's output: each match can become a 100-unit reading, so
+ * 8,000 units could grow to 800,000. A cut inside a w/ｗ run would show the
+ * laughter rule a fake end of text (turning "wwwb" into laughter), so the
+ * whole run is kept, plus the code point after it; one run is a single cheap
+ * match whatever its length.
+ */
+function capExpanded(text: string): string {
+  if (text.length <= MAX_INPUT_LENGTH) return text;
+  let end = capInput(text).length;
+  while (end < text.length && (text[end] === 'w' || text[end] === 'ｗ')) end++;
+  if (end < text.length) end += text.codePointAt(end)! > 0xffff ? 2 : 1;
+  return text.slice(0, end);
+}
+
 const SEPARATORS = new Set([' ', '、']);
 
 /** Trim spaces and 、 from both ends with a plain scan (no `[...]+$`). */
@@ -201,7 +243,13 @@ export function normalizeForSpeech(
   overflow: Overflow = 'ellipsis'
 ): string {
   const p = SPEECH_PATTERNS;
-  let result = capInput(text)
+  // Resolved names are folded like the text, so the dictionary matches them.
+  const name = (resolved: string | undefined, fallback: string) =>
+    ` ${resolved === undefined ? fallback : foldForSpeech(resolved)} `;
+
+  // Folded before the caps, since folding can lengthen text (﷽ is 18
+  // characters in NFKC); the first cut only keeps that from being enormous.
+  let result = capInput(foldForSpeech(capInput(text)))
     // Say what was posted instead of reading it out.
     .replace(p.codeBlock, ' コード省略 ')
     .replace(p.spoiler, ' ネタバレ ')
@@ -212,17 +260,14 @@ export function normalizeForSpeech(
       p.customEmoji,
       (_m, name: string) => ` ${name.replace(/_/g, ' ')} `
     )
-    .replace(
-      p.userMention,
-      (_m, id: string) => ` ${context.resolveUser(id) ?? 'だれか'} `
+    .replace(p.userMention, (_m, id: string) =>
+      name(context.resolveUser(id), 'だれか')
     )
-    .replace(
-      p.roleMention,
-      (_m, id: string) => ` ${context.resolveRole(id) ?? 'ロール'} `
+    .replace(p.roleMention, (_m, id: string) =>
+      name(context.resolveRole(id), 'ロール')
     )
-    .replace(
-      p.channelMention,
-      (_m, id: string) => ` ${context.resolveChannel(id) ?? 'チャンネル'} `
+    .replace(p.channelMention, (_m, id: string) =>
+      name(context.resolveChannel(id), 'チャンネル')
     )
     .replace(p.slashCommand, ' $1 ')
     .replace(p.timestamp, ' 日時 ')
@@ -234,9 +279,10 @@ export function normalizeForSpeech(
     .replace(p.lineBreak, '、');
 
   // Mentions can grow into long names; cap again so the dictionary below,
-  // which can multiply the length a hundredfold, starts from a bounded text.
-  // The server's dictionary wins over the built-in slang rule below.
-  result = applyDictionary(capInput(result), context.dictionary);
+  // which can multiply the length a hundredfold, starts from a bounded text,
+  // and cap what it produces. The server's dictionary wins over the built-in
+  // slang rule below.
+  result = capExpanded(applyDictionary(capInput(result), context.dictionary));
 
   result = result
     .replace(p.laughter, '$1わら')

@@ -179,11 +179,60 @@ describe('TtsSessionManager', () => {
         guildId: GUILD,
         voiceChannelId: VC,
         textChannelIds: new Set([VC, TEXT]),
+        creditedCharacters: new Set(),
         startedBy: 'starter',
         startedAt: 1234,
       });
       expect(h.manager.get(VC)).toBe(info);
       expect(h.manager.getForGuild(GUILD)).toBe(info);
+    });
+
+    it('credits each character once per session', () => {
+      const h = harness();
+      h.manager.start({
+        guildId: GUILD,
+        voiceChannelId: VC,
+        textChannelId: TEXT,
+        startedBy: 'starter',
+        creditedCharacters: ['ずんだもん'],
+      });
+
+      // Already named by the start message.
+      expect(h.manager.creditCharacter(VC, 'ずんだもん')).toBe(false);
+      // New: the caller posts the credit, once.
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(true);
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(false);
+      expect([...h.manager.get(VC)!.creditedCharacters]).toEqual([
+        'ずんだもん',
+        '四国めたん',
+      ]);
+      // No session, nothing to credit.
+      expect(h.manager.creditCharacter('nope', '春日部つむぎ')).toBe(false);
+    });
+
+    it('adds the characters a second start credits to the running session', () => {
+      const h = harness();
+      h.start();
+
+      h.manager.start({
+        guildId: GUILD,
+        voiceChannelId: VC,
+        textChannelId: 'text-2',
+        startedBy: 'other',
+        creditedCharacters: ['四国めたん'],
+      });
+
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(false);
+    });
+
+    it('forgets what was credited when the session ends', () => {
+      const h = harness();
+      h.start();
+      h.manager.creditCharacter(VC, '四国めたん');
+      h.manager.stop(VC);
+
+      h.start();
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(true);
     });
 
     it('unmutes when a session starts', () => {

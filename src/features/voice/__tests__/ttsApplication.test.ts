@@ -28,6 +28,7 @@ const ttsSessions = vi.hoisted(() => ({
   getForGuild: vi.fn(),
   findForTextChannel: vi.fn(),
   enqueue: vi.fn(),
+  creditCharacter: vi.fn(),
 }));
 
 vi.mock('../tts/sessionManager.js', () => ({ ttsSessions }));
@@ -72,12 +73,17 @@ const resolveLocale = vi.hoisted(() =>
   )
 );
 
-vi.mock('../../../locales/guildLocale.js', () => ({ resolveLocale }));
+vi.mock('../../../locales/guildLocale.js', () => ({
+  resolveLocale,
+  // The guild's own language, for posts no interaction asked for.
+  resolveGuildLocale: (_guildId: string, fallback: string) => fallback,
+}));
 
 const { autocompleteTts, executeTtsCommand, handleTtsMessage } =
   await import('../application/tts.js');
 const { command: ttsCommand } = await import('../commands/tts.js');
-const { applyDictionary } = await import('../tts/textNormalizer.js');
+const { applyDictionary, dictionaryKey } =
+  await import('../tts/textNormalizer.js');
 const { MAX_DICTIONARY_ENTRIES } =
   await import('../repositories/ttsRepository.js');
 const { t } = await import('../../../locales/index.js');
@@ -109,10 +115,14 @@ const JOINED = { kind: 'connection' };
 
 let client: ReturnType<typeof fakeClient>;
 
+/** Characters the session has credited; the default one from the start. */
+let credited: Set<string>;
+
 /** A guild whose caches resolve the mentions used in these tests. */
 function fakeGuild(me: object | null = { id: 'bot' }) {
   return {
     id: GUILD,
+    preferredLocale: 'en-US',
     members: {
       me,
       cache: new Collection<string, { displayName: string }>([
@@ -321,6 +331,14 @@ beforeEach(() => {
   ttsSessions.skip.mockReturnValue(false);
   ttsSessions.stop.mockReturnValue(true);
   ttsSessions.enqueue.mockReturnValue(true);
+  credited = new Set(['ずんだもん']);
+  ttsSessions.creditCharacter.mockImplementation(
+    (_voiceChannelId: string, character: string) => {
+      if (credited.has(character)) return false;
+      credited.add(character);
+      return true;
+    }
+  );
   ttsRepository.getUserSettings.mockReturnValue(null);
   ttsRepository.listDictionary.mockReturnValue([]);
   ttsRepository.getDictionaryEntry.mockReturnValue(null);
@@ -566,8 +584,13 @@ describe('/tts start', () => {
       voiceChannelId: VC,
       textChannelId: TEXT,
       startedBy: USER,
+      // What the footer names, so it is not posted again on first use.
+      creditedCharacters: new Set(['ずんだもん']),
     });
-    expect(client.listVoices).toHaveBeenCalledTimes(1);
+    // Fetched right after deferring, alongside the health check and join.
+    expect(client.listVoices.mock.invocationCallOrder[0]).toBeLessThan(
+      client.isAvailable.mock.invocationCallOrder[0]
+    );
     expect(interaction.reply).not.toHaveBeenCalled();
 
     const embed = embedOf(edited(interaction));
@@ -622,13 +645,41 @@ describe('/tts start', () => {
         await run();
 
         expect(footer(interaction)).toBe(t('tts.credit', locale, { credits }));
+        expect(ttsSessions.start).toHaveBeenCalledWith(
+          expect.objectContaining({
+            creditedCharacters: new Set(['ずんだもん', '四国めたん']),
+          })
+        );
         expect(ttsRepository.getUserSettings).not.toHaveBeenCalledWith(
           'some-bot'
         );
       }
     );
 
-    it('falls back to the default character when the voice list fails', async () => {
+    it('uses a voice list that only arrives while the bot is joining', async () => {
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      // One request shared by every caller, as the real client does.
+      let answer!: (voices: typeof VOICES) => void;
+      const list = new Promise<typeof VOICES>((resolve) => {
+        answer = resolve;
+      });
+      client.listVoices.mockReturnValue(list);
+      connectionManager.waitUntilReady.mockImplementation(async () => {
+        answer(VOICES);
+        return JOINED;
+      });
+      const { interaction, run } = start();
+
+      await run();
+
+      expect(footer(interaction)).toBe(
+        t('tts.credit', 'en', {
+          credits: 'VOICEVOX:ずんだもん and VOICEVOX:四国めたん',
+        })
+      );
+    });
+
+    it('credits only the default voice when the list fails, leaving the rest to first use', async () => {
       ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
       client.listVoices.mockRejectedValue(new Error('engine hiccup'));
       const { interaction, run } = start();
@@ -638,6 +689,12 @@ describe('/tts start', () => {
       expect(embedOf(edited(interaction)).title).toBe(t('tts.started', 'en'));
       expect(footer(interaction)).toBe(
         t('tts.credit', 'en', { credits: 'VOICEVOX:ずんだもん' })
+      );
+      // 四国めたん was not named, so the session still owes its credit.
+      expect(ttsSessions.start).toHaveBeenCalledWith(
+        expect.objectContaining({
+          creditedCharacters: new Set(['ずんだもん']),
+        })
       );
     });
 
@@ -656,8 +713,9 @@ describe('/tts start', () => {
       );
     });
 
-    it('stops waiting on a slow engine after two seconds', async () => {
+    it('stops waiting on a slow engine two seconds after joining', async () => {
       vi.useFakeTimers();
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
       client.listVoices.mockReturnValue(new Promise(() => undefined));
       const { interaction, run } = start();
 
@@ -669,6 +727,11 @@ describe('/tts start', () => {
 
       expect(footer(interaction)).toBe(
         t('tts.credit', 'en', { credits: 'VOICEVOX:ずんだもん' })
+      );
+      expect(ttsSessions.start).toHaveBeenCalledWith(
+        expect.objectContaining({
+          creditedCharacters: new Set(['ずんだもん']),
+        })
       );
     });
   });
@@ -869,6 +932,20 @@ describe('/tts stop after auto-join was turned back on', () => {
     expect(connectionManager.disconnect).not.toHaveBeenCalled();
     // Members are told their audio is now kept, as on any auto-join.
     expect(announceBuffering).toHaveBeenCalledWith(voiceChannel);
+    expect(embedOf(replied(interaction)).title).toBe(t('tts.stopped', 'en'));
+  });
+
+  it('replies without waiting for the buffering notice to go out', async () => {
+    announceBuffering.mockReturnValue(new Promise(() => undefined));
+    const { interaction, run } = command({
+      subcommand: 'stop',
+      members: [{ id: USER }],
+    });
+
+    await run();
+
+    expect(connectionManager.enableReceive).toHaveBeenCalledWith(VC);
+    expect(announceBuffering).toHaveBeenCalled();
     expect(embedOf(replied(interaction)).title).toBe(t('tts.stopped', 'en'));
   });
 
@@ -1218,7 +1295,28 @@ describe('/tts voice', () => {
       await run();
 
       expect(ttsSessions.enqueue).toHaveBeenCalled();
+      expect(ttsSessions.creditCharacter).toHaveBeenCalledWith(
+        VC,
+        'ずんだもん'
+      );
       expect(textChannel.send).not.toHaveBeenCalled();
+    });
+
+    it('credits each character once, however often styles are switched', async () => {
+      ttsSessions.getForGuild.mockReturnValue(session());
+      const sent: unknown[] = [];
+      // ずんだもん (3, 1) is credited from the start; 四国めたん (2) is new.
+      for (const speaker of [1, 3, 1, 2, 1, 2, 3]) {
+        const { textChannel, run } = voice({
+          voice: VC,
+          options: { speaker },
+        });
+        await run();
+        sent.push(...textChannel.send.mock.calls);
+      }
+
+      expect(sent).toHaveLength(1);
+      expect(ttsSessions.enqueue).toHaveBeenCalledTimes(7);
     });
 
     it('posts nothing for a caller who is not being read', async () => {
@@ -1289,7 +1387,7 @@ describe('/tts dict', () => {
       await run();
 
       expect(embedOf(replied(interaction)).description).toBe(
-        '・w → わら\n・草 → くさ'
+        '・`w` → `わら`\n・`草` → `くさ`'
       );
     });
 
@@ -1306,7 +1404,7 @@ describe('/tts dict', () => {
       await run();
 
       expect(embedOf(replied(interaction)).description).toBe(
-        '・\\*bold\\* → \\[Free Nitro](https://evil.example)'
+        '・`*bold*` → `[Free Nitro](https://evil.example)`'
       );
     });
 
@@ -1347,8 +1445,8 @@ describe('/tts dict', () => {
 
       const lines = embedOf(replied(interaction)).description!.split('\n');
       expect(lines).toHaveLength(41);
-      expect(lines[0]).toBe('・word0 → よみ0');
-      expect(lines[39]).toBe('・word39 → よみ39');
+      expect(lines[0]).toBe('・`word0` → `よみ0`');
+      expect(lines[39]).toBe('・`word39` → `よみ39`');
       expect(lines[40]).toBe(t('tts.dict.listMore', 'en', { count: 5 }));
     });
 
@@ -1424,7 +1522,7 @@ describe('/tts dict', () => {
       const embed = embedOf(payload);
       expect(embed.title).toBe(t('tts.dict.addedTitle', 'en'));
       expect(embed.description).toBe(
-        t('tts.dict.added', 'en', { word: 'w', reading: 'わら' })
+        t('tts.dict.added', 'en', { word: '`w`', reading: '`わら`' })
       );
       expect(embed.color).toBe(COLORS.SUCCESS);
     });
@@ -1448,7 +1546,7 @@ describe('/tts dict', () => {
         USER
       );
       expect(embedOf(replied(interaction)).description).toBe(
-        t('tts.dict.updated', 'en', { word: 'w', reading: 'くさ' })
+        t('tts.dict.updated', 'en', { word: '`w`', reading: '`くさ`' })
       );
     });
 
@@ -1476,6 +1574,37 @@ describe('/tts dict', () => {
       }
     );
 
+    it.each([
+      ['fullwidth', 'ａｌｉｃｅ', 'ＡＬＩＣＥ'],
+      ['accented', 'café', 'CAFÉ'],
+      ['Greek', 'αλίκη', 'ΑΛΊΚΗ'],
+    ])(
+      "refuses a %s case variant of another member's word",
+      async (_label, owned, variant) => {
+        // Looked up by the same folded key the repository stores.
+        ttsRepository.getDictionaryEntry.mockImplementation(
+          (_guildId: string, word: string) =>
+            dictionaryKey(word) === dictionaryKey(owned)
+              ? { word: owned, reading: 'ありす', createdBy: 'someone-else' }
+              : null
+        );
+        const add = dict('add', {
+          options: { word: variant, reading: 'ばか' },
+        });
+        await add.run();
+        expectError(
+          add.interaction,
+          t('common.error', 'en'),
+          t('tts.dict.notOwner', 'en')
+        );
+        expect(ttsRepository.upsertDictionaryEntry).not.toHaveBeenCalled();
+
+        const remove = dict('remove', { options: { word: variant } });
+        await remove.run();
+        expect(ttsRepository.removeDictionaryEntry).not.toHaveBeenCalled();
+      }
+    );
+
     it("lets a server manager change anyone's word", async () => {
       ttsRepository.getDictionaryEntry.mockReturnValue({
         word: 'Taka',
@@ -1497,7 +1626,7 @@ describe('/tts dict', () => {
         USER
       );
       expect(embedOf(replied(interaction)).description).toBe(
-        t('tts.dict.updated', 'en', { word: 'Taka', reading: 'たか' })
+        t('tts.dict.updated', 'en', { word: '`Taka`', reading: '`たか`' })
       );
     });
 
@@ -1517,10 +1646,70 @@ describe('/tts dict', () => {
       );
       expect(embedOf(replied(interaction)).description).toBe(
         t('tts.dict.added', 'en', {
-          word: 'nitro\\_\\*',
-          reading: '\\[Discord Nitro 無料配布](https://evil.example)',
+          word: '`nitro_*`',
+          reading: '`[Discord Nitro 無料配布](https://evil.example)`',
         })
       );
+    });
+
+    /** The reply with every inline code span taken out. */
+    const outsideCode = (description: string) =>
+      description.replace(/`[^`]*`/g, '');
+
+    it.each<Locale>(['en', 'ja'])(
+      'cannot form a link from a word and a reading together (%s)',
+      async (locale) => {
+        const { interaction, run } = dict('add', {
+          locale,
+          options: {
+            word: '[Claim your reward',
+            reading: '](https://phish.example)',
+          },
+        });
+
+        await run();
+
+        const description = embedOf(replied(interaction)).description!;
+        expect(description).toBe(
+          t('tts.dict.added', locale, {
+            word: '`[Claim your reward`',
+            reading: '`](https://phish.example)`',
+          })
+        );
+        // Every bracket sits inside a code span, where Discord renders no
+        // links.
+        expect(outsideCode(description)).not.toMatch(/[[\]()]/);
+      }
+    );
+
+    it('cannot form a link from two masked links in one word', async () => {
+      const word = '[a](b)[Steam gift](https://e.example)';
+      const { interaction, run } = dict('add', {
+        options: { word, reading: 'x' },
+      });
+
+      await run();
+
+      const description = embedOf(replied(interaction)).description!;
+      expect(outsideCode(description)).not.toMatch(/[[\]()]/);
+      expect(description).toContain(`\`${word}\``);
+    });
+
+    it('cannot close the code span early with a backtick', async () => {
+      const { interaction, run } = dict('add', {
+        options: { word: 'a`[x](https://e.example)`b', reading: '``y' },
+      });
+
+      await run();
+
+      const description = embedOf(replied(interaction)).description!;
+      expect(description).toBe(
+        t('tts.dict.added', 'en', {
+          word: '`aˋ[x](https://e.example)ˋb`',
+          reading: '`ˋˋy`',
+        })
+      );
+      expect(outsideCode(description)).not.toMatch(/[[\]()]/);
     });
 
     it(`refuses a new word once the server has ${MAX_DICTIONARY_ENTRIES}`, async () => {
@@ -1571,7 +1760,7 @@ describe('/tts dict', () => {
         USER
       );
       expect(embedOf(replied(interaction)).description).toBe(
-        t('tts.dict.updated', 'en', { word: 'w', reading: 'くさ' })
+        t('tts.dict.updated', 'en', { word: '`w`', reading: '`くさ`' })
       );
     });
   });
@@ -1597,7 +1786,7 @@ describe('/tts dict', () => {
       expectError(
         interaction,
         t('common.error', 'en'),
-        t('tts.dict.notFound', 'en', { word: 'nope' })
+        t('tts.dict.notFound', 'en', { word: '`nope`' })
       );
       expect(ttsRepository.removeDictionaryEntry).not.toHaveBeenCalled();
     });
@@ -1631,7 +1820,7 @@ describe('/tts dict', () => {
       const embed = embedOf(payload);
       expect(embed.title).toBe(t('tts.dict.removedTitle', 'en'));
       expect(embed.description).toBe(
-        t('tts.dict.removed', 'en', { word: 'w' })
+        t('tts.dict.removed', 'en', { word: '`w`' })
       );
       expect(embed.color).toBe(COLORS.INFO);
     });
@@ -1645,7 +1834,7 @@ describe('/tts dict', () => {
       const removed = dict('remove', { options: { word: '**x**' } });
       await removed.run();
       expect(embedOf(replied(removed.interaction)).description).toBe(
-        t('tts.dict.removed', 'en', { word: '\\*\\*x\\*\\*' })
+        t('tts.dict.removed', 'en', { word: '`**x**`' })
       );
       expect(ttsRepository.removeDictionaryEntry).toHaveBeenCalledWith(
         GUILD,
@@ -1656,7 +1845,7 @@ describe('/tts dict', () => {
       const missing = dict('remove', { options: { word: '||x||' } });
       await missing.run();
       expect(embedOf(replied(missing.interaction)).description).toBe(
-        t('tts.dict.notFound', 'en', { word: '\\|\\|x\\|\\|' })
+        t('tts.dict.notFound', 'en', { word: '`||x||`' })
       );
     });
 
@@ -1816,6 +2005,19 @@ describe('autocompleteTts', () => {
       }
     });
 
+    it('never cuts a voice name inside a surrogate pair', async () => {
+      client.listVoices.mockResolvedValue([
+        { id: 8, character: `a${'𠮷'.repeat(60)}`, style: 'ノーマル' },
+      ]);
+      const { run, choices } = autocomplete('speaker', '');
+
+      await run();
+
+      const name = choices()[0].name;
+      expect(name).toBe(`a${'𠮷'.repeat(49)}`);
+      expect(name.length).toBe(99);
+    });
+
     it('keeps voice names within 100 characters', async () => {
       client.listVoices.mockResolvedValue([
         { id: 7, character: 'き'.repeat(80), style: 'す'.repeat(40) },
@@ -1904,11 +2106,13 @@ describe('handleTtsMessage', () => {
   }
 
   function message(opts: MessageOptions = {}) {
+    const guild = fakeGuild();
+    (guild.channels.cache as Collection<string, unknown>).set(VC, voiceChat);
     return {
       inGuild: () => opts.inGuild !== false,
       guildId: GUILD,
       channelId: opts.channelId ?? TEXT,
-      guild: fakeGuild(),
+      guild,
       author: { id: 'author-1', bot: opts.bot ?? false },
       webhookId: opts.webhookId ?? null,
       system: opts.system ?? false,
@@ -1929,8 +2133,150 @@ describe('handleTtsMessage', () => {
   const handle = (msg: ReturnType<typeof message>) =>
     handleTtsMessage(msg as unknown as Message);
 
+  /** The voice channel's own chat, where first-use credits go. */
+  let voiceChat: ReturnType<typeof sendableChannel>;
+
   beforeEach(() => {
     ttsSessions.findForTextChannel.mockReturnValue({ voiceChannelId: VC });
+    voiceChat = sendableChannel(VC);
+  });
+
+  describe('crediting a voice the first time it is read', () => {
+    const sentCredits = () =>
+      voiceChat.send.mock.calls.map(([payload]) => payload);
+
+    it('posts the credit for a character the session has not credited yet', async () => {
+      client.cachedVoices.mockReturnValue(VOICES);
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+
+      await handle(message());
+
+      expect(ttsSessions.enqueue).toHaveBeenCalledWith(
+        VC,
+        expect.objectContaining({ speakerId: 2 })
+      );
+      expect(ttsSessions.creditCharacter).toHaveBeenCalledWith(
+        VC,
+        '四国めたん'
+      );
+      expect(sentCredits()).toEqual([
+        {
+          content: t('tts.voice.credit', 'en', { character: '四国めたん' }),
+          allowedMentions: { parse: [] },
+        },
+      ]);
+    });
+
+    it('posts nothing for a character already credited', async () => {
+      client.cachedVoices.mockReturnValue(VOICES);
+
+      // Default voice, named in the start message; then a second line.
+      await handle(message());
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      await handle(message());
+      await handle(message());
+
+      expect(sentCredits()).toHaveLength(1);
+    });
+
+    it('fetches the voice list when it is not cached yet, and credits after', async () => {
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      let answer!: (voices: typeof VOICES) => void;
+      client.listVoices.mockReturnValue(
+        new Promise((resolve) => {
+          answer = resolve;
+        })
+      );
+
+      await handle(message());
+      // Reading does not wait for the list.
+      expect(ttsSessions.enqueue).toHaveBeenCalled();
+      expect(voiceChat.send).not.toHaveBeenCalled();
+
+      answer(VOICES);
+      await vi.waitFor(() => expect(voiceChat.send).toHaveBeenCalledTimes(1));
+    });
+
+    it('gives up quietly when the list cannot be fetched', async () => {
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      client.listVoices.mockRejectedValue(new Error('down'));
+
+      await handle(message());
+      await Promise.resolve();
+
+      expect(ttsSessions.enqueue).toHaveBeenCalled();
+      expect(ttsSessions.creditCharacter).not.toHaveBeenCalled();
+      expect(voiceChat.send).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, () => void]>([
+      [
+        'the voice is not in the list',
+        () =>
+          ttsRepository.getUserSettings.mockReturnValue({
+            speakerId: 99,
+            speed: 1,
+          }),
+      ],
+      [
+        'no engine is configured',
+        () => getVoicevoxClient.mockReturnValue(null),
+      ],
+      [
+        'the voice chat cannot be posted in',
+        () => {
+          ttsRepository.getUserSettings.mockReturnValue({
+            speakerId: 2,
+            speed: 1,
+          });
+          Object.assign(voiceChat, { isSendable: () => false });
+        },
+      ],
+    ])('posts nothing when %s', async (_label, arrange) => {
+      client.cachedVoices.mockReturnValue(VOICES);
+      arrange();
+
+      await handle(message());
+
+      expect(voiceChat.send).not.toHaveBeenCalled();
+    });
+
+    it('still reads when the credit cannot be posted', async () => {
+      client.cachedVoices.mockReturnValue(VOICES);
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      voiceChat.send.mockRejectedValue(new Error('Missing Access'));
+
+      await handle(message());
+      await Promise.resolve();
+
+      expect(ttsSessions.enqueue).toHaveBeenCalled();
+    });
+
+    it('credits a voice changed from another server once it is read here', async () => {
+      client.cachedVoices.mockReturnValue(VOICES);
+      // In another server, where nothing is being read: saved, nothing posted.
+      const elsewhere = command({
+        subcommand: 'voice',
+        voice: null,
+        options: { speaker: 2 },
+      });
+      await elsewhere.run();
+      expect(ttsRepository.setUserSettings).toHaveBeenCalledWith(USER, {
+        speakerId: 2,
+        speed: 1,
+      });
+      expect(elsewhere.textChannel.send).not.toHaveBeenCalled();
+
+      // Back in the server being read, the first line in it is credited.
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      await handle(message());
+
+      expect(sentCredits()).toEqual([
+        expect.objectContaining({
+          content: t('tts.voice.credit', 'en', { character: '四国めたん' }),
+        }),
+      ]);
+    });
   });
 
   it.each<[string, MessageOptions]>([

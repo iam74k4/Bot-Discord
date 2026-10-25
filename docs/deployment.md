@@ -107,11 +107,11 @@ encodes it to Opus with the bundled encoder.
 
 VOICEVOX and each character's terms require a credit (for example
 `VOICEVOX:ずんだもん`). The public `/tts start` message credits the default
-voice and the voices of everyone in the channel at that moment, and switching
-voice during a session posts the new voice's credit in the channel being read.
-A member who joins later with a voice of their own is not credited until they
-change it, so you may also want to list the characters your members use in the
-bot's **About Me** in the Developer Portal.
+voice and the voices of everyone in the channel at that moment. Every other
+character is credited in the voice channel's chat the first time a line in it
+is read during the session: a member who joins later, or who switches voice
+(even from another server), so every voice listeners hear has been credited
+where they can see it. Each character is credited once per session.
 
 Where a server has turned auto-join off (`/voice autojoin disable` or an
 excluded channel), `/tts start` still joins, but deafened and without buffering
@@ -121,8 +121,9 @@ buffer is still dropped by those commands, which ends any reading through it
 (the channel is told, and `/tts start` resumes reading deafened).
 
 With `VOICEVOX_URL` set the bot receives every guild message, but it keeps no
-message cache (discord.js would otherwise hold the last 200 per channel), so
-reading adds no memory to the sizing above.
+message cache (discord.js would otherwise hold the last 200 per channel).
+Members who post are still cached, as other events would cache them, so
+reading adds little memory beyond the sizing above.
 
 ### 4. Choose how production deploys run
 

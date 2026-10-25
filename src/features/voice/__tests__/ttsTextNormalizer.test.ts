@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   applyDictionary,
   buildMessageSpeech,
+  dictionaryKey,
+  foldForSpeech,
   isMarkedSilent,
   MAX_INPUT_LENGTH,
   MAX_NAME_LENGTH,
@@ -260,12 +262,16 @@ describe('normalizeForSpeech', () => {
       expect(speak(input)).toBe(expected);
     });
 
-    it.each(['new', 'wow', 'awww', 'www.example', 'show', 'lolｗｗｗ'])(
+    it.each(['new', 'wow', 'awww', 'www.example', 'show'])(
       'leaves English words like %j alone',
       (input) => {
         expect(speak(input)).toBe(input);
       }
     );
+
+    it('leaves a fullwidth run after an English word alone (only folded)', () => {
+      expect(speak('lolｗｗｗ')).toBe('lolwww');
+    });
 
     it.each([
       ['草ｗｗ', '草わら'],
@@ -283,7 +289,40 @@ describe('normalizeForSpeech', () => {
     });
   });
 
+  describe('compatibility forms', () => {
+    it('reads fullwidth, halfwidth and circled forms as their plain form', () => {
+      expect(speak('ＡＢＣ ｶﾀｶﾅ ① ｗ')).toBe('ABC カタカナ 1 わら');
+    });
+
+    it('still drops emoji that NFKC would turn into letters', () => {
+      expect(speak('™ ℹ️ Ⓜ️ ㊗️ ok')).toBe('ok');
+    });
+
+    it('folds resolved names too, so the dictionary matches them', () => {
+      const ctx = { ...context([{ word: 'taro', reading: 'たろー' }]) };
+      ctx.resolveUser = () => 'ＴＡＲＯ';
+      expect(normalizeForSpeech('<@1>', ctx)).toBe('たろー');
+    });
+  });
+
   describe('dictionary', () => {
+    it.each([
+      ['fullwidth', 'ａｌｉｃｅ と ＡＬＩＣＥ と alice', 'ＡＬＩＣＥ'],
+      ['accented', 'café と CAFÉ', 'Café'],
+      ['Greek', 'αλίκη と ΑΛΊΚΗ', 'Αλίκη'],
+    ])(
+      'matches %s case variants of a word as one word',
+      (_label, text, word) => {
+        const read = speak(text, [{ word, reading: 'よみ' }]);
+        expect(read).toBe(
+          text
+            .split(' と ')
+            .map(() => 'よみ')
+            .join(' と ')
+        );
+      }
+    );
+
     it('applies the dictionary case-insensitively to normalized text', () => {
       expect(
         speak('VOICEVOX と voicevox', [
@@ -324,6 +363,61 @@ describe('normalizeForSpeech', () => {
       expect(speak(`${'あ'.repeat(MAX_INPUT_LENGTH - 1)}い`)).toBe(
         `${'あ'.repeat(MAX_SPEECH_LENGTH)}、以下略`
       );
+    });
+
+    it('cuts raw text before any rule shortens it', () => {
+      // Without the first cut, the URL rule would shrink this under the
+      // later ones and the greeting would be read.
+      expect(speak(`http://${'a'.repeat(MAX_INPUT_LENGTH)} こんにちは`)).toBe(
+        'URL省略'
+      );
+    });
+
+    it('drops text that mention expansion pushes past the input cap', () => {
+      // 80 mentions of a 98-letter role fill the cap exactly; the dictionary
+      // then shrinks each to a pause, so only that cut keeps the greeting out.
+      const ctx = {
+        ...context([{ word: 'r'.repeat(98), reading: '、' }]),
+        resolveRole: () => 'r'.repeat(98),
+      };
+      const mentions = '<@&1>'.repeat(MAX_INPUT_LENGTH / 100);
+      expect(normalizeForSpeech(`${mentions}こんにちは`, ctx)).toBe('');
+      expect(normalizeForSpeech(`${mentions.slice(5)}こんにちは`, ctx)).toBe(
+        'こんにちは'
+      );
+    });
+
+    it('drops text that the dictionary pushes past the input cap', () => {
+      // Each "a" becomes 100 characters that collapse to one pause, so
+      // without a cut after the dictionary the greeting would still be read.
+      const reading = `、${' '.repeat(98)}、`;
+      expect(
+        speak(`${'a'.repeat(100)}こんにちは`, [{ word: 'a', reading }])
+      ).toBe('');
+      expect(
+        speak(`${'a'.repeat(70)}こんにちは`, [{ word: 'a', reading }])
+      ).toBe('こんにちは');
+    });
+
+    it('keeps a surrogate pair whole at the cut after the dictionary', () => {
+      const read = speak('a'.repeat(81), [
+        { word: 'a', reading: '𠮷'.repeat(50) },
+      ]);
+      expect(read).toBe(`${'𠮷'.repeat(MAX_SPEECH_LENGTH)}、以下略`);
+    });
+
+    it('keeps a w run that reaches the end of the dictionary output', () => {
+      expect(
+        speak('a'.repeat(100), [{ word: 'a', reading: 'ｗ'.repeat(100) }])
+      ).toBe('わら');
+    });
+
+    it('never cuts the dictionary output inside a w run', () => {
+      // Cut mid-run, the run would look like trailing laughter; whole, it is
+      // followed by a letter and read as written.
+      expect(
+        speak(`${'a'.repeat(200)}b`, [{ word: 'a', reading: 'ｗ'.repeat(100) }])
+      ).toBe(`${'ｗ'.repeat(MAX_SPEECH_LENGTH)}、以下略`);
     });
 
     it('never leaves half a surrogate pair at the input cap', () => {
@@ -432,9 +526,11 @@ describe('regex cost (ReDoS)', () => {
   }
 
   // A linear pattern handles these inputs in a few milliseconds; each of the
-  // patterns this replaced took over a second on at least one of them.
-  const BUDGET_MS = 50;
-  const LENGTH = 50_000;
+  // patterns this replaced took several seconds on at least one of them. The
+  // budget is generous so a slow, instrumented CI runner cannot fail a
+  // linear pattern.
+  const BUDGET_MS = 250;
+  const LENGTH = 100_000;
 
   it('reads the reported worst case quickly and still cuts it off', () => {
     const dictionary = [{ word: 'a', reading: 'ｗ'.repeat(100) }];
@@ -475,7 +571,16 @@ describe('regex cost (ReDoS)', () => {
       'a '.repeat(2000),
       [{ word: 'a', reading: 'ｗ'.repeat(100) }],
     ],
-    ['input past the cap', '['.repeat(MAX_INPUT_LENGTH * 50), []],
+    [
+      'pause-heavy readings across the whole input',
+      'a'.repeat(MAX_INPUT_LENGTH),
+      [{ word: 'a', reading: '、ｗ'.repeat(50) }],
+    ],
+    [
+      'input that folds to 18 times its length',
+      '\uFDFA'.repeat(MAX_INPUT_LENGTH),
+      [{ word: 'a', reading: 'ｗ'.repeat(100) }],
+    ],
   ])('handles %s within budget', (_label, content, dictionary) => {
     const elapsed = fastestMs(() =>
       normalizeForSpeech(
@@ -484,6 +589,22 @@ describe('regex cost (ReDoS)', () => {
       )
     );
     expect(elapsed).toBeLessThan(BUDGET_MS);
+  });
+
+  it('handles a Nitro message of self-mentions expanded by the dictionary', () => {
+    const ctx = {
+      ...context([{ word: 'a', reading: '、ｗ'.repeat(50) }]),
+      resolveUser: () => 'a'.repeat(32),
+    };
+    const content = '<@123456789012345678>'.repeat(190);
+    let result = '';
+    const elapsed = fastestMs(() => {
+      result = normalizeForSpeech(content, ctx);
+    });
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+    expect(Array.from(result).length).toBeLessThanOrEqual(
+      MAX_SPEECH_LENGTH + '、以下略'.length
+    );
   });
 
   it('applies a full dictionary of near-identical long words within budget', () => {
@@ -555,4 +676,27 @@ describe('regex cost (ReDoS)', () => {
       expect(slow).toEqual([]);
     }
   );
+});
+
+describe('dictionaryKey', () => {
+  it.each([
+    ['ＡＬＩＣＥ', 'alice'],
+    ['ａｌｉｃｅ', 'Alice'],
+    ['CAFÉ', 'café'],
+    ['ΑΛΊΚΗ', 'αλίκη'],
+    ['ｶﾀｶﾅ', 'カタカナ'],
+  ])('gives %j and %j the same key', (a, b) => {
+    expect(dictionaryKey(a)).toBe(dictionaryKey(b));
+  });
+
+  it('keeps different words apart', () => {
+    expect(dictionaryKey('alice')).not.toBe(dictionaryKey('alicia'));
+    expect(dictionaryKey('™')).not.toBe(dictionaryKey('tm'));
+  });
+});
+
+describe('foldForSpeech', () => {
+  it('folds compatibility forms but leaves pictographs as they are', () => {
+    expect(foldForSpeech('ＡＢＣ™ｗ㊗️')).toBe('ABC™w㊗️');
+  });
 });

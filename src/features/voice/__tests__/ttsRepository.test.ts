@@ -57,14 +57,15 @@ describe('011_tts migration', () => {
     });
   });
 
-  it('keys the dictionary by guild and word', () => {
+  it('keys the dictionary by guild and folded word', () => {
     ttsTables();
     const insert = db.prepare(
-      'INSERT INTO tts_dictionary (guild_id, word, reading, created_by, created_at) VALUES (?, ?, ?, ?, ?)'
+      'INSERT INTO tts_dictionary (guild_id, word_key, word, reading, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
     );
-    insert.run('g1', 'w', 'わら', 'u', 0);
-    insert.run('g2', 'w', 'わら', 'u', 0);
-    expect(() => insert.run('g1', 'w', 'だぶ', 'u', 0)).toThrow(/UNIQUE/);
+    insert.run('g1', 'w', 'w', 'わら', 'u', 0);
+    insert.run('g2', 'w', 'w', 'わら', 'u', 0);
+    // The key, not the spelling, is what must be unique.
+    expect(() => insert.run('g1', 'w', 'Ｗ', 'だぶ', 'u', 0)).toThrow(/UNIQUE/);
   });
 });
 
@@ -231,6 +232,45 @@ describe('ttsRepository', () => {
       ]);
       expect(ttsRepository.removeDictionaryEntry('g1', 'Abc')).toBe(true);
       expect(ttsRepository.countDictionary('g1')).toBe(0);
+    });
+
+    it.each([
+      ['fullwidth', 'ａｌｉｃｅ', 'ＡＬＩＣＥ', 'alice'],
+      ['accented', 'café', 'cafÉ', 'CAFÉ'],
+      ['Greek', 'αλίκη', 'ΑΛΊΚΗ', 'Αλίκη'],
+      ['halfwidth kana', 'ｶﾀｶﾅ', 'カタカナ', 'ｶﾀｶﾅ'],
+    ])(
+      'treats %s variants as one word, with one owner',
+      (_label, first, variant, removeAs) => {
+        ttsRepository.upsertDictionaryEntry('g1', first, 'よみ1', 'u1');
+
+        expect(ttsRepository.getDictionaryEntry('g1', variant)).toEqual({
+          word: first,
+          reading: 'よみ1',
+          createdBy: 'u1',
+        });
+        expect(
+          ttsRepository.upsertDictionaryEntry('g1', variant, 'よみ2', 'u2')
+        ).toBe(false);
+        // One row, still u1's, shown with the latest spelling.
+        expect(ttsRepository.listDictionary('g1')).toEqual([
+          { word: variant, reading: 'よみ2', createdBy: 'u1' },
+        ]);
+        expect(ttsRepository.removeDictionaryEntry('g1', removeAs)).toBe(true);
+        expect(ttsRepository.countDictionary('g1')).toBe(0);
+      }
+    );
+
+    it('lists words in folded order, whatever their case', () => {
+      ttsRepository.upsertDictionaryEntry('g1', 'Beta', 'べーた', 'u1');
+      ttsRepository.upsertDictionaryEntry('g1', 'alpha', 'あるふぁ', 'u1');
+      ttsRepository.upsertDictionaryEntry('g1', 'ＧＡＭＭＡ', 'がんま', 'u1');
+
+      expect(ttsRepository.listDictionary('g1').map((e) => e.word)).toEqual([
+        'alpha',
+        'Beta',
+        'ＧＡＭＭＡ',
+      ]);
     });
 
     it('removes a word only from its own server', () => {

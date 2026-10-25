@@ -6,9 +6,12 @@ import { database } from '../connection.js';
  * Voice choice follows the person rather than the server - someone who picked
  * a voice once should sound the same everywhere the bot reads for them - so it
  * is keyed by user alone. The reading dictionary is a server's own vocabulary
- * (member nicknames, in-jokes, game terms) and is keyed by guild. Words are
- * case-insensitive (NOCASE), matching how they are applied to chat, so "ABC"
- * and "abc" are one entry rather than two where only one could ever win.
+ * (member nicknames, in-jokes, game terms) and is keyed by guild and
+ * `word_key`: the word folded the way it is matched against chat (NFKC, then
+ * lower case; see dictionaryKey in the voice feature). So "ABC", "abc",
+ * "ＡＢＣ" and "ａｂｃ" are one entry - and one owner - rather than several where
+ * only one could ever win. SQLite's NOCASE would fold only ASCII. `word` keeps
+ * the latest spelling for display.
  */
 export function up(): void {
   database.exec(`
@@ -23,11 +26,12 @@ export function up(): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS tts_dictionary (
       guild_id TEXT NOT NULL,
-      word TEXT NOT NULL COLLATE NOCASE,
+      word_key TEXT NOT NULL,
+      word TEXT NOT NULL,
       reading TEXT NOT NULL,
       created_by TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      PRIMARY KEY (guild_id, word)
+      PRIMARY KEY (guild_id, word_key)
     )
   `);
 }

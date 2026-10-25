@@ -286,9 +286,9 @@ export const en: TranslationKeys = {
       enabled:
         'Auto-join is on for this server. The bot joins occupied voice channels and keeps the last {minutes} minutes of audio.',
       disabled:
-        'Auto-join is off for this server. The bot will no longer join voice channels on its own or keep any audio. `/tts start` can still bring it in, deafened, to read chat.',
+        'Auto-join is off for this server. The bot will no longer join voice channels on its own or keep any audio.',
       excluded:
-        'Auto-join now skips <#{channel}>. Audio in that channel is not kept; `/tts start` can still bring the bot in, deafened, to read chat.',
+        'Auto-join now skips <#{channel}>. Audio in that channel is not kept.',
       included: 'Auto-join covers <#{channel}> again.',
       notExcluded: '<#{channel}> was not on the exclusion list.',
       statusEnabled: 'On',
@@ -302,6 +302,8 @@ export const en: TranslationKeys = {
       currentChannelNone: 'You are not in a voice channel',
       readingStopped:
         'Reading in <#{channel}> stopped too, because that connection was keeping audio. `/tts start` resumes reading without keeping any.',
+      ttsStillReads:
+        '`/tts start` can still bring the bot in, deafened, to read chat.',
     },
     notice: {
       title: 'Audio is being kept',
@@ -382,7 +384,7 @@ export const en: TranslationKeys = {
       '⚠️ The bot lacks the Speak permission in <#{voice}>, so it may not be heard.',
     noViewPermission:
       '⚠️ The bot cannot view this channel, so messages here will not be read; only the voice chat is.',
-    credit: 'Voice: {credits}',
+    credit: 'Voices: {credits}',
     stopped: 'Text-to-speech stopped',
     stoppedDesc: 'Run `/tts start` whenever you want it again.',
     stoppedByOptOut:
@@ -399,15 +401,15 @@ export const en: TranslationKeys = {
       unknownDesc: 'Pick one of the suggestions shown while typing.',
       credit: 'Credit: VOICEVOX:{character}',
       preview: 'この声で読み上げます',
-      changed: "<@{user}>'s voice is now **{voice}**.",
+      changed: "<@{user}>'s reading voice is now **{voice}**.",
     },
     dict: {
       addedTitle: 'Added to the dictionary',
-      added: '"{word}" will be read as "{reading}".',
-      updated: 'Updated the reading of "{word}" to "{reading}".',
+      added: '{word} will be read as {reading}.',
+      updated: 'Updated the reading of {word} to {reading}.',
       removedTitle: 'Removed from the dictionary',
-      removed: 'Removed "{word}" from the dictionary.',
-      notFound: '"{word}" is not in the dictionary.',
+      removed: 'Removed {word} from the dictionary.',
+      notFound: '{word} is not in the dictionary.',
       notOwner:
         'Only the member who added a word, or members with Manage Server, can change or remove it.',
       full: 'The dictionary is full ({max} words). Remove unused words with `/tts dict remove`.',

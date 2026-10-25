@@ -281,9 +281,9 @@ export const ja: TranslationKeys = {
       enabled:
         'このサーバーでVCへの自動参加を有効にしました。Botは人がいるVCに参加し、直近{minutes}分の音声を保持します。',
       disabled:
-        'このサーバーでVCへの自動参加を無効にしました。Botが自分からVCに参加することはなくなり、音声も保持しません（`/tts start` で読み上げるときだけ、スピーカーミュートの状態で参加します）。',
+        'このサーバーでVCへの自動参加を無効にしました。Botが自分からVCに参加することはなくなり、音声も保持しません。',
       excluded:
-        '<#{channel}> を自動参加の対象外にしました。このチャンネルの音声は保持されません（`/tts start` で読み上げるときだけ、スピーカーミュートの状態で参加します）。',
+        '<#{channel}> を自動参加の対象外にしました。このチャンネルの音声は保持されません。',
       included: '<#{channel}> を自動参加の対象に戻しました。',
       notExcluded: '<#{channel}> は対象外に設定されていません。',
       statusEnabled: '有効',
@@ -297,6 +297,8 @@ export const ja: TranslationKeys = {
       currentChannelNone: 'VCに参加していません',
       readingStopped:
         '<#{channel}> では音声を保持していたため、読み上げも終了しました。`/tts start` を実行すると、音声を保持せずに読み上げを再開できます。',
+      ttsStillReads:
+        '`/tts start` で読み上げるときだけ、Botはスピーカーミュートの状態で参加します。',
     },
     notice: {
       title: '音声を保持しています',
@@ -399,11 +401,11 @@ export const ja: TranslationKeys = {
     },
     dict: {
       addedTitle: '辞書に登録しました',
-      added: '「{word}」を「{reading}」と読みます。',
-      updated: '「{word}」の読み方を「{reading}」に更新しました。',
+      added: '{word} を {reading} と読みます。',
+      updated: '{word} の読み方を {reading} に更新しました。',
       removedTitle: '辞書から削除しました',
-      removed: '「{word}」を辞書から削除しました。',
-      notFound: '「{word}」は辞書に登録されていません。',
+      removed: '{word} を辞書から削除しました。',
+      notFound: '{word} は辞書に登録されていません。',
       notOwner:
         '他の人が登録した単語は、登録した本人か「サーバーの管理」権限を持つ人だけが変更・削除できます。',
       full: '辞書の登録数が上限（{max}件）に達しています。不要な単語を `/tts dict remove` で削除してください。',

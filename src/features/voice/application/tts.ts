@@ -3,7 +3,6 @@ import {
   type AutocompleteInteraction,
   ChannelType,
   type ChatInputCommandInteraction,
-  escapeMarkdown,
   type Guild,
   type Message,
   MessageFlags,
@@ -13,8 +12,11 @@ import {
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
-import { t, type Locale } from '../../../locales/index.js';
-import { resolveLocale } from '../../../locales/guildLocale.js';
+import { mapDiscordLocale, t, type Locale } from '../../../locales/index.js';
+import {
+  resolveGuildLocale,
+  resolveLocale,
+} from '../../../locales/guildLocale.js';
 import { connectionManager } from '../recording/connectionManager.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 import {
@@ -92,11 +94,25 @@ function formatSpeed(speed: number): string {
 }
 
 /**
- * User text going into an embed. Embeds render markdown, masked links
- * included, and escapeMarkdown leaves those alone unless asked.
+ * Dictionary text shown in a reply: as inline code, where Discord renders no
+ * markdown, so no link or formatting can form from a word, a reading, or the
+ * two together (escaping each value separately cannot stop "[text" in one
+ * and "](url)" in the other from pairing up). Backticks become ˋ so the span
+ * cannot be closed early.
  */
-function md(text: string): string {
-  return escapeMarkdown(text, { maskedLink: true });
+function asCode(text: string): string {
+  return `\`${text.replaceAll('`', 'ˋ')}\``;
+}
+
+/**
+ * An autocomplete choice name within Discord's limit, never ending on half a
+ * surrogate pair.
+ */
+function choiceName(text: string): string {
+  if (text.length <= CHOICE_NAME_MAX) return text;
+  const code = text.charCodeAt(CHOICE_NAME_MAX - 1);
+  const isHighSurrogate = code >= 0xd800 && code <= 0xdbff;
+  return text.slice(0, CHOICE_NAME_MAX - (isHighSurrogate ? 1 : 0));
 }
 
 function humanMembers(channel: VoiceBasedChannel) {
@@ -132,16 +148,16 @@ async function voicesWithin(
 }
 
 /**
- * The credit line VOICEVOX and its characters' terms require
- * ("VOICEVOX:ずんだもん"), for the default voice plus the voices of everyone
- * in the channel now. Falls back to the default character when the engine
- * cannot list its voices.
+ * The characters to credit when reading starts, as VOICEVOX and its
+ * characters' terms require ("VOICEVOX:ずんだもん"): the default voice plus
+ * the voices of everyone in the channel now. Falls back to the default
+ * character when the engine cannot list its voices in time; anyone else is
+ * then credited the first time they are read (see creditOnFirstUse).
  */
-async function voiceCredits(
+async function charactersToCredit(
   client: VoicevoxClient,
-  voiceChannel: VoiceBasedChannel,
-  locale: Locale
-): Promise<string> {
+  voiceChannel: VoiceBasedChannel
+): Promise<Set<string>> {
   const speakerIds = new Set([DEFAULT_SPEAKER_ID]);
   for (const member of humanMembers(voiceChannel).values()) {
     speakerIds.add(
@@ -150,16 +166,70 @@ async function voiceCredits(
   }
 
   const voices = await voicesWithin(client, VOICE_LIST_WAIT_MS);
-  const characters = new Set<string>();
+  const characters = new Set([DEFAULT_CHARACTER]);
   for (const id of speakerIds) {
     const voice = voices.find((v) => v.id === id);
     if (voice) characters.add(voice.character);
   }
-  if (characters.size === 0) characters.add(DEFAULT_CHARACTER);
+  return characters;
+}
 
+function formatCredits(characters: Iterable<string>, locale: Locale): string {
   return new Intl.ListFormat(locale, { type: 'conjunction' }).format(
     [...characters].map((character) => `VOICEVOX:${character}`)
   );
+}
+
+/**
+ * Credit a character the first time a session reads a line in it: members
+ * who joined after the start message, or who changed voice from another
+ * server, are heard in voices that message never named. Posted to the voice
+ * channel's own chat, which every session reads. Best effort.
+ */
+function creditOnFirstUse(
+  guild: Guild,
+  voiceChannelId: string,
+  speakerId: number
+): void {
+  const client = getVoicevoxClient();
+  if (!client) return;
+  const credit = (voices: VoicevoxVoice[]): void => {
+    const character = voices.find((v) => v.id === speakerId)?.character;
+    if (character && ttsSessions.creditCharacter(voiceChannelId, character)) {
+      void postCredit(guild, voiceChannelId, character);
+    }
+  };
+  const cached = client.cachedVoices();
+  if (cached) {
+    credit(cached);
+    return;
+  }
+  void client.listVoices().then(credit, (error: unknown) => {
+    logger.debug(`Could not list VOICEVOX voices: ${getErrorMessage(error)}`);
+  });
+}
+
+async function postCredit(
+  guild: Guild,
+  channelId: string,
+  character: string
+): Promise<void> {
+  try {
+    const channel = guild.channels.cache.get(channelId);
+    if (!channel?.isSendable()) return;
+    const locale = resolveGuildLocale(
+      guild.id,
+      mapDiscordLocale(guild.preferredLocale)
+    );
+    await channel.send({
+      content: t('tts.voice.credit', locale, { character }),
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    logger.debug(
+      `Could not post a voice credit in ${channelId}: ${getErrorMessage(error)}`
+    );
+  }
 }
 
 export async function executeTtsCommand(
@@ -243,6 +313,9 @@ async function handleStart(
 
   // Health check and joining can take longer than Discord's 3s reply window.
   await interaction.deferReply();
+  // Fetch the voice list while checking and joining, so the credits in the
+  // reply below usually have it even right after a restart.
+  void client.listVoices().catch(() => undefined);
 
   if (!(await client.isAvailable())) {
     await replyError(
@@ -305,12 +378,14 @@ async function handleStart(
     interaction.channelId === voiceChannel.id ||
     interaction.appPermissions.has(PermissionFlagsBits.ViewChannel);
 
+  const credited = await charactersToCredit(client, voiceChannel);
   ttsSessions.start({
     guildId: interaction.guildId,
     voiceChannelId: voiceChannel.id,
     // The voice chat is always read; add this channel only if it can be.
     textChannelId: canReadHere ? interaction.channelId : voiceChannel.id,
     startedBy: interaction.user.id,
+    creditedCharacters: credited,
   });
 
   const me = interaction.guild.members.me;
@@ -342,7 +417,7 @@ async function handleStart(
         ],
         // Public on purpose: VOICEVOX requires listeners to see the credit.
         footer: t('tts.credit', locale, {
-          credits: await voiceCredits(client, voiceChannel, locale),
+          credits: formatCredits(credited, locale),
         }),
       }),
     ],
@@ -433,7 +508,9 @@ async function resumeAutoJoin(
   ) {
     return false;
   }
-  await announceBuffering(channel);
+  // Not awaited: a slow or rate-limited post must not hold up the reply past
+  // Discord's 3 s window. announceBuffering catches its own errors.
+  void announceBuffering(channel);
   return true;
 }
 
@@ -540,9 +617,10 @@ async function handleVoice(
       speed,
     });
     // This reply is private, but everyone hears the new voice: credit it
-    // where they can see it.
-    if (speakerId !== current.speakerId) {
-      await announceVoiceChange(interaction, session, voice, locale);
+    // where they can see it - once per character per session, so switching
+    // between styles of one character posts nothing.
+    if (ttsSessions.creditCharacter(session.voiceChannelId, voice.character)) {
+      void announceVoiceChange(interaction, session, voice, locale);
     }
   }
 
@@ -611,7 +689,7 @@ async function handleDictionary(
     const lines: string[] = [];
     let length = 0;
     for (const entry of entries.slice(0, LIST_LIMIT)) {
-      const line = `・${md(entry.word)} → ${md(entry.reading)}`;
+      const line = `・${asCode(entry.word)} → ${asCode(entry.reading)}`;
       if (length + line.length + 1 > LIST_MAX_CHARS) break;
       lines.push(line);
       length += line.length + 1;
@@ -647,7 +725,7 @@ async function handleDictionary(
       await replyError(
         interaction,
         t('common.error', locale),
-        t('tts.dict.notFound', locale, { word: md(word) })
+        t('tts.dict.notFound', locale, { word: asCode(word) })
       );
       return;
     }
@@ -667,7 +745,7 @@ async function handleDictionary(
       embeds: [
         createEmbed({
           title: t('tts.dict.removedTitle', locale),
-          description: t('tts.dict.removed', locale, { word: md(word) }),
+          description: t('tts.dict.removed', locale, { word: asCode(word) }),
           color: COLORS.INFO,
         }),
       ],
@@ -735,8 +813,8 @@ async function handleDictionary(
       createEmbed({
         title: t('tts.dict.addedTitle', locale),
         description: t(exists ? 'tts.dict.updated' : 'tts.dict.added', locale, {
-          word: md(word),
-          reading: md(reading),
+          word: asCode(word),
+          reading: asCode(reading),
         }),
         color: COLORS.SUCCESS,
       }),
@@ -759,7 +837,7 @@ export async function autocompleteTts(
         .filter((voice) => voiceLabel(voice).toLowerCase().includes(query))
         .slice(0, AUTOCOMPLETE_LIMIT)
         .map((voice) => ({
-          name: voiceLabel(voice).slice(0, CHOICE_NAME_MAX),
+          name: choiceName(voiceLabel(voice)),
           value: voice.id,
         }))
     );
@@ -777,7 +855,7 @@ export async function autocompleteTts(
         )
         .slice(0, AUTOCOMPLETE_LIMIT)
         .map((entry) => ({
-          name: `${entry.word} → ${entry.reading}`.slice(0, CHOICE_NAME_MAX),
+          name: choiceName(`${entry.word} → ${entry.reading}`),
           value: entry.word,
         }))
     );
@@ -832,11 +910,13 @@ export async function handleTtsMessage(message: Message): Promise<void> {
   if (!text) return;
 
   const settings = ttsRepository.getUserSettings(message.author.id);
+  const speakerId = settings?.speakerId ?? DEFAULT_SPEAKER_ID;
   ttsSessions.enqueue(session.voiceChannelId, {
     authorId: message.author.id,
     authorName: speakableName(member.displayName, context),
     text,
-    speakerId: settings?.speakerId ?? DEFAULT_SPEAKER_ID,
+    speakerId,
     speed: settings?.speed ?? DEFAULT_SPEED,
   });
+  creditOnFirstUse(message.guild, session.voiceChannelId, speakerId);
 }

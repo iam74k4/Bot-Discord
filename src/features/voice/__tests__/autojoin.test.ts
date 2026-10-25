@@ -36,6 +36,23 @@ const ttsSessions = vi.hoisted(() => ({ get: vi.fn() }));
 
 vi.mock('../tts/sessionManager.js', () => ({ ttsSessions }));
 
+/** VOICEVOX_URL as the command sees it; everything else is the real config. */
+const tts = vi.hoisted(() => ({ url: '' }));
+
+vi.mock('../../../config/index.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../../config/index.js')>();
+  return {
+    ...actual,
+    env: new Proxy(actual.env, {
+      get: (target, property, receiver) =>
+        property === 'VOICEVOX_URL'
+          ? tts.url
+          : Reflect.get(target, property, receiver),
+    }),
+  };
+});
+
 const { executeAutoJoinCommand } = await import('../application/autojoin.js');
 const { voiceSettingsRepository } =
   await import('../repositories/voiceSettingsRepository.js');
@@ -57,12 +74,23 @@ function voiceChannel(id: string, type: ChannelType = ChannelType.GuildVoice) {
   return { id, type };
 }
 
+/** One stand-in VoiceConnection per channel, so calls can be matched. */
+const voiceConnections = new Map<string, { channelId: string }>();
+function connectionOf(channelId: string) {
+  let connection = voiceConnections.get(channelId);
+  if (!connection) {
+    connection = { channelId };
+    voiceConnections.set(channelId, connection);
+  }
+  return connection;
+}
+
 function connectionInfo(
   channelId: string,
   guildId: string,
   receiving?: boolean
 ) {
-  return { channelId, guildId, receiving };
+  return { channelId, guildId, receiving, connection: connectionOf(channelId) };
 }
 
 /** A voice channel's own text chat, as the guild cache returns it. */
@@ -159,6 +187,7 @@ describe('/voice autojoin', () => {
     getConnection.mockReturnValue(undefined);
     disconnect.mockResolvedValue(undefined);
     ttsSessions.get.mockReturnValue(undefined);
+    tts.url = '';
   });
 
   describe('outside a guild', () => {
@@ -223,9 +252,17 @@ describe('/voice autojoin', () => {
       await executeAutoJoinCommand(interaction);
 
       expect(disconnect).toHaveBeenCalledTimes(2);
-      expect(disconnect).toHaveBeenCalledWith('voice-a');
-      expect(disconnect).toHaveBeenCalledWith('voice-b');
-      expect(disconnect).not.toHaveBeenCalledWith('voice-other');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-b',
+        connectionOf('voice-b')
+      );
+      expect(disconnect.mock.calls.map(([id]) => id)).not.toContain(
+        'voice-other'
+      );
     });
 
     it('tells the admin it is off only after every disconnect has finished', async () => {
@@ -314,7 +351,10 @@ describe('/voice autojoin', () => {
       );
 
       expect(disconnect).toHaveBeenCalledTimes(1);
-      expect(disconnect).toHaveBeenCalledWith('voice-9');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-9',
+        connectionOf('voice-9')
+      );
     });
 
     it('confirms the exclusion only after the bot has actually left', async () => {
@@ -453,7 +493,10 @@ describe('/voice autojoin', () => {
 
       // Privacy wins over reading: the listening connection goes.
       expect(disconnect).toHaveBeenCalledTimes(1);
-      expect(disconnect).toHaveBeenCalledWith('voice-a');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
       expect(replyEmbed(interaction).description).toBe(
         `${t('record.autojoin.disabled', 'en')}\n\n${t(
           'record.autojoin.readingStopped',
@@ -480,7 +523,10 @@ describe('/voice autojoin', () => {
 
       await executeAutoJoinCommand(interaction);
 
-      expect(disconnect).toHaveBeenCalledWith('voice-a');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
       expect(replyEmbed(interaction).description).toBe(
         `${t('record.autojoin.excluded', 'en', { channel: 'voice-a' })}\n\n${t(
           'record.autojoin.readingStopped',
@@ -502,7 +548,10 @@ describe('/voice autojoin', () => {
 
       await executeAutoJoinCommand(interaction);
 
-      expect(disconnect).toHaveBeenCalledWith('voice-a');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
       expect(chat.send).not.toHaveBeenCalled();
       expect(replyEmbed(interaction).description).toBe(
         t('record.autojoin.excluded', 'en', { channel: 'voice-a' })
@@ -530,11 +579,89 @@ describe('/voice autojoin', () => {
 
       await executeAutoJoinCommand(interaction);
 
-      expect(disconnect).toHaveBeenCalledWith('voice-a');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
       expect(replyEmbed(interaction).description).toContain(
         t('record.autojoin.readingStopped', 'en', { channel: 'voice-a' })
       );
     });
+  });
+
+  describe('opt-out timing', () => {
+    it.each(['disable', 'exclude'])(
+      '%s stops buffering and replies even while the notice never goes out',
+      async (subcommand) => {
+        const info = connectionInfo('voice-a', GUILD, true);
+        getAllConnections.mockReturnValue(new Map([['voice-a', info]]));
+        getConnection.mockReturnValue(info);
+        ttsSessions.get.mockReturnValue({ voiceChannelId: 'voice-a' });
+        const order: string[] = [];
+        disconnect.mockImplementation(async () => {
+          order.push('disconnect');
+        });
+        const chat = {
+          isSendable: () => true,
+          send: vi.fn(() => {
+            order.push('send');
+            return new Promise(() => undefined);
+          }),
+        };
+        const interaction = createInteraction({
+          subcommand,
+          channel: voiceChannel('voice-a'),
+          channels: { 'voice-a': chat },
+        });
+
+        await executeAutoJoinCommand(interaction);
+
+        // The opt-out takes effect before anything is posted, and the
+        // reply does not wait for the post.
+        expect(order).toEqual(['disconnect', 'send']);
+        expect(disconnect).toHaveBeenCalledWith(
+          'voice-a',
+          connectionOf('voice-a')
+        );
+        expect(replyEmbed(interaction).description).toContain(
+          t('record.autojoin.readingStopped', 'en', { channel: 'voice-a' })
+        );
+      }
+    );
+  });
+
+  describe('mentioning text-to-speech', () => {
+    it.each<['en' | 'ja', string, string]>([
+      ['en', 'en-US', 'disable'],
+      ['ja', 'ja', 'disable'],
+      ['en', 'en-US', 'exclude'],
+      ['ja', 'ja', 'exclude'],
+    ])(
+      'says /tts start still reads only when text-to-speech is set up (%s, %s)',
+      async (locale, discordLocale, subcommand) => {
+        const base =
+          subcommand === 'disable'
+            ? t('record.autojoin.disabled', locale)
+            : t('record.autojoin.excluded', locale, { channel: 'voice-9' });
+        const run = async () => {
+          const interaction = createInteraction({
+            subcommand,
+            locale: discordLocale,
+            channel: voiceChannel('voice-9'),
+          });
+          await executeAutoJoinCommand(interaction);
+          return replyEmbed(interaction).description;
+        };
+
+        tts.url = '';
+        expect(await run()).toBe(base);
+
+        tts.url = 'http://voicevox.railway.internal:50021';
+        expect(await run()).toBe(
+          `${base} ${t('record.autojoin.ttsStillReads', locale)}`
+        );
+      }
+    );
   });
 
   describe('include', () => {

@@ -333,6 +333,7 @@ export interface TranslationKeys {
       currentChannelNotKept: string;
       currentChannelNone: string;
       readingStopped: string;
+      ttsStillReads: string;
     };
     notice: {
       title: string;

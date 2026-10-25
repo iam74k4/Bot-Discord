@@ -290,19 +290,33 @@ describe('VoiceConnectionManager (text-to-speech support)', () => {
       });
     });
 
-    it('reads selfDeaf when the deferred change applies', async () => {
+    it('keeps the deafen state from whether it receives, not from joinConfig', async () => {
       const { connection, fireOnce } = await join(manager, undefined, {
         status: 'connecting',
       });
       manager.setSelfMute('vc-1', true);
 
+      // A late voice-state update from an older deafened state rewrote it.
       connection.joinConfig.selfDeaf = true;
       fireOnce('ready');
 
       expect(connection.rejoin).toHaveBeenCalledWith({
         channelId: 'vc-1',
-        selfDeaf: true,
+        selfDeaf: false,
         selfMute: true,
+      });
+    });
+
+    it('stays deafened for a reading-only connection', async () => {
+      const { connection } = await join(manager, { receive: false });
+      connection.joinConfig.selfDeaf = false;
+
+      manager.setSelfMute('vc-1', false);
+
+      expect(connection.rejoin).toHaveBeenCalledWith({
+        channelId: 'vc-1',
+        selfDeaf: true,
+        selfMute: false,
       });
     });
   });

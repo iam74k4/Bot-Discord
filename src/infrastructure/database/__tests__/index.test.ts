@@ -125,7 +125,8 @@ const DOCUMENTED_SCHEMA: Record<string, TableShape> = {
   tts_dictionary: {
     columns: {
       guild_id: col('TEXT', { notNull: true, pk: 1 }),
-      word: col('TEXT', { notNull: true, pk: 2 }),
+      word_key: col('TEXT', { notNull: true, pk: 2 }),
+      word: col('TEXT', { notNull: true }),
       reading: col('TEXT', { notNull: true }),
       created_by: col('TEXT', { notNull: true }),
       created_at: col('INTEGER', { notNull: true }),

@@ -244,8 +244,9 @@ are gone — use `/community poll end` to close a short poll when you are done.
 - WAV format output at 48kHz/16bit/mono (~27.5MB for 5 minutes)
 - Private delivery: Recording responses and files are sent ephemerally
 - Automatic file cleanup after `RECORDING_RETENTION_HOURS` (default: 24 hours)
-- Memory monitoring against `MEMORY_LIMIT_MB` (RSS), disconnecting the oldest
-  connections when usage passes 85% of the budget
+- Memory monitoring against `MEMORY_LIMIT_MB` (RSS): when usage passes 85% of
+  the budget, connections holding audio buffers are disconnected first (oldest
+  first), and text-to-speech-only joins last
 
 **Notes:**
 
@@ -279,7 +280,11 @@ Available when the bot operator sets `VOICEVOX_URL` (see
   of quiet), so listeners know who is talking
 - URLs, code blocks, spoilers, and long messages are summarised (`URL省略`,
   `コード省略`, `ネタバレ`, `以下略`); mentions and custom emoji are read as
-  names, other emoji are dropped, and trailing `www` is read as laughter
+  names, other emoji are dropped, and trailing `www` is read as laughter.
+  Fullwidth and halfwidth forms are read as their plain form (`ＡＢＣ` as ABC,
+  `ｶﾀｶﾅ` as カタカナ)
+- Dictionary words match however they are typed: `alice`, `ALICE` and
+  `ａｌｉｃｅ` are one word, with one owner
 - Each member picks their own voice; it follows them across servers
 - Anyone can start reading or add dictionary words; only members in the
   channel being read (or with Manage Server) can stop or skip, and only the
@@ -291,9 +296,11 @@ Available when the bot operator sets `VOICEVOX_URL` (see
 - Stage channels are not supported: the bot would join as a listener and could
   not be heard. In a text channel the bot cannot view, only the voice
   channel's own chat is read, and `/tts start` says so
-- Credits: the public `/tts start` message names the VOICEVOX voices in use
-  (for example `VOICEVOX:ずんだもん`, the default), and switching voice during a
-  session posts the new voice's credit; each character's own terms apply
+- Credits: the public `/tts start` message names the VOICEVOX voices of the
+  people in the channel (for example `VOICEVOX:ずんだもん`, the default). Any
+  other character - someone who joins later, or switches voice, even from
+  another server - is credited in the voice channel's chat the first time it
+  is read in that session. Each character's own terms apply
 
 ### Memory
 
