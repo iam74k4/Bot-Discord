@@ -7,7 +7,7 @@ import {
   type ChatInputCommandInteraction,
   type PermissionResolvable,
 } from 'discord.js';
-import { vi } from 'vitest';
+import { vi, type Mock } from 'vitest';
 import type { CommandHelp } from '../../../shared/help/catalog.js';
 import type { Command, SlashCommandData } from '../../../shared/types/index.js';
 
@@ -85,7 +85,14 @@ function asker(options: AskerOptions) {
  * that can host a component collector. The collector's callbacks are
  * captured so a test can fire components and the timeout by hand.
  */
-export function panelReply() {
+export interface PanelReply {
+  reply: Mock;
+  createMessageComponentCollector: Mock;
+  collect(component: unknown): Promise<void>;
+  end(): Promise<void>;
+}
+
+export function panelReply(): PanelReply {
   const listeners = new Map<string, Listener>();
   const createMessageComponentCollector = vi.fn(() => ({
     on: (event: string, listener: Listener) => {
@@ -181,8 +188,21 @@ export function autocompleteInteraction(
   return { interaction, respond };
 }
 
+export interface HelpComponent {
+  user: { id: string };
+  customId: string;
+  values: string[];
+  isStringSelectMenu: () => boolean;
+  update: Mock;
+  reply: Mock;
+  deferUpdate: Mock;
+}
+
 /** A component interaction arriving on the help panel's collector. */
-export function selectComponent(values: string[], userId = USER_ID) {
+export function selectComponent(
+  values: string[],
+  userId = USER_ID
+): HelpComponent {
   return {
     user: { id: userId },
     customId: 'help_category',
@@ -195,7 +215,7 @@ export function selectComponent(values: string[], userId = USER_ID) {
 }
 
 /** A non-select component (e.g. a stray button) on the same message. */
-export function buttonComponent(userId = USER_ID) {
+export function buttonComponent(userId = USER_ID): HelpComponent {
   return {
     ...selectComponent([], userId),
     customId: 'help_button',
