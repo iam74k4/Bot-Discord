@@ -8,6 +8,8 @@ export const ja: TranslationKeys = {
     error: 'エラー',
     warning: '警告',
     guildOnly: 'このコマンドはサーバー内でのみ使用できます。',
+    guildNotAllowed:
+      'この Bot はこのサーバーでは利用できない設定になっています。',
     noPermission: 'このコマンドを使用する権限がありません。',
     noData: 'データなし',
     unexpectedError: 'コマンドの実行中に予期しないエラーが発生しました。',
