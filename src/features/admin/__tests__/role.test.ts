@@ -1,10 +1,12 @@
 import Database from 'better-sqlite3';
 import {
   Collection,
+  DiscordAPIError,
   GuildMember,
   MessageFlags,
   PermissionFlagsBits,
   PermissionsBitField,
+  RESTJSONErrorCodes,
   type ChatInputCommandInteraction,
 } from 'discord.js';
 import {
@@ -48,16 +50,36 @@ vi.mock('../../../shared/utils/logger.js', () => ({
 const { executeRoleCommand } = await import('../application/role.js');
 const { t } = await import('../../../locales/index.js');
 const { logger } = await import('../../../shared/utils/logger.js');
+const { COLORS } = await import('../../../shared/utils/constants/index.js');
+const { formatPermissionNames } =
+  await import('../../../shared/utils/discord.js');
 
 const ACTOR_ID = 'mod-1';
 const TARGET_ID = 'member-1';
 const OWNER_ID = 'owner-1';
 const ROLE = { id: 'role-helper', name: 'Helper', position: 5 };
+/** The name the bot's role goes by in Server Settings → Roles. */
+const BOT_ROLE = 'Helper Bot';
+
+/** What the members-without-Manage-Roles refusal says. */
+const MISSING_MANAGE_ROLES = t('common.permissionsRequired', 'en', {
+  permissions: formatPermissionNames(PermissionFlagsBits.ManageRoles, 'en'),
+});
+
+/** Audit details are written once, in the server's language (ja here). */
+function roleDetails(role: { id: string; name: string } = ROLE): string {
+  return t('audit.details.role', 'ja', {
+    roleId: role.id,
+    roleName: role.name,
+  });
+}
 
 interface Scenario {
   subcommand?: 'add' | 'remove';
   /** Positions of each party's highest role. `bot: null` = bot not cached. */
   bot?: number | null;
+  /** The bot's server-wide permissions; unset = unknown (left to Discord). */
+  botPermissions?: bigint[];
   actor?: number;
   target?: number;
   role?: { id: string; name: string; position: number; managed?: boolean };
@@ -83,19 +105,31 @@ function memberStub(
   id: string,
   highest: number,
   guild: unknown,
-  extra: { roleIds?: string[]; add?: Mock; remove?: Mock } = {}
+  extra: {
+    roleIds?: string[];
+    add?: Mock;
+    remove?: Mock;
+    displayName?: string;
+    highestName?: string;
+    permissions?: bigint[];
+  } = {}
 ): GuildMember {
   const roleIds = new Set(extra.roleIds ?? []);
-  const member = {
+  const member: Record<string, unknown> = {
     id,
     guild,
+    displayName: extra.displayName ?? id,
     roles: {
-      highest: { position: highest },
+      highest: { position: highest, name: extra.highestName ?? 'Top' },
       cache: { has: (roleId: string) => roleIds.has(roleId) },
       add: extra.add ?? vi.fn().mockResolvedValue(undefined),
       remove: extra.remove ?? vi.fn().mockResolvedValue(undefined),
     },
   };
+  // Own properties shadow GuildMember's getters, which need a full client.
+  if (extra.permissions) {
+    member.permissions = new PermissionsBitField(extra.permissions);
+  }
   Object.setPrototypeOf(member, GuildMember.prototype);
   return member as unknown as GuildMember;
 }
@@ -125,6 +159,7 @@ function setup(s: Scenario = {}) {
           roleIds: s.targetHasRole ? [role.id] : [],
           add: rolesAdd,
           remove: rolesRemove,
+          displayName: 'Member *One*',
         });
   if (targetId === ACTOR_ID) {
     Object.assign(target.roles, {
@@ -147,7 +182,13 @@ function setup(s: Scenario = {}) {
     throw new Error('Unknown Member');
   });
   guild.members = {
-    me: s.bot === null ? null : memberStub('bot', s.bot ?? 20, guild),
+    me:
+      s.bot === null
+        ? null
+        : memberStub('bot', s.bot ?? 20, guild, {
+            highestName: BOT_ROLE,
+            permissions: s.botPermissions,
+          }),
     fetch,
   };
 
@@ -203,20 +244,25 @@ describe('executeRoleCommand', () => {
 
       await executeRoleCommand(interaction);
 
-      expect(replyEmbed(reply).description).toBe(t('common.guildOnly', 'en'));
+      const embed = replyEmbed(reply);
+      expect(embed.title).toBe(t('common.serverOnlyTitle', 'en'));
+      expect(embed.description).toBe(t('common.guildOnly', 'en'));
       expect(rolesAdd).not.toHaveBeenCalled();
     });
 
-    it('requires Manage Roles', async () => {
+    it('requires Manage Roles, named the way Discord names it', async () => {
       const { interaction, reply, rolesAdd, fetch } = setup({
         permissions: new PermissionsBitField(PermissionFlagsBits.ManageGuild),
       });
 
       await executeRoleCommand(interaction);
 
-      expect(replyEmbed(reply).description).toBe(
-        t('admin.role.errors.noPermission', 'en')
-      );
+      const embed = replyEmbed(reply);
+      expect(embed.title).toBe(t('common.permissionDeniedTitle', 'en'));
+      expect(embed.description).toBe(MISSING_MANAGE_ROLES);
+      expect(embed.description).toContain('Manage Roles');
+      // Not something that went wrong: a warning, not an error.
+      expect(embed.color).toBe(COLORS.WARNING);
       expect(fetch).not.toHaveBeenCalled();
       expect(rolesAdd).not.toHaveBeenCalled();
     });
@@ -226,9 +272,7 @@ describe('executeRoleCommand', () => {
 
       await executeRoleCommand(interaction);
 
-      expect(replyEmbed(reply).description).toBe(
-        t('admin.role.errors.noPermission', 'en')
-      );
+      expect(replyEmbed(reply).description).toBe(MISSING_MANAGE_ROLES);
     });
 
     it('denies when member permissions arrive unresolved', async () => {
@@ -236,9 +280,20 @@ describe('executeRoleCommand', () => {
 
       await executeRoleCommand(interaction);
 
-      expect(replyEmbed(reply).description).toBe(
-        t('admin.role.errors.noPermission', 'en')
-      );
+      expect(replyEmbed(reply).description).toBe(MISSING_MANAGE_ROLES);
+    });
+
+    it('accepts the permissions Discord sent with the interaction', async () => {
+      const { interaction, rolesAdd } = setup({ member: null });
+      Object.assign(interaction, {
+        memberPermissions: new PermissionsBitField(
+          PermissionFlagsBits.ManageRoles
+        ),
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
     });
 
     it.each([
@@ -261,27 +316,49 @@ describe('executeRoleCommand', () => {
       ['below', 4],
       ['level with', 5],
     ])(
-      "rejects a role when the bot's highest role is %s it",
+      "rejects a role when the bot's highest role is %s it, saying what to drag where",
       async (_case, bot) => {
         const { interaction, reply, rolesAdd } = setup({ bot });
 
         await executeRoleCommand(interaction);
 
         expect(replyEmbed(reply).description).toBe(
-          t('admin.role.errors.botRoleHierarchy', 'en')
+          t('admin.role.errors.botRoleHierarchy', 'en', {
+            role: ROLE.name,
+            botRole: BOT_ROLE,
+          })
         );
         expect(rolesAdd).not.toHaveBeenCalled();
       }
     );
 
-    it('rejects when the bot member is not cached', async () => {
-      const { interaction, reply } = setup({ bot: null });
+    it("names the bot's own managed role when Discord reports one", async () => {
+      const { interaction, reply } = setup({ bot: 4 });
+      const me = interaction.guild!.members.me!;
+      Object.assign(me.roles, { botRole: { name: 'Helper Bot (managed)' } });
 
       await executeRoleCommand(interaction);
 
       expect(replyEmbed(reply).description).toBe(
-        t('admin.role.errors.botRoleHierarchy', 'en')
+        t('admin.role.errors.botRoleHierarchy', 'en', {
+          role: ROLE.name,
+          botRole: 'Helper Bot (managed)',
+        })
       );
+    });
+
+    it('rejects when the bot member is not cached', async () => {
+      const { interaction, reply, rolesAdd } = setup({ bot: null });
+
+      await executeRoleCommand(interaction);
+
+      expect(replyEmbed(reply).description).toBe(
+        t('admin.role.errors.botRoleHierarchy', 'en', {
+          role: ROLE.name,
+          botRole: 'Bot',
+        })
+      );
+      expect(rolesAdd).not.toHaveBeenCalled();
     });
 
     it('rejects a role that is not in the guild role cache', async () => {
@@ -290,8 +367,38 @@ describe('executeRoleCommand', () => {
       await executeRoleCommand(interaction);
 
       expect(replyEmbed(reply).description).toBe(
-        t('admin.role.errors.botRoleHierarchy', 'en')
+        t('admin.role.errors.botRoleHierarchy', 'en', {
+          role: ROLE.name,
+          botRole: BOT_ROLE,
+        })
       );
+    });
+  });
+
+  describe('bot permission', () => {
+    it('says the bot lacks Manage Roles before Discord is asked', async () => {
+      const { interaction, reply, rolesAdd } = setup({
+        botPermissions: [PermissionFlagsBits.SendMessages],
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(replyEmbed(reply).description).toBe(
+        t('admin.role.errors.botMissingManageRoles', 'en', {
+          botRole: BOT_ROLE,
+        })
+      );
+      expect(rolesAdd).not.toHaveBeenCalled();
+    });
+
+    it('goes ahead when the bot holds Manage Roles', async () => {
+      const { interaction, rolesAdd } = setup({
+        botPermissions: [PermissionFlagsBits.ManageRoles],
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
     });
   });
 
@@ -411,17 +518,14 @@ describe('executeRoleCommand', () => {
   });
 
   /**
-   * KNOWN BUG (role.ts checkActorCanManageRole / checkActorCanManageMember):
-   * the guild owner passes the Manage Roles check (Discord resolves the owner
-   * as having every permission) but is then held to the actor hierarchy
-   * checks, which compare role positions with no `executor.id ===
-   * guild.ownerId` shortcut. An owner whose highest role is low gets refused
-   * for roles and members Discord itself lets them manage. Over-restrictive,
-   * not a privilege escalation. `it.fails` keeps the suite green until the
-   * fix lands; then these start failing and should become a plain `it`.
+   * Regression: the guild owner passes the Manage Roles check (Discord
+   * resolves the owner as having every permission) but used to be held to
+   * the actor hierarchy checks too, so an owner whose own highest role is low
+   * was refused roles and members Discord itself lets them manage. Only the
+   * bot's limits apply to the owner.
    */
   describe('guild owner as actor', () => {
-    it.fails.each([
+    it.each([
       ['a role above their own highest role', { actor: 0, target: 0 }],
       ['a role to a member ranked above them', { actor: 10, target: 15 }],
     ])('may grant %s', async (_case, positions) => {
@@ -434,22 +538,36 @@ describe('executeRoleCommand', () => {
 
       expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
     });
+
+    it('still cannot reach past the bot', async () => {
+      const { interaction, reply, rolesAdd } = setup({
+        ownerId: ACTOR_ID,
+        actor: 0,
+        bot: 20,
+        target: 25,
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(replyEmbed(reply).description).toBe(
+        t('admin.role.errors.botTargetMemberHierarchy', 'en')
+      );
+      expect(rolesAdd).not.toHaveBeenCalled();
+    });
   });
 
   /**
-   * KNOWN BUG (role.ts executeRoleCommand): nothing checks `role.managed`
-   * (bot/integration/booster roles Discord never lets anyone assign) or stops
-   * removing @everyone (id = guild id, which discord.js always reports as
-   * held). Both reach `member.roles.add/remove`, Discord rejects them, and the
-   * moderator gets the generic "failed" reply plus an error log instead of a
-   * clear refusal. `it.fails` keeps the suite green until the fix lands; then
-   * these start failing and should become a plain `it`.
+   * Regression: nothing used to check `role.managed` (bot/integration/booster
+   * roles Discord never lets anyone assign) or stop removing @everyone (id =
+   * guild id, which discord.js always reports as held). Both reached
+   * `member.roles.add/remove`, Discord rejected them, and the moderator got
+   * the generic "failed" reply plus an error log instead of a clear refusal.
    */
   describe('roles Discord never lets anyone assign', () => {
-    it.fails.each(['add', 'remove'] as const)(
+    it.each(['add', 'remove'] as const)(
       'refuses to %s a managed role before calling Discord',
       async (subcommand) => {
-        const { interaction, rolesAdd, rolesRemove } = setup({
+        const { interaction, reply, rolesAdd, rolesRemove } = setup({
           subcommand,
           role: { ...ROLE, managed: true },
           targetHasRole: subcommand === 'remove',
@@ -459,20 +577,44 @@ describe('executeRoleCommand', () => {
 
         expect(rolesAdd).not.toHaveBeenCalled();
         expect(rolesRemove).not.toHaveBeenCalled();
+        expect(replyEmbed(reply).description).toBe(
+          t('admin.role.errors.managedRole', 'en', { role: ROLE.name })
+        );
+        expect(logger.error).not.toHaveBeenCalled();
       }
     );
 
-    it.fails('refuses to remove @everyone before calling Discord', async () => {
-      const everyone = { id: GUILD_ID, name: '@everyone', position: 0 };
-      const { interaction, rolesRemove } = setup({
-        subcommand: 'remove',
-        role: everyone,
-        targetHasRole: true,
+    it.each(['add', 'remove'] as const)(
+      'refuses to %s @everyone before calling Discord',
+      async (subcommand) => {
+        const everyone = { id: GUILD_ID, name: '@everyone', position: 0 };
+        const { interaction, reply, rolesAdd, rolesRemove } = setup({
+          subcommand,
+          role: everyone,
+          targetHasRole: true,
+        });
+
+        await executeRoleCommand(interaction);
+
+        expect(rolesAdd).not.toHaveBeenCalled();
+        expect(rolesRemove).not.toHaveBeenCalled();
+        expect(replyEmbed(reply).description).toBe(
+          t('admin.role.errors.everyoneRole', 'en')
+        );
+      }
+    );
+
+    it('refuses a managed role even before the bot permission is checked', async () => {
+      const { interaction, reply } = setup({
+        role: { ...ROLE, managed: true },
+        botPermissions: [],
       });
 
       await executeRoleCommand(interaction);
 
-      expect(rolesRemove).not.toHaveBeenCalled();
+      expect(replyEmbed(reply).description).toBe(
+        t('admin.role.errors.managedRole', 'en', { role: ROLE.name })
+      );
     });
   });
 
@@ -485,51 +627,49 @@ describe('executeRoleCommand', () => {
       expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
       const embed = replyEmbed(reply);
       expect(embed.title).toBe(t('admin.role.add.success', 'en'));
+      // Mentions plus the server display name, not the account tag; the
+      // name is escaped so markdown in it cannot restyle the reply.
       expect(embed.description).toBe(
         t('admin.role.add.successDesc', 'en', {
-          user: 'Member#0001',
-          role: 'Helper',
+          userId: TARGET_ID,
+          displayName: 'Member \\*One\\*',
+          roleId: ROLE.id,
         })
       );
+      expect(embed.description).toContain(`<@&${ROLE.id}>`);
       expect(auditRows(db)).toEqual([
         {
           action: 'ROLE_ADD',
           user_id: ACTOR_ID,
           target_id: TARGET_ID,
-          details: 'Role: Helper (role-helper)',
+          details: roleDetails(),
         },
       ]);
     });
 
-    // KNOWN BUG (reported, role.ts): the confirmation reply sits in the same
-    // `try` as the role change, so when Discord rejects the confirmation after
-    // the role was granted, the moderator is told "Failed to modify role."
-    // and a retry then says the member already has it. `it.fails` until the
-    // reply is outside that `try`; then change it to `it`.
-    it.fails(
-      'does not report a granted role as failed when only the confirmation is lost',
-      async () => {
-        const reply = vi
-          .fn()
-          .mockRejectedValueOnce(new Error('Unknown interaction'))
-          .mockResolvedValue({});
-        const { interaction, editReply, rolesAdd } = setup({
-          subcommand: 'add',
-          reply,
-        });
+    // Regression: the confirmation used to share a `try` with the role change,
+    // so a lost confirmation reported a granted role as failed.
+    it('does not report a granted role as failed when only the confirmation is lost', async () => {
+      const reply = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('Unknown interaction'))
+        .mockResolvedValue({});
+      const { interaction, editReply, rolesAdd } = setup({
+        subcommand: 'add',
+        reply,
+      });
 
-        await executeRoleCommand(interaction).catch(() => undefined);
+      await executeRoleCommand(interaction).catch(() => undefined);
 
-        expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
-        const failed = t('admin.role.errors.failed', 'en');
-        const described = [...reply.mock.calls, ...editReply.mock.calls].map(
-          ([payload]) =>
-            (payload as { embeds?: Array<{ data?: { description?: string } }> })
-              .embeds?.[0]?.data?.description
-        );
-        expect(described).not.toContain(failed);
-      }
-    );
+      expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
+      const failed = t('admin.role.errors.failed', 'en');
+      const described = [...reply.mock.calls, ...editReply.mock.calls].map(
+        ([payload]) =>
+          (payload as { embeds?: Array<{ data?: { description?: string } }> })
+            .embeds?.[0]?.data?.description
+      );
+      expect(described).not.toContain(failed);
+    });
 
     it('warns instead of calling Discord when the member already has it', async () => {
       const { interaction, reply, rolesAdd } = setup({
@@ -542,28 +682,11 @@ describe('executeRoleCommand', () => {
       expect(rolesAdd).not.toHaveBeenCalled();
       const embed = replyEmbed(reply);
       expect(embed.title).toBe(t('common.warning', 'en'));
+      expect(embed.color).toBe(COLORS.WARNING);
       expect(embed.description).toBe(
         t('admin.role.errors.alreadyHasRole', 'en')
       );
       expect(auditRows(db)).toEqual([]);
-    });
-
-    it('never asks Discord to grant @everyone', async () => {
-      // discord.js keeps the @everyone role (id = guild id) in every member's
-      // role cache, so it always reads as already held.
-      const everyone = { id: GUILD_ID, name: '@everyone', position: 0 };
-      const { interaction, reply, rolesAdd } = setup({
-        subcommand: 'add',
-        role: everyone,
-        targetHasRole: true,
-      });
-
-      await executeRoleCommand(interaction);
-
-      expect(rolesAdd).not.toHaveBeenCalled();
-      expect(replyEmbed(reply).description).toBe(
-        t('admin.role.errors.alreadyHasRole', 'en')
-      );
     });
   });
 
@@ -581,8 +704,9 @@ describe('executeRoleCommand', () => {
       expect(embed.title).toBe(t('admin.role.remove.success', 'en'));
       expect(embed.description).toBe(
         t('admin.role.remove.successDesc', 'en', {
-          user: 'Member#0001',
-          role: 'Helper',
+          userId: TARGET_ID,
+          displayName: 'Member \\*One\\*',
+          roleId: ROLE.id,
         })
       );
       expect(auditRows(db)).toEqual([
@@ -590,9 +714,25 @@ describe('executeRoleCommand', () => {
           action: 'ROLE_REMOVE',
           user_id: ACTOR_ID,
           target_id: TARGET_ID,
-          details: 'Role: Helper (role-helper)',
+          details: roleDetails(),
         },
       ]);
+    });
+
+    it('writes the audit details in English on a server set to English', async () => {
+      db.prepare(
+        "INSERT INTO guild_settings (guild_id, language, created_at, updated_at) VALUES (?, 'en', 0, 0)"
+      ).run(GUILD_ID);
+      const { interaction } = setup({
+        subcommand: 'remove',
+        targetHasRole: true,
+      });
+
+      await executeRoleCommand(interaction);
+
+      expect(auditRows(db)[0]?.details).toBe(
+        t('audit.details.role', 'en', { roleId: ROLE.id, roleName: 'Helper' })
+      );
     });
 
     it('warns instead of calling Discord when the member lacks it', async () => {
@@ -604,7 +744,9 @@ describe('executeRoleCommand', () => {
       await executeRoleCommand(interaction);
 
       expect(rolesRemove).not.toHaveBeenCalled();
-      expect(replyEmbed(reply).description).toBe(
+      const embed = replyEmbed(reply);
+      expect(embed.color).toBe(COLORS.WARNING);
+      expect(embed.description).toBe(
         t('admin.role.errors.doesNotHaveRole', 'en')
       );
     });
@@ -639,42 +781,55 @@ describe('executeRoleCommand', () => {
       }
     );
 
-    it('edits the reply when the interaction was already answered', async () => {
-      const { interaction, reply, editReply } = setup({
-        rolesAdd: vi.fn().mockRejectedValue(apiError),
-        replied: true,
+    it('names the missing bot permission when Discord says so', async () => {
+      const missingPermissions = new DiscordAPIError(
+        {
+          code: RESTJSONErrorCodes.MissingPermissions,
+          message: 'Missing Permissions',
+        },
+        RESTJSONErrorCodes.MissingPermissions,
+        403,
+        'PUT',
+        '/guilds/guild-1/members/member-1/roles/role-helper',
+        {}
+      );
+      const { interaction, reply } = setup({
+        rolesAdd: vi.fn().mockRejectedValue(missingPermissions),
       });
 
       await executeRoleCommand(interaction);
 
-      expect(reply).not.toHaveBeenCalled();
-      expect(
-        embedAt(payloadOf<{ embeds: unknown[] }>(editReply)).description
-      ).toBe(t('admin.role.errors.failed', 'en'));
+      expect(replyEmbed(reply).description).toBe(
+        t('admin.role.errors.botMissingManageRoles', 'en', {
+          botRole: BOT_ROLE,
+        })
+      );
+      expect(auditRows(db)).toEqual([]);
     });
 
-    it('does not throw when editing the error into an answered reply fails', async () => {
-      const { interaction, editReply } = setup({
-        rolesAdd: vi.fn().mockRejectedValue(apiError),
-        replied: true,
-      });
-      editReply.mockRejectedValue(new Error('Unknown Message'));
-
-      await expect(executeRoleCommand(interaction)).resolves.toBeUndefined();
-
-      expect(editReply).toHaveBeenCalledTimes(1);
-    });
-
-    it('does not throw when the success reply itself fails', async () => {
-      // The role was changed; a failed confirmation falls into the error path,
-      // whose own reply failing must be swallowed rather than crash the handler.
-      const reply = vi.fn().mockRejectedValue(new Error('Unknown interaction'));
+    /**
+     * Regression: the confirmation reply used to sit in the same `try` as the
+     * role change, so a lost confirmation was reported as "Failed to modify
+     * role." although the change went through (and was audited), and a retry
+     * then said the member already had the role. Now only the change is
+     * guarded; a failed confirmation reaches the router like any other
+     * command's.
+     */
+    it('lets a lost confirmation reach the router instead of reporting a failed change', async () => {
+      const lost = new Error('Unknown interaction');
+      const reply = vi.fn().mockRejectedValue(lost);
       const { interaction, rolesAdd } = setup({ reply });
 
-      await expect(executeRoleCommand(interaction)).resolves.toBeUndefined();
+      await expect(executeRoleCommand(interaction)).rejects.toBe(lost);
 
       expect(rolesAdd).toHaveBeenCalledTimes(1);
-      expect(reply).toHaveBeenCalledTimes(2);
+      // One attempt only: nothing claims the change failed.
+      expect(reply).toHaveBeenCalledTimes(1);
+      expect(embedAt(payloadOf<{ embeds: unknown[] }>(reply)).title).toBe(
+        t('admin.role.add.success', 'en')
+      );
+      expect(auditRows(db).map((row) => row.action)).toEqual(['ROLE_ADD']);
+      expect(logger.error).not.toHaveBeenCalled();
     });
   });
 });

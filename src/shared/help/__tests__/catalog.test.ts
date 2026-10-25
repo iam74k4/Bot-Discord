@@ -1,7 +1,11 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
+import {
+  InteractionContextType,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+} from 'discord.js';
 import type { Command } from '../../types/command.js';
 import { discoverFeatureCommands } from '../../../app/interactions/commandRegistry.js';
 import { buildHelpCatalog, type CommandCategory } from '../catalog.js';
@@ -173,6 +177,92 @@ describe('buildHelpCatalog', () => {
     expect(categories[0].commands.map((c) => c.name)).toEqual(['a', 'b']);
   });
 
+  it('gives each subcommand entry its command’s description, for search', () => {
+    const [category] = buildHelpCatalog([
+      command({
+        data: new SlashCommandBuilder()
+          .setName('community')
+          .setDescription('Polls and roulette')
+          .setDescriptionLocalizations({ ja: '投票とルーレット' })
+          .addSubcommand((sub) => sub.setName('poll').setDescription('p')),
+        help: { category: { en: 'Demo', ja: 'デモ' } },
+      }),
+      command({
+        data: new SlashCommandBuilder().setName('solo').setDescription('s'),
+        help: { category: { en: 'Demo', ja: 'デモ' } },
+      }),
+    ]);
+
+    expect(category.commands[0].commandDescription).toEqual({
+      en: 'Polls and roulette',
+      ja: '投票とルーレット',
+    });
+    // A command without subcommands is its own entry already.
+    expect(category.commands[1]).not.toHaveProperty('commandDescription');
+  });
+
+  it('attaches declared keywords to the entry they name', () => {
+    const [category] = buildHelpCatalog([
+      command({
+        data: new SlashCommandBuilder()
+          .setName('voice')
+          .setDescription('v')
+          .addSubcommand((sub) => sub.setName('record').setDescription('r'))
+          .addSubcommand((sub) => sub.setName('status').setDescription('s')),
+        help: {
+          category: { en: 'Demo', ja: 'デモ' },
+          keywords: { 'voice record': [{ ja: '録音', en: 'recording' }] },
+        },
+      }),
+    ]);
+
+    expect(category.commands[0].keywords).toEqual([
+      { ja: '録音', en: 'recording' },
+    ]);
+    expect(category.commands[1]).not.toHaveProperty('keywords');
+  });
+
+  it.each([
+    [
+      'contexts without the bot DM',
+      new SlashCommandBuilder()
+        .setName('g')
+        .setDescription('g')
+        .setContexts(InteractionContextType.Guild),
+      true,
+    ],
+    [
+      'contexts that include the bot DM',
+      new SlashCommandBuilder()
+        .setName('g')
+        .setDescription('g')
+        .setContexts(
+          InteractionContextType.Guild,
+          InteractionContextType.BotDM
+        ),
+      false,
+    ],
+    [
+      'the deprecated DM permission set to false',
+      new SlashCommandBuilder()
+        .setName('g')
+        .setDescription('g')
+        .setDMPermission(false),
+      true,
+    ],
+    [
+      'no contexts at all',
+      new SlashCommandBuilder().setName('g').setDescription('g'),
+      false,
+    ],
+  ])('marks a command server-only from %s', (_label, data, guildOnly) => {
+    const [category] = buildHelpCatalog([
+      command({ data, help: { category: { en: 'Demo', ja: 'デモ' } } }),
+    ]);
+
+    expect(category.commands[0].guildOnly === true).toBe(guildOnly);
+  });
+
   it('omits commands that declare no help metadata', () => {
     const categories = buildHelpCatalog([
       command({
@@ -199,6 +289,7 @@ describe('the real command definitions', () => {
 
     expect([...roots].sort()).toEqual([
       'admin',
+      'caption',
       'community',
       'general',
       'notification',
@@ -227,6 +318,21 @@ describe('the real command definitions', () => {
     // Derived from the command's own middleware declaration.
     expect(autojoin?.requiredPermission).toBe('manageGuild');
     expect(autojoin?.usage).toContain('/voice autojoin exclude');
+  });
+
+  it('mark the server-only commands, but not /general or /owner', () => {
+    const entries = categories.flatMap((c) => c.commands);
+    const guildOnly = (name: string) =>
+      entries.find((cmd) => cmd.name === name)?.guildOnly === true;
+
+    expect(guildOnly('community poll')).toBe(true);
+    expect(guildOnly('voice record')).toBe(true);
+    expect(guildOnly('general help')).toBe(false);
+    expect(
+      entries
+        .filter((cmd) => cmd.name.startsWith('owner '))
+        .some((cmd) => cmd.guildOnly)
+    ).toBe(false);
   });
 
   it('keep /notification stats open while its settings stay restricted', () => {

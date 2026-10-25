@@ -19,9 +19,14 @@ vi.mock('../recording/connectionManager.js', () => ({
     disconnect,
     getConnection,
     getAllConnections,
+    getConnectedChannelInGuild: vi.fn().mockReturnValue(undefined),
     isAtLimit,
     updateActivity,
   },
+}));
+
+vi.mock('../application/reconcile.js', () => ({
+  reconcileGuild: vi.fn().mockResolvedValue({ status: 'none' }),
 }));
 
 vi.mock('../repositories/voiceSettingsRepository.js', () => ({

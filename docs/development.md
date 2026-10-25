@@ -64,7 +64,9 @@ export const command: Command = {
   middleware: ['cooldown'], // Optional
 
   options: {
-    cooldown: 5000, // Optional: 5 seconds
+    cooldown: 5000, // Optional: 5 seconds (default 3 s)
+    // Optional, per subcommand path; the longest prefix wins, 0 turns it off.
+    // cooldowns: { 'mycommand slow': 10_000 },
   },
 
   async execute(interaction) {
@@ -74,6 +76,30 @@ export const command: Command = {
 ```
 
 2. The command will be automatically loaded from `features/*/commands/` on next restart.
+
+3. Declare who may use it in `COMMAND_POLICY`
+   (`src/__tests__/integration/commands/command-smoke.helpers.ts`): its default
+   member permissions, contexts, cooldowns and autocomplete options. The
+   payload and smoke tests fail until the policy and the command agree, and
+   then run every path of the new command automatically.
+
+Guidelines that keep commands consistent:
+
+- Admin-only commands set `setDefaultMemberPermissions(...)` so members do not
+  see them, and still check the permission at run time. Server-only commands
+  set `setContexts(InteractionContextType.Guild)`.
+- Write command names in replies with `commandMention('voice record')`, so
+  they become clickable.
+- Turn a request down with a private warning; call
+  `releaseCooldown(interaction)` when nothing was done yet, so the user can fix
+  it and retry at once. Let unexpected errors reach the router, which logs and
+  shows an error id.
+- Buttons belong to a panel (`runComponentPanel`) or a prompt
+  (`awaitConfirmationResult`). A button that must survive a restart is
+  registered with `registerComponentHandler(prefix, handler)` in the feature's
+  `start()` and removed in `stop()`.
+- To show a feature's settings in `/admin settings view`, register a provider
+  with `registerSettingsSummary()` in `start()`.
 
 ### Command Placement Rules
 

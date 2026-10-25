@@ -1,12 +1,32 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  afterAll,
+  vi,
+} from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { LocalStorage } from '../storage/localStorage.js';
 import { validateBackupFilename } from '../storage/types.js';
 
+/**
+ * A throwaway directory in the OS temp dir, unique to this run: the suite
+ * never writes inside the repository, and two runs at once do not share it.
+ */
+const dirs = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const root = mkdtempSync(join(tmpdir(), 'bot-local-storage-'));
+  return { root, backupDir: join(root, 'backups') };
+});
+
 vi.mock('../../../config/index.js', () => ({
   env: {
-    BACKUP_DIR: 'test-backups-local-storage',
+    BACKUP_DIR: dirs.backupDir,
   },
 }));
 
@@ -20,7 +40,7 @@ vi.mock('../../../shared/utils/logger.js', () => ({
 }));
 
 describe('LocalStorage', () => {
-  const testBackupDir = 'test-backups-local-storage';
+  const testBackupDir = dirs.backupDir;
 
   beforeEach(() => {
     if (fs.existsSync(testBackupDir)) {
@@ -33,6 +53,10 @@ describe('LocalStorage', () => {
     if (fs.existsSync(testBackupDir)) {
       fs.rmSync(testBackupDir, { recursive: true });
     }
+  });
+
+  afterAll(() => {
+    fs.rmSync(dirs.root, { recursive: true, force: true });
   });
 
   describe('validateBackupFilename', () => {

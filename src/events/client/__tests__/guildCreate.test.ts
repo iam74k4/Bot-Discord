@@ -8,9 +8,11 @@ const { allowlist, logger } = vi.hoisted(() => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock('../../../app/guildAllowlist.js', async (importOriginal) => {
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import('../../../app/guildAllowlist.js')>();
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
   return {
     isGuildAllowed: (guildId: string | null) =>
       actual.isGuildAllowed(guildId, allowlist.ids),

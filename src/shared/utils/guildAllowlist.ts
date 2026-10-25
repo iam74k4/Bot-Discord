@@ -1,4 +1,4 @@
-import { env } from '../config/index.js';
+import { env } from '../../config/index.js';
 
 /**
  * Which servers this deployment serves (`ALLOWED_GUILD_IDS`).

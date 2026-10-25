@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GuildMember, MessageFlags, PermissionsBitField } from 'discord.js';
 import { t } from '../../../locales/index.js';
@@ -5,6 +6,12 @@ import { t } from '../../../locales/index.js';
 vi.mock('../../../shared/utils/embed.js', () => ({
   createEmbed: vi.fn((opts) => opts),
   createErrorEmbed: vi.fn((title, description) => ({ title, description })),
+  createWarningEmbed: vi.fn((title, description) => ({ title, description })),
+}));
+
+// No guild settings stored: the server language falls back to Japanese.
+vi.mock('../../../infrastructure/database/connection.js', () => ({
+  database: new Database(':memory:'),
 }));
 
 vi.mock('../../../shared/utils/logger.js', () => ({
@@ -39,6 +46,7 @@ function memberStub(
   const roleCache = new Map((opts.roleIds ?? []).map((id) => [id, { id }]));
   const member = {
     id: opts.id,
+    displayName: opts.id,
     roles: {
       highest: { position: opts.highestPosition },
       cache: {
@@ -209,7 +217,7 @@ describe('admin role target hierarchy', () => {
       'guild-1',
       'mod-1',
       'user-1',
-      'Role: Muted (role-low)'
+      t('audit.details.role', 'ja', { roleId: 'role-low', roleName: 'Muted' })
     );
   });
 

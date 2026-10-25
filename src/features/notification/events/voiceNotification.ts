@@ -1,11 +1,12 @@
-import { Events, Guild, VoiceState } from 'discord.js';
+import { Events, Guild, VoiceState, escapeMarkdown } from 'discord.js';
 import { Event } from '../../../shared/types/index.js';
 import { ExtendedClient } from '../../../client.js';
 import { createEmbed } from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
-import { t, mapDiscordLocale, type Locale } from '../../../locales/index.js';
-import { resolveGuildLocale } from '../../../locales/guildLocale.js';
+import { isGuildAllowed } from '../../../shared/utils/guildAllowlist.js';
+import { t, type Locale } from '../../../locales/index.js';
+import { resolveBackgroundLocale } from '../../../locales/guildLocale.js';
 import { notificationChannelRepository } from '../repositories/notificationChannelRepository.js';
 import { voiceTracker } from '../tracking/voiceTracker.js';
 import { getSendableTextChannel } from '../../../shared/utils/discord.js';
@@ -23,8 +24,12 @@ import {
  * change is announced immediately so "someone is in the call" still arrives
  * promptly, and everything that follows within the window is collapsed into a
  * single summary. A channel filling up costs two messages instead of ten.
+ *
+ * One kind of change is never held back: someone joining a VC that was empty
+ * (a call starting) flushes the window at once, together with whatever had
+ * been waiting, because that is the notification people act on.
  */
-const DIGEST_WINDOW_MS = 30_000;
+export const DIGEST_WINDOW_MS = 30_000;
 
 interface DigestWindow {
   timer: NodeJS.Timeout;
@@ -45,11 +50,14 @@ export const event: Event<typeof Events.VoiceStateUpdate> = {
   ) {
     if (!client.isFullyReady) return;
     if (newState.member?.user.bot) return;
+    // Neither notices nor VC time tracking for a server outside
+    // ALLOWED_GUILD_IDS.
+    if (!isGuildAllowed(newState.guild.id)) return;
 
     const guildId = newState.guild.id;
 
     if (!oldState.channel && newState.channel) {
-      await handleJoin(guildId, newState);
+      await handleJoin(client, guildId, newState);
       return;
     }
 
@@ -63,13 +71,44 @@ export const event: Event<typeof Events.VoiceStateUpdate> = {
       newState.channel &&
       oldState.channel.id !== newState.channel.id
     ) {
-      await handleMove(guildId, oldState, newState);
+      await handleMove(client, guildId, oldState, newState);
     }
   },
 };
 
+/**
+ * Whether `state` is in the guild's AFK channel. Discord moves idle members
+ * there on its own, so being in it counts as having left VC: no notification
+ * line and no stats time.
+ */
+function isAfk(state: VoiceState): boolean {
+  const channelId = state.channel?.id;
+  return channelId !== undefined && channelId === state.guild.afkChannelId;
+}
+
+/**
+ * Whether `state` is the first person into its channel: nobody else was
+ * there, not counting bots (the bot's own recording or TTS connection
+ * included). Read from the guild's voice-state cache, which has an entry for
+ * everyone in a VC even when their member object is not cached; a state
+ * whose member is unknown counts as a person, which only means batching.
+ */
+function startsCall(client: ExtendedClient, state: VoiceState): boolean {
+  const channelId = state.channel?.id;
+  const states = state.guild.voiceStates?.cache;
+  if (!channelId || !states || isAfk(state)) return false;
+
+  const joinerId = state.member?.user.id ?? state.id;
+  for (const other of states.values()) {
+    if (other.id === joinerId || other.channelId !== channelId) continue;
+    const isBot = other.member?.user.bot ?? other.id === client.user?.id;
+    if (!isBot) return false;
+  }
+  return true;
+}
+
 function startSessionFromState(guildId: string, state: VoiceState): void {
-  if (!state.member || !state.channel) return;
+  if (!state.member || !state.channel || isAfk(state)) return;
   voiceTracker.startSession(
     guildId,
     state.member.user.id,
@@ -87,23 +126,33 @@ function toActivity(
   state: VoiceState,
   kind: VoiceActivity['kind']
 ): VoiceActivity | null {
-  if (!state.member || !state.channel) return null;
+  if (!state.member || !state.channel || isAfk(state)) return null;
   return {
     userId: state.member.user.id,
-    displayName: state.member.displayName,
+    // Shown inside **bold**: a name like `*star*` must not break it.
+    displayName: escapeMarkdown(state.member.displayName),
     channelId: state.channel.id,
     kind,
   };
 }
 
-async function handleJoin(guildId: string, state: VoiceState): Promise<void> {
+async function handleJoin(
+  client: ExtendedClient,
+  guildId: string,
+  state: VoiceState
+): Promise<void> {
   try {
     startSessionFromState(guildId, state);
   } catch (error) {
     logger.error(`Failed to start voice session: ${getErrorMessage(error)}`);
   }
 
-  await recordActivity(guildId, state.guild, [toActivity(state, 'join')]);
+  await recordActivity(
+    guildId,
+    state.guild,
+    [toActivity(state, 'join')],
+    startsCall(client, state)
+  );
 }
 
 async function handleLeave(guildId: string, state: VoiceState): Promise<void> {
@@ -121,8 +170,12 @@ async function handleLeave(guildId: string, state: VoiceState): Promise<void> {
  * Event listeners are not awaited by the dispatcher, so a concurrent leave
  * during leave-notify can otherwise race ahead of startSession and leave a
  * ghost open session for a channel the user already left.
+ *
+ * A move into the AFK channel reads as a leave and a move out of it as a
+ * join, because the AFK half produces no activity.
  */
 async function handleMove(
+  client: ExtendedClient,
   guildId: string,
   oldState: VoiceState,
   newState: VoiceState
@@ -138,28 +191,41 @@ async function handleMove(
 
   // Both halves are handed over together so a move outside an open window is
   // still reported as one line rather than a leave now and a join later.
-  await recordActivity(guildId, newState.guild, [
-    toActivity(oldState, 'leave'),
-    toActivity(newState, 'join'),
-  ]);
+  await recordActivity(
+    guildId,
+    newState.guild,
+    [toActivity(oldState, 'leave'), toActivity(newState, 'join')],
+    startsCall(client, newState)
+  );
 }
 
 /**
  * Announce immediately when the guild has no open window, otherwise buffer
- * until the window closes.
+ * until the window closes - unless the change starts a call, which flushes
+ * the window now and restarts it.
  */
 async function recordActivity(
   guildId: string,
   guild: Guild,
-  activities: ReadonlyArray<VoiceActivity | null>
+  activities: ReadonlyArray<VoiceActivity | null>,
+  urgent: boolean = false
 ): Promise<void> {
   const events = activities.filter((a): a is VoiceActivity => a !== null);
   if (events.length === 0) return;
 
   const open = windows.get(guildId);
   if (open) {
-    open.buffered.push(...events);
     open.guild = guild;
+    if (!urgent) {
+      open.buffered.push(...events);
+      return;
+    }
+
+    const pending = [...open.buffered, ...events];
+    open.buffered = [];
+    clearTimeout(open.timer);
+    open.timer = setTimeout(() => void closeWindow(guildId), DIGEST_WINDOW_MS);
+    await sendDigest(guild, summarizeVoiceActivity(pending));
     return;
   }
 
@@ -233,10 +299,7 @@ async function sendDigest(guild: Guild, digest: VoiceDigest): Promise<void> {
     const textChannel = await getSendableTextChannel(guild, notifyChannelId);
     if (!textChannel) return;
 
-    const locale = resolveGuildLocale(
-      guild.id,
-      mapDiscordLocale(guild.preferredLocale)
-    );
+    const locale = resolveBackgroundLocale(guild);
     const lines = digestLines(digest, locale);
     // A single change keeps its old one-line look; only a real batch gets a
     // heading, so the common case is not made noisier by the batching.

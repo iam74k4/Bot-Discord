@@ -25,6 +25,7 @@ flowchart LR
     bot["Bot service (Docker, Node.js 22.22)"]
     volume[("Volume /app/data: SQLite, backups, recordings")]
     voicevox["VOICEVOX engine (optional, private network only)"]
+    whisper["Whisper engine (optional, private network only)"]
   end
 
   webhook["Alert webhook (a Discord channel)"]
@@ -35,6 +36,7 @@ flowchart LR
   bot <-- "Opus audio" --> voice
   bot <--> volume
   bot -- "HTTP: audio_query / synthesis" --> voicevox
+  bot -- "HTTP: transcription (consenting speakers only)" --> whisper
   bot -- "crashes, memory pressure" --> webhook
 ```
 
@@ -45,15 +47,17 @@ flowchart LR
   cache server, or queue: one process owns everything, which keeps shutdown,
   backups and migrations simple. It also means one replica per environment -
   see [Scaling limits](#scaling-limits).
-- **VOICEVOX** is reachable only over Railway private networking and is never
-  exposed to the internet.
+- **VOICEVOX** and **Whisper** are reachable only over Railway private
+  networking and are never exposed to the internet. Captions add no intent:
+  they use the voice connection the bot already holds.
 
 ## Inside the process
 
-Every Discord event enters through the auto-loaded event listeners. Slash
-commands then pass one router and one middleware pipeline before reaching a
-feature; feature events (voice state, messages) go straight to the feature
-that registered them.
+Every Discord event enters through the auto-loaded event listeners. Every
+interaction passes one router: slash commands then go through one middleware
+pipeline before reaching a feature, and buttons, menus and forms go to the
+panel, prompt or persistent handler that owns them. Feature events (voice
+state, messages) go straight to the feature that registered them.
 
 ```mermaid
 flowchart TD
@@ -69,9 +73,11 @@ flowchart TD
   ic --> router["app/interactions/interactionRouter"]
   router --> allow{"server allowed?"}
   allow -- "no" --> refuse["ephemeral refusal"]
-  allow -- "yes" --> mw["middleware: permissions, cooldown"]
+  allow -- "slash command" --> mw["middleware: permissions, cooldown"]
   mw --> cmd["features/*/commands"]
   cmd --> appl["features/*/application"]
+  allow -- "button / menu / form" --> comp["open panel or prompt, else persistent handler (shared/interactions)"]
+  comp --> appl
 
   fevents --> appl
   appl --> repo["features/*/repositories (SQL)"]
@@ -81,10 +87,53 @@ flowchart TD
   infra --> db
 ```
 
-Buttons, select menus and modals never reach the router: each panel collects
-the components on the message it sent (`runComponentPanel()` in
-`src/shared/utils/panel.ts`), so the router cannot answer an interaction a
-panel is about to handle.
+### Interactions
+
+- Slash commands and events are auto-discovered from `features/*/commands/`
+  and `features/*/events/`.
+- Interactive panels use `runComponentPanel()` from
+  `src/shared/utils/panel.ts`, which owns the reply/collect/re-render/expire
+  lifecycle. A panel supplies `render`, `renderDisabled`, and `onComponent`.
+  Yes/no prompts use `awaitConfirmationResult()` from
+  `src/shared/utils/confirm.ts`. Both register their message as live, so the
+  router leaves its clicks to them and shutdown can close them visibly.
+- Buttons that must keep working after a restart (the "exclude this VC"
+  button on voice notices, `voice-optout:`) are registered by customId prefix
+  with `registerComponentHandler()` from `src/shared/interactions` in the
+  owning feature's `start()`, and re-check permissions on every click.
+- Buttons and selects reach the router in this order: a live collector (open
+  panel or prompt) keeps them; then a registered persistent handler; then a
+  message whose panel or prompt settled in the last 10 seconds is
+  acknowledged quietly (its owner is replacing it); anything else gets the
+  fallback, after a 1.5 s grace for messages sent by this process. Once
+  component routing is ready, the fallback greys the components out and
+  names the command to run again. Before every feature has started, and from
+  the first shutdown step, it only replies "the bot is restarting, try again"
+  and never edits the message, because a persistent button's handler may
+  simply not be registered yet.
+- A submitted form (modal) is answered by whoever opened it
+  (`awaitModalSubmit`). If nothing has answered it after the same grace
+  period - the bot restarted while it was open, or it stayed open too long -
+  the router tells the user privately that the form expired and what they
+  typed was not saved.
+- Slash command names in replies are written with `commandMention()`
+  (`src/shared/utils/commandMentions.ts`), which renders a clickable
+  `</voice record:id>` once the registered ids are known.
+- Errors shown to users carry a short error id (`createErrorId()`), logged
+  next to the stack, so a report can be matched to the log.
+
+### Middleware
+
+- Cooldown logic lives in `middleware/cooldown/` (cooldownMiddleware +
+  cooldownStore). Cooldowns are per user and per full subcommand path;
+  `options.cooldowns` sets them per path prefix (the longest match wins), and
+  a handler that turns a request down before doing any work calls
+  `releaseCooldown(interaction)`.
+- `options.permissions` are checked against the member's server-wide
+  permissions (roles and ownership); a channel overwrite does not count.
+- `runMiddleware()` in `middleware/index.ts` runs the pipeline (permissions,
+  cooldown, etc.) before command execution. A refusal is a private warning,
+  not an error.
 
 ## Layers
 
@@ -172,13 +221,13 @@ test case in `src/__tests__/architecture.test.ts`, so breaking one fails CI:
 
 ## Features
 
-| Feature        | Commands           | Owns                                                                    |
-| -------------- | ------------------ | ----------------------------------------------------------------------- |
-| `admin`        | `/admin`, `/owner` | Server settings panel, role tools, owner system panel, DB statistics    |
-| `community`    | `/community`       | Native Discord polls (`poll/`), VC roulette                             |
-| `general`      | `/general`         | Help (built from the shared help catalog), ping                         |
-| `notification` | `/notification`    | VC join/leave and member-join notices, VC time tracking and daily stats |
-| `voice`        | `/voice`, `/tts`   | The voice connection, past-audio recording, auto-join, text-to-speech   |
+| Feature        | Commands           | Owns                                                                                                                           |
+| -------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `admin`        | `/admin`, `/owner` | Server settings panel and overview, role tools, broadcasts, owner system panel, backups, DB statistics                         |
+| `community`    | `/community`       | Native Discord polls (`poll/`) with their creation form, VC roulette with re-roll                                              |
+| `general`      | `/general`         | Help (catalog index with search, built from command definitions), about, ping                                                  |
+| `notification` | `/notification`    | VC join/leave and member-join notices, VC time tracking, daily stats on the `STATS_TIMEZONE` calendar                          |
+| `voice`        | `/voice`, `/tts`   | The voice connection, past-audio recording, auto-join with onboarding, opt-out button and voice channel status, text-to-speech |
 
 Every feature exports `name`, `start(context)` and `stop()` from its
 `index.ts`, and is discovered automatically:
@@ -192,14 +241,22 @@ Every feature exports `name`, `start(context)` and `stop()` from its
   `env` to start themselves. Nothing is constructed at import time.
 - `commands/` holds only the public slash command files the command handler
   auto-loads; internal logic lives in `application/`.
+- Features meet only in `shared/` registries: the help catalog, persistent
+  component handlers (`shared/interactions`) and the settings overview
+  (`shared/settingsSummary`). A feature registers into them in `start()` and
+  removes itself in `stop()`, so features stay unaware of each other.
 
-### Why text-to-speech lives inside `voice`
+### Why text-to-speech and captions live inside `voice`
 
 Discord lets a bot hold **one voice connection per server**. Recording,
-auto-join and text-to-speech all need that connection, so exactly one module
-must own it - `voice/recording/connectionManager.ts` - and arbitrate between
-them: whether a join may buffer audio, who may disconnect, which connection
-to shed under memory pressure.
+auto-join, text-to-speech and captions all need that connection, so exactly
+one module must own it - `voice/recording/connectionManager.ts` - and
+arbitrate between them: whether a join hears people and whether it keeps
+what it hears (`recording/audioMode.ts`: deafened for reading aloud,
+listening for captions, buffering for recording), who may disconnect, which
+connection to shed under memory pressure. Captions do not reach into the
+receive path: the manager hands every speaker's decoded audio to registered
+audio taps.
 
 ```mermaid
 flowchart LR
@@ -208,9 +265,14 @@ flowchart LR
     autojoin["application/autojoin.ts + events/voiceStateUpdate"]
     tts["application/tts.ts + events/ttsMessage"]
     cm["recording/connectionManager (one connection per server)"]
+    placer["recording/chunkPlacer (frames end to end per talk spurt)"]
     ring["recording/channelMixRing (past-audio buffer)"]
     tsm["tts/sessionManager (queue, playback)"]
+    sched["tts/synthesisScheduler (one fair queue for the shared engine)"]
     vv["tts/voicevoxClient"]
+    captions["application/captions.ts (/caption)"]
+    csm["captions/sessionManager (consent gate, utterances, posting)"]
+    wc["captions/whisperClient"]
     mem["jobs/memoryMonitor"]
   end
 
@@ -218,12 +280,21 @@ flowchart LR
   autojoin --> cm
   tts --> tsm
   tsm --> cm
-  tsm --> vv
-  cm --> ring
+  tsm --> sched
+  sched --> vv
+  captions --> csm
+  cm -- "audio tap" --> csm
+  csm --> sched
+  sched --> wc
+  cm --> placer
+  placer --> ring
   mem -- "shed oldest connection" --> cm
 ```
 
-A separate `tts` feature would have to import `connectionManager` from
+Captions use their own instance of the same scheduler class, so the Whisper
+engine gets the same fairness as VOICEVOX without the two queues mixing.
+
+A separate `tts` or `captions` feature would have to import `connectionManager` from
 `voice`, which "features never import each other" forbids for good reason:
 the two would change in lockstep anyway. Keeping them together is the honest
 boundary. If a third, unrelated consumer of the connection appears, move the
@@ -237,17 +308,22 @@ flowchart TD
   createApp --> initDb["initializeDatabase(): run migrations"]
   initDb --> loadFeatures["loadFeatures()"]
   loadFeatures --> loadDiscord["loadCommands() + loadEvents()"]
-  loadDiscord --> login["client.login()"]
+  loadDiscord --> metricsStart["startRuntimeMetrics()"]
+  metricsStart --> login["client.login()"]
   login --> ready["ClientReady"]
   ready --> featureStart["startAllFeatures({ client, config })"]
-  featureStart --> backupStart["backupService.start() + startAuditRetention()"]
+  featureStart --> routingReady["component routing ready"]
+  routingReady --> backupStart["backupService.start() + startAuditRetention()"]
   backupStart --> running["running"]
   running -- "SIGTERM / SIGINT / uncaught error" --> shutdown["app.stop()"]
-  shutdown --> finalBackup["runBackup() if SHUTDOWN_FINAL_BACKUP"]
-  finalBackup --> backupStop["backupService.stop() + stopAuditRetention()"]
+  shutdown --> routingOff["component routing off"]
+  routingOff --> liveComponents["close open panels and prompts (min(3 s, SHUTDOWN_TIMEOUT_MS / 5))"]
+  liveComponents --> backupStop["backupService.stop() + stopAuditRetention()"]
   backupStop --> featureStop["stopAllFeatures() in reverse order"]
-  featureStop --> cooldowns["cooldownStore.clearAll()"]
-  cooldowns --> closeDb["closeDatabase()"]
+  featureStop --> finalBackup["runBackup() if SHUTDOWN_FINAL_BACKUP"]
+  finalBackup --> cooldowns["cooldownStore.clearAll()"]
+  cooldowns --> metricsStop["stopRuntimeMetrics()"]
+  metricsStop --> closeDb["closeDatabase()"]
   closeDb --> destroyClient["client.destroy()"]
 ```
 
@@ -256,19 +332,40 @@ hangs cannot leave the database open. `app/processHandlers.ts` bounds the
 whole shutdown by `SHUTDOWN_TIMEOUT_MS` and exits non-zero after a crash so
 Railway's `ON_FAILURE` policy restarts the bot.
 
+The final backup runs after `stopAllFeatures()`, so rows that features write
+on the way out (the notification feature closes open VC sessions) are in it.
+Stopping the backup service first only cancels its schedule; `runBackup()`
+still works afterwards.
+
+Component routing is marked ready only after every feature has started (and
+registered its persistent buttons), and switched off as the first shutdown
+step, before features unregister them; see [Interactions](#interactions).
+
+The voice feature also hooks the connection manager before each disconnect
+(`onBeforeDisconnect`), so the bot clears the voice channel status it set
+while it is still in the channel.
+
 ## Composition root
 
 `src/app/composition.ts` is the single place the running bot is assembled.
 `createApp(config, deps)` builds the object graph and returns `start()` and
 `stop()`; `src/index.ts` keeps only what belongs to the process - reading
-configuration, signal handlers, and last-resort crash reporting.
+configuration, signal handlers, and last-resort crash reporting. A test
+enforces that split (`src/__tests__/architecture.test.ts`).
 
 `deps` defaults to the real collaborators and can be replaced wholesale, so
 `src/app/__tests__/composition.test.ts` drives the real startup and shutdown
 sequence with fakes instead of mocking module paths. Order is a correctness
 property here - the database opens before anything queries it, features start
-only after the gateway is ready, and the final backup runs while the
-connection is still open - so it is asserted, not assumed.
+only after the gateway is ready, and the final backup runs after features
+have written their last rows but while the connection is still open - so it
+is asserted, not assumed.
+
+Features are started with a `FeatureContext` (`{ client, config }`) rather
+than importing `env` for themselves, and nothing is constructed at import
+time: the voice jobs are built from the config their feature is handed, and
+services that must stay module-level (`backupService`,
+`connectionManager`) read configuration on first use.
 
 **What is deliberately not injected:** `config` and the database connection.
 Both are process-wide resources with an explicit lifecycle (`loadConfig`,
@@ -283,12 +380,13 @@ steps and a temporal coupling on top. Tests override both by mocking
 - `infrastructure/database/` is pure infrastructure: connection management,
   `runTransaction()`, and migrations. All feature SQL lives in that feature's
   `repositories/` (or its runtime folder, such as `community/poll/`).
-- Migrations are numbered files (`001_steam.ts` … `011_tts.ts`) applied by
-  `initializeDatabase()` on **every boot**, so each one must be safe to re-run
-  against a database it has already migrated: a column is added only after
-  checking `PRAGMA table_info`, and a migration never rewrites a table that a
-  later migration replaced. `migrationsReboot.test.ts` applies the full set
-  three times to one database to keep that true.
+- Migrations are numbered files (`001_steam.ts` … `012_query_indexes.ts`)
+  applied by `initializeDatabase()` on **every boot**, so each one must be
+  safe to re-run against a database it has already migrated: a column is
+  added only after checking `PRAGMA table_info`, and a migration never
+  rewrites a table that a later migration replaced. `migrationsReboot.test.ts`
+  applies the full set three times to one database to keep that true. Two
+  files with the same number stop the boot.
 - Migrations 001 and 002 are kept untouched for a clean upgrade path from the
   removed Steam feature; `005_drop_steam.ts` drops those tables.
 
@@ -328,18 +426,18 @@ The design trades horizontal scale for simplicity, on purpose:
 ├── vitest.config.ts              # Tests + coverage floors
 └── src/
     ├── index.ts                  # Process entry: config, signals, crash reporting
-    ├── client.ts                 # Discord client: intents, cache limits
+    ├── client.ts                 # Discord client: intents, keep-alive REST agent, cache limits
     ├── app/
     │   ├── composition.ts        # Composition root: what the bot is made of, in order
+    │   ├── compileCache.ts       # V8 compile cache under DATA_DIR (production)
     │   ├── processHandlers.ts    # Signals, uncaught errors, bounded graceful shutdown
-    │   ├── guildAllowlist.ts     # ALLOWED_GUILD_IDS check
     │   └── interactions/
     │       ├── commandRegistry.ts    # Command discovery + registration payload
-    │       └── interactionRouter.ts  # Slash commands and autocomplete
+    │       └── interactionRouter.ts  # Slash commands, autocomplete, components, unclaimed forms
     ├── app-scripts/
     │   └── cleanup-commands.ts   # npm run cleanup-commands
     ├── config/
-    │   ├── schema.ts             # Pure parsing + validation of the environment
+    │   ├── schema.ts             # Pure parsing + validation (STATS_TIMEZONE, paths, limits)
     │   ├── env.ts                # loadConfig(), lazy `env`
     │   ├── constants.ts          # Non-configurable constants (audio format, limits)
     │   └── index.ts
@@ -350,54 +448,59 @@ The design trades horizontal scale for simplicity, on purpose:
     │   └── interaction/
     │       └── interactionCreate.ts  # Hands interactions to the router
     ├── handlers/
-    │   ├── commandHandler.ts     # Load commands, register them with Discord
+    │   ├── commandHandler.ts     # Load commands, sync them with Discord (hash in DATA_DIR)
     │   └── eventHandler.ts       # Load core + feature events
     ├── middleware/
     │   ├── index.ts              # runMiddleware() pipeline
     │   ├── permissions.ts
-    │   └── cooldown/             # Cooldown middleware + store
+    │   ├── types.ts
+    │   └── cooldown/             # Cooldown middleware + store (per subcommand path)
     ├── features/
     │   ├── index.ts              # Registry: discovery, FeatureContext, start/stop all
     │   ├── admin/
     │   │   ├── commands/         # admin.ts (/admin), owner.ts (/owner)
-    │   │   ├── application/      # settings, settingsPanel, role, owner, systemPanel
+    │   │   ├── application/      # settings and system panels, roles, broadcasts, backups
     │   │   └── repositories/     # databaseStatsRepository
     │   ├── community/
-    │   │   ├── commands/         # roulette.ts (/community)
-    │   │   ├── application/      # roulette
-    │   │   └── poll/             # Native polls: application + pollRepository
+    │   │   ├── commands/         # community.ts (/community)
+    │   │   ├── application/      # roulette (with re-roll buttons)
+    │   │   └── poll/             # Native polls: command, creation form, pollRepository
     │   ├── general/
     │   │   ├── commands/         # general.ts (/general)
-    │   │   └── application/      # help, ping
+    │   │   └── application/      # help (helpIndex: memoized catalog + search), about, ping
     │   ├── notification/
     │   │   ├── commands/         # notification.ts (/notification)
-    │   │   ├── application/      # panel, stats, voiceDigest
+    │   │   ├── application/      # panel, stats, voiceDigest, channel checks, settings summary
     │   │   ├── events/           # voiceNotification, memberJoinNotification
     │   │   ├── repositories/     # notificationChannel, voiceSession
+    │   │   ├── stats/            # calendar (STATS_TIMEZONE day keys), periods
     │   │   └── tracking/         # voiceTracker
     │   └── voice/
-    │       ├── commands/         # record.ts (/voice), tts.ts (/tts)
-    │       ├── application/      # record, autojoin, reconcile, status, announce, tts
-    │       ├── events/           # voiceStateUpdate, ttsMessage
-    │       ├── recording/        # connectionManager, channelMixRing, recordingService
-    │       ├── tts/              # voicevoxClient, sessionManager, textNormalizer, wav
-    │       ├── repositories/     # voiceSettings, tts
+    │       ├── commands/         # voice.ts (/voice), tts.ts (/tts), caption.ts (/caption)
+    │       ├── application/      # record, status panel, autojoin, onboarding, optOut, tts, captions …
+    │       ├── events/           # voiceStateUpdate, guildCreate, voiceChannelStatus, ttsMessage
+    │       ├── recording/        # connectionManager, audioMode, channelMixRing, chunkPlacer, recordingService
+    │       ├── tts/              # voicevoxClient, synthesisScheduler, sessionManager, nameAudioCache …
+    │       ├── captions/         # sessionManager, whisperClient, utterances, transcriptFilter, captionPoster, audio
+    │       ├── repositories/     # voiceSettings, tts, captionConsent
     │       └── jobs/             # fileCleanup, memoryMonitor
     ├── infrastructure/
     │   ├── database/
     │   │   ├── connection.ts     # Connection, pragmas, close
     │   │   ├── transaction.ts    # runTransaction()
-    │   │   └── migrations/       # 001_steam … 011_tts; index.ts = initializeDatabase()
+    │   │   └── migrations/       # 001_steam … 012_query_indexes; index.ts = initializeDatabase()
     │   ├── guildSettings/        # Sole owner of guild_settings
     │   ├── audit/                # audit_logs: repository, format, retention
-    │   ├── backup/               # Scheduled SQLite backups (storage/)
+    │   ├── backup/               # Scheduled SQLite backups (snapshot in a worker thread, storage/)
     │   ├── health/               # Health status (memory, per-feature)
-    │   └── metrics/              # In-memory counters
+    │   └── metrics/              # In-memory counters, event-loop delay, time to acknowledge
     ├── shared/
     │   ├── help/catalog.ts       # Help catalog built from command definitions
+    │   ├── interactions/         # Persistent component handlers, live components, error ids
+    │   ├── settingsSummary/      # Registry each feature adds its part of the settings view to
     │   ├── types/                # Command, Event, middleware, voice types
-    │   └── utils/                # logger, embed, panel, confirm, retry, alert, cleanup …
-    └── locales/                  # en, ja, per-server locale resolution
+    │   └── utils/                # logger, embed, panel, confirm, commandMentions, guildAllowlist, retry, alert …
+    └── locales/                  # en, ja, formatters (format.ts), server language (guildLocale.ts)
 ```
 
 Each feature also has an `index.ts` (its lifecycle) and a `__tests__/`
@@ -409,11 +512,6 @@ rules, the all-commands smoke harness - live in `src/__tests__/`.
 Not wrong enough to block work, but recorded so they get fixed on purpose
 rather than copied:
 
-- **Some command files are named after an old command.**
-  `voice/commands/record.ts` defines `/voice` and
-  `community/commands/roulette.ts` defines `/community`; both predate their
-  commands growing subcommands. Rename them (`voice.ts`, `community.ts`) in a
-  change of their own, when no other branch is editing them.
 - **`voice` is the largest feature.** That is the cost of the single
   connection owner described above, not an accident; split it only along the
   connection manager.

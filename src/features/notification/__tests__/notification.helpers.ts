@@ -87,26 +87,34 @@ export function insertDailyStat(
   );
 }
 
+/** What the bot needs to post a notification embed. */
+export const POSTING_PERMISSIONS =
+  PermissionFlagsBits.ViewChannel |
+  PermissionFlagsBits.SendMessages |
+  PermissionFlagsBits.EmbedLinks;
+
 /**
- * A text channel that passes the real `getSendableTextChannel` checks
- * (`instanceof TextChannel` plus a SendMessages permission for the bot).
+ * A text channel that passes the real `getSendableTextChannel` and
+ * notification-channel checks (`instanceof TextChannel` plus View Channel,
+ * Send Messages and Embed Links for the bot). `permissions` replaces the
+ * bot's permissions there; `canSend: false` takes them all away.
  */
 export function createTextChannel(
   id: string,
-  options: { canSend?: boolean } = {}
+  options: { canSend?: boolean; permissions?: bigint; name?: string } = {}
 ): TextChannel {
+  const granted =
+    options.canSend === false
+      ? 0n
+      : (options.permissions ?? POSTING_PERMISSIONS);
   const channel = Object.create(TextChannel.prototype) as TextChannel;
   Object.defineProperties(channel, {
     id: { value: id },
+    name: { value: options.name },
     type: { value: ChannelType.GuildText },
     send: { value: vi.fn().mockResolvedValue({}) },
     permissionsFor: {
-      value: vi.fn(
-        () =>
-          new PermissionsBitField(
-            options.canSend === false ? 0n : PermissionFlagsBits.SendMessages
-          )
-      ),
+      value: vi.fn(() => new PermissionsBitField(granted)),
     },
   });
   return channel;
@@ -121,7 +129,10 @@ export interface FakeGuildOptions {
   /** The bot's own member; `null` models a guild where it is not cached. */
   me?: object | null;
   preferredLocale?: string;
+  /** Guild features; `['COMMUNITY']` lets the server language be trusted. */
+  features?: readonly string[];
   memberCount?: number;
+  rulesChannelId?: string | null;
 }
 
 export function createGuild(options: FakeGuildOptions = {}): Guild {
@@ -133,7 +144,9 @@ export function createGuild(options: FakeGuildOptions = {}): Guild {
   return {
     id: options.id ?? GUILD_ID,
     preferredLocale: options.preferredLocale ?? 'en-US',
+    features: options.features ?? [],
     memberCount: options.memberCount ?? 10,
+    rulesChannelId: options.rulesChannelId ?? null,
     channels: {
       cache,
       fetch: vi.fn(async (channelId: string) => {
@@ -200,6 +213,7 @@ export function createCommandInteraction(
   const editReply = vi.fn().mockResolvedValue({});
 
   const interaction = {
+    commandName: 'notification',
     guild,
     guildId: guild?.id ?? null,
     locale: options.locale ?? 'en-US',
@@ -287,6 +301,7 @@ export interface ComponentJson {
   disabled?: boolean;
   placeholder?: string;
   channel_types?: number[];
+  default_values?: Array<{ id: string; type: string }>;
   options?: Array<{ value: string; label: string; default?: boolean }>;
 }
 

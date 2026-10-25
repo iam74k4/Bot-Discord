@@ -23,11 +23,9 @@ export function up(): void {
     )
   `);
 
-  database.exec(`
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_guild_id
-    ON audit_logs(guild_id)
-  `);
-
+  // 012 replaces the `guild_id` index this used to create with one on
+  // (guild_id, created_at). Creating the old one here again would rebuild it
+  // on every boot only for 012 to drop it.
   database.exec(`
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at
     ON audit_logs(created_at)

@@ -6,22 +6,22 @@ export const command: Command = {
   data: new SlashCommandBuilder()
     .setName('owner')
     .setDescription(
-      'Bot owner tools for system status, backups, and broadcasts'
+      'Bot operator tools for system status, backups, and broadcasts'
     )
     .setDescriptionLocalizations({
-      ja: 'Botオーナー向けの状態確認・バックアップ・一斉通知',
+      ja: 'Bot運営者向けの状態確認・バックアップ・一斉通知',
     })
-    .setContexts(
-      InteractionContextType.Guild,
-      InteractionContextType.BotDM,
-      InteractionContextType.PrivateChannel
-    )
+    // Hidden from everyone but server admins in servers; Discord ignores
+    // default permissions in the bot's DM, where the owner can always use
+    // it. Who may actually run it is checked against BOT_OWNER_IDS.
+    .setDefaultMemberPermissions(0)
+    .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM)
     .addSubcommandGroup((group) =>
       group
         .setName('system')
-        .setDescription('Bot owner system tools')
+        .setDescription('Bot operator system tools')
         .setDescriptionLocalizations({
-          ja: 'Botオーナー向けシステム機能',
+          ja: 'Bot運営者向けシステム機能',
         })
         .addSubcommand((sub) =>
           sub
@@ -51,14 +51,15 @@ export const command: Command = {
           sub
             .setName('broadcast')
             .setDescription(
-              'Send a message to all server owners after confirmation'
+              'Post to every server that set an announcement channel (after confirmation)'
             )
             .setDescriptionLocalizations({
-              ja: '確認後に全サーバーオーナーへメッセージ送信',
+              ja: 'お知らせチャンネルを設定したサーバーへ一斉通知（確認あり）',
             })
             .addStringOption((opt) =>
               opt
                 .setName('message')
+                .setNameLocalizations({ ja: 'メッセージ' })
                 .setDescription('Message to broadcast')
                 .setDescriptionLocalizations({
                   ja: '送信するメッセージ',

@@ -22,15 +22,120 @@ import {
   VoiceConnectionState,
 } from '../../../shared/types/voice.js';
 import { channelMixRingManager } from './channelMixRing.js';
+import { ChunkPlacer } from './chunkPlacer.js';
+import { keepsAudio } from './audioMode.js';
+
+/**
+ * opusscript (the bundled Opus backend) runs every decoder in one 16 MiB
+ * wasm heap. Past roughly 29 live mono decoders per process (20 stereo) a
+ * new one fails with "memory access out of bounds" and that speaker is
+ * simply missing from recordings. Decoding to mono raises the cap; installing
+ * the native `@discordjs/opus` (which prism-media prefers automatically)
+ * removes it. Failures are counted and reported at warn level, at most once
+ * a minute, so a busy server shows up in the logs instead of going silent.
+ */
+const OPUS_HEAP_EXHAUSTED = 'memory access out of bounds';
+const DECODER_WARNING_INTERVAL_MS = 60_000;
+
+let liveDecoders = 0;
+let lastDecoderWarningAt = Number.NEGATIVE_INFINITY;
+let backendLogged = false;
+
+/** Number of Opus decoders currently open across every connection. */
+export function getLiveDecoderCount(): number {
+  return liveDecoders;
+}
+
+/** The Opus module prism-media loaded, once it has loaded one. */
+function opusBackendName(): string | undefined {
+  return (prism.opus.Decoder as unknown as { type?: string }).type;
+}
+
+function logOpusBackendOnce(): void {
+  if (backendLogged) return;
+  backendLogged = true;
+  logger.info(`Opus decoder backend: ${opusBackendName() ?? 'unknown'}`);
+}
+
+/**
+ * Log at startup which Opus module prism-media uses (`@discordjs/opus` or
+ * `opusscript`), so production logs show whether the opusscript decoder cap
+ * applies before anyone speaks. prism loads the module with its first
+ * stream, so a throwaway decoder is opened and closed to find out. Never
+ * throws: a missing module is logged as a warning.
+ */
+export function logOpusBackend(): void {
+  if (backendLogged) return;
+  try {
+    if (!opusBackendName()) {
+      new prism.opus.Decoder({
+        rate: AUDIO.SAMPLE_RATE,
+        channels: 1,
+        frameSize: 960,
+      }).destroy();
+    }
+  } catch (error) {
+    logger.warn(
+      `No Opus module could be loaded; voice audio cannot be decoded: ${getErrorMessage(error)}`
+    );
+    return;
+  }
+  logOpusBackendOnce();
+}
+
+function reportDecodeError(userId: string, error: unknown): void {
+  const message = getErrorMessage(error);
+  if (!message.includes(OPUS_HEAP_EXHAUSTED)) {
+    logger.debug(`Audio decode error for user ${userId}:`, message);
+    return;
+  }
+  const now = Date.now();
+  if (now - lastDecoderWarningAt < DECODER_WARNING_INTERVAL_MS) return;
+  lastDecoderWarningAt = now;
+  logger.warn(
+    `Opus decoder ran out of memory with ${liveDecoders} live decoders; ` +
+      'speakers beyond this are not recorded. Installing @discordjs/opus ' +
+      'lifts the opusscript limit.'
+  );
+}
+
+/**
+ * Work that must happen while the bot is still in the channel, such as
+ * clearing the voice channel status it set (Discord accepts that only from
+ * a member). Return undefined when there is nothing to do.
+ */
+export type BeforeDisconnectHook = (
+  channelId: string
+) => Promise<unknown> | undefined;
+
+/** How long a disconnect waits for its before-disconnect hooks. */
+export const BEFORE_DISCONNECT_TIMEOUT_MS = 2_000;
 
 export interface ConnectOptions {
   /**
-   * Decode and buffer what people say (the `/voice record` ring). Defaults to
-   * true. Text-to-speech joins with `false` where the server has opted out of
-   * buffering, and the bot then also deafens itself so members can see it is
-   * not listening.
+   * Decode what people say. Defaults to true. Text-to-speech joins with
+   * `false` where the server has opted out of buffering, and the bot then
+   * also deafens itself so members can see it is not listening.
    */
   receive?: boolean;
+  /**
+   * Keep what is received in the `/voice record` ring. Defaults to `receive`.
+   * Captions join with `false` where the server has opted out of buffering:
+   * they need to hear people, not to keep their audio.
+   */
+  buffer?: boolean;
+}
+
+/**
+ * Something that wants each speaker's decoded audio as it arrives (captions).
+ * Called for every listening connection, buffering or not; a tap decides for
+ * itself whose audio it wants. It must be quick and must not throw.
+ */
+export interface AudioTap {
+  /** One decoded chunk: 48 kHz mono 16-bit PCM. */
+  onAudio(channelId: string, userId: string, pcm: Buffer, now: number): void;
+  /** The speaker's stream ended: they went quiet, left, or the bot did. */
+  onSpeechEnd(channelId: string, userId: string): void;
 }
 
 /**
@@ -42,6 +147,8 @@ export class VoiceConnectionManager {
   /** One audio player per connection, used by text-to-speech playback. */
   private players: Map<string, AudioPlayer> = new Map();
   private readonly disconnectListeners = new Set<(channelId: string) => void>();
+  private readonly audioTaps = new Set<AudioTap>();
+  private readonly beforeDisconnectHooks = new Set<BeforeDisconnectHook>();
   /** In-flight connect promises keyed by channel id (dedupe concurrent joins). */
   private readonly connecting = new Map<
     string,
@@ -155,10 +262,12 @@ export class VoiceConnectionManager {
       return null;
     }
 
+    const receive = options.receive !== false;
     const connectPromise = this.connectInternal(
       guild,
       channel,
-      options.receive !== false
+      receive,
+      receive && options.buffer !== false
     );
     this.connecting.set(channelId, connectPromise);
     this.connectingGuilds.set(guildId, channelId);
@@ -175,7 +284,8 @@ export class VoiceConnectionManager {
   private async connectInternal(
     guild: Guild,
     channel: VoiceChannel | StageChannel,
-    receive: boolean
+    receive: boolean,
+    buffer: boolean
   ): Promise<VoiceConnection | null> {
     const channelId = channel.id;
     const guildId = guild.id;
@@ -262,11 +372,16 @@ export class VoiceConnectionManager {
           },
         });
 
+        // Mono straight from the decoder: libopus downmixes for free, which
+        // saves a JS downmix per chunk and lets more decoders fit in the
+        // opusscript heap than stereo would.
         const decoder = new prism.opus.Decoder({
           rate: AUDIO.SAMPLE_RATE,
-          channels: 2,
+          channels: 1,
           frameSize: 960,
         });
+        liveDecoders++;
+        logOpusBackendOnce();
 
         const pcmStream = opusStream.pipe(decoder);
 
@@ -278,8 +393,14 @@ export class VoiceConnectionManager {
         // Type assertions: prism Decoder and discord/voice produce Node-like streams
         // but their types don't extend Readable; runtime behavior is compatible.
 
+        let cleanedUp = false;
         const cleanup = () => {
           subscribedUsers.delete(userId);
+          if (!cleanedUp) {
+            cleanedUp = true;
+            liveDecoders--;
+            this.notifySpeechEnd(channelId, userId);
+          }
           if (!opusStream.destroyed) opusStream.destroy();
           if (!pcmStream.destroyed) pcmStream.destroy();
           if (streams) {
@@ -288,39 +409,43 @@ export class VoiceConnectionManager {
           }
         };
 
+        // One placer per talk spurt: frames are laid end to end instead of
+        // at their (jittery) arrival times. See ChunkPlacer.
+        const placer = new ChunkPlacer();
         let chunkCount = 0;
         pcmStream.on('data', (chunk: Buffer) => {
-          if (!this.connections.has(channelId)) return;
+          const info = this.connections.get(channelId);
+          if (!info) return;
           chunkCount++;
           if (chunkCount === 1) {
             logger.debug(
               `First audio chunk received from user ${userId} (${chunk.length} bytes)`
             );
           }
-          const monoSamples = chunk.length / 4;
-          const monoChunk = Buffer.allocUnsafe(monoSamples * 2);
 
-          for (let i = 0; i < monoSamples; i++) {
-            const left = chunk.readInt16LE(i * 4);
-            const right = chunk.readInt16LE(i * 4 + 2);
-            const mono = Math.round((left + right) / 2);
-            monoChunk.writeInt16LE(mono, i * 2);
-          }
+          const now = Date.now();
+          this.notifyAudio(channelId, userId, chunk, now);
+          // A captions-only join hears people but keeps nothing.
+          if (info.buffering === false) return;
 
-          // Allocated here rather than on connect: the ring costs ~82MB at the
+          // Allocated here rather than on connect: the ring costs ~55MB at the
           // default buffer length, and a channel where nobody ever speaks
           // should not pay it. The first chunk also sets the ring's epoch, so
-          // the timeline starts at real audio instead of at join time.
-          channelMixRingManager
-            .getOrCreate(channelId)
-            .addMonoPcmInt16(monoChunk, Date.now());
+          // the timeline starts at real audio instead of at join time - at
+          // the chunk's start, since it ends now: an epoch of now would put
+          // the whole first frame before the timeline, where it is dropped.
+          const samples = chunk.length >> 1;
+          const ring = channelMixRingManager.getOrCreate(
+            channelId,
+            now - (samples * 1000) / AUDIO.SAMPLE_RATE
+          );
+          const start = placer.place(ring.globalIndexAt(now), samples);
+          if (start === null) return; // catching up after running ahead
+          ring.addMonoPcmInt16At(chunk, start);
         });
 
         pcmStream.on('error', (error) => {
-          logger.debug(
-            `Audio decode error for user ${userId}:`,
-            getErrorMessage(error)
-          );
+          reportDecodeError(userId, error);
           cleanup();
         });
 
@@ -387,6 +512,7 @@ export class VoiceConnectionManager {
         connectedAt: Date.now(),
         lastActivity: Date.now(),
         receiving: receive,
+        buffering: buffer,
       };
 
       this.connections.set(channelId, info);
@@ -423,6 +549,13 @@ export class VoiceConnectionManager {
       return;
     }
 
+    const before = this.runBeforeDisconnect(channelId);
+    if (before) {
+      await before;
+      // Another disconnect (or a kick) finished the job while we waited.
+      if (this.connections.get(channelId) !== info) return;
+    }
+
     try {
       // Destroy all active audio streams for this channel
       this.destroyStreamsForChannel(channelId);
@@ -449,12 +582,100 @@ export class VoiceConnectionManager {
   }
 
   /**
+   * Run `hook` before every disconnect this manager makes, while the bot is
+   * still in the channel. The disconnect waits for it, but never longer than
+   * `BEFORE_DISCONNECT_TIMEOUT_MS`. Not run when Discord already dropped the
+   * connection (a kick or network loss). Returns an unsubscribe.
+   */
+  onBeforeDisconnect(hook: BeforeDisconnectHook): () => void {
+    this.beforeDisconnectHooks.add(hook);
+    return () => this.beforeDisconnectHooks.delete(hook);
+  }
+
+  /** Null when no hook has work to do, so most disconnects stay synchronous. */
+  private runBeforeDisconnect(channelId: string): Promise<void> | null {
+    const pending: Promise<unknown>[] = [];
+    for (const hook of this.beforeDisconnectHooks) {
+      try {
+        const result = hook(channelId);
+        if (result) {
+          pending.push(
+            result.catch((error: unknown) => {
+              logger.debug(
+                `Before-disconnect hook failed for ${channelId}:`,
+                getErrorMessage(error)
+              );
+            })
+          );
+        }
+      } catch (error) {
+        logger.debug(
+          `Before-disconnect hook failed for ${channelId}:`,
+          getErrorMessage(error)
+        );
+      }
+    }
+    if (pending.length === 0) return null;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, BEFORE_DISCONNECT_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    return Promise.race([
+      Promise.all(pending).then(() => undefined),
+      timeout,
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  /**
    * Run `listener` whenever a tracked connection goes away, however it went
    * (explicit disconnect, kick, network loss). Returns an unsubscribe.
    */
   onDisconnect(listener: (channelId: string) => void): () => void {
     this.disconnectListeners.add(listener);
     return () => this.disconnectListeners.delete(listener);
+  }
+
+  /**
+   * Hand every speaker's decoded audio to `tap` as well as (where the
+   * connection buffers) the record ring. Returns an unsubscribe.
+   */
+  addAudioTap(tap: AudioTap): () => void {
+    this.audioTaps.add(tap);
+    return () => this.audioTaps.delete(tap);
+  }
+
+  /** A tap that throws must not cost the recording its audio. */
+  private notifyAudio(
+    channelId: string,
+    userId: string,
+    pcm: Buffer,
+    now: number
+  ): void {
+    for (const tap of this.audioTaps) {
+      try {
+        tap.onAudio(channelId, userId, pcm, now);
+      } catch (error) {
+        logger.debug(
+          `Audio tap failed for ${userId} in ${channelId}:`,
+          getErrorMessage(error)
+        );
+      }
+    }
+  }
+
+  private notifySpeechEnd(channelId: string, userId: string): void {
+    for (const tap of this.audioTaps) {
+      try {
+        tap.onSpeechEnd(channelId, userId);
+      } catch (error) {
+        logger.debug(
+          `Audio tap failed for ${userId} in ${channelId}:`,
+          getErrorMessage(error)
+        );
+      }
+    }
   }
 
   private notifyDisconnect(channelId: string): void {
@@ -500,15 +721,49 @@ export class VoiceConnectionManager {
   /**
    * Start listening on a connection that joined deafened for text-to-speech
    * (`receive: false`), in place: reconnecting would end the reading session
-   * and race the bot's own leave/join voice-state events. False when the
-   * channel is not connected or is already listening.
+   * and race the bot's own leave/join voice-state events. With `buffer`
+   * (the default) what it hears is kept in the record ring, which also turns
+   * a captions-only connection into a buffering one. False when the channel
+   * is not connected or nothing changed.
    */
-  enableReceive(channelId: string): boolean {
+  enableReceive(
+    channelId: string,
+    { buffer = true }: { buffer?: boolean } = {}
+  ): boolean {
     const info = this.connections.get(channelId);
-    if (!info || info.receiving !== false) return false;
-    info.receiving = true;
-    this.updateVoiceState(channelId, { selfDeaf: false });
-    logger.info(`Started receiving audio in voice channel ${channelId}`);
+    if (!info) return false;
+    if (info.receiving === false) {
+      info.receiving = true;
+      info.buffering = buffer;
+      this.updateVoiceState(channelId, { selfDeaf: false });
+      logger.info(`Started receiving audio in voice channel ${channelId}`);
+      return true;
+    }
+    if (buffer && info.buffering === false) {
+      info.buffering = true;
+      logger.info(`Started keeping audio in voice channel ${channelId}`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Stop listening without leaving: the bot deafens itself, closes every
+   * speaker's stream and drops any audio it kept. For a connection that
+   * listened only for captions and stays to read chat aloud. False when the
+   * channel is not connected or is not listening.
+   */
+  disableReceive(channelId: string): boolean {
+    const info = this.connections.get(channelId);
+    if (!info || info.receiving === false) return false;
+    info.receiving = false;
+    info.buffering = false;
+    this.destroyStreamsForChannel(channelId);
+    // Streams of speakers who start talking again are tracked in a new set.
+    this.activeStreams.set(channelId, new Set());
+    channelMixRingManager.remove(channelId);
+    this.updateVoiceState(channelId, { selfDeaf: true });
+    logger.info(`Stopped receiving audio in voice channel ${channelId}`);
     return true;
   }
 
@@ -597,6 +852,20 @@ export class VoiceConnectionManager {
   }
 
   /**
+   * Channel the bot is connected to in this guild, if any. Discord allows one
+   * voice connection per guild, so this is the channel that keeps every
+   * other channel of the guild from being joined.
+   */
+  getConnectedChannelInGuild(guildId: string): string | undefined {
+    for (const info of this.connections.values()) {
+      if (info.guildId === guildId) {
+        return info.channelId;
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * Get all active connections
    */
   getAllConnections(): Map<string, VoiceConnectionInfo> {
@@ -619,15 +888,15 @@ export class VoiceConnectionManager {
 
   /**
    * Shed connections when memory runs short: those holding a mix ring first
-   * (that is where the memory is), then other listening connections, then
-   * text-to-speech-only joins, which hold almost nothing - dropping one of
-   * those would end a reading session and free no memory. Oldest first
-   * within each group.
+   * (that is where the memory is), then other buffering connections, then
+   * joins that keep nothing (reading aloud, captions), which hold almost
+   * nothing - dropping one of those would end a session and free no memory.
+   * Oldest first within each group.
    */
   async disconnectOldest(count: number): Promise<void> {
     const sheddingOrder = (channelId: string, info: VoiceConnectionInfo) => {
       if (channelMixRingManager.has(channelId)) return 0;
-      return info.receiving === false ? 2 : 1;
+      return keepsAudio(info) ? 1 : 2;
     };
     const sorted = Array.from(this.connections.entries()).sort(
       (a, b) =>

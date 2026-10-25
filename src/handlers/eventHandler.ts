@@ -4,6 +4,7 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import { Event } from '../shared/types/index.js';
 import { ExtendedClient } from '../client.js';
 import { getErrorMessage, logger } from '../shared/utils/logger.js';
+import { isLoadableModuleFile } from '../app/interactions/commandRegistry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -73,11 +74,7 @@ export async function loadEvents(client: ExtendedClient): Promise<void> {
 
   for (const category of categoryFolders) {
     const categoryPath = join(eventsPath, category);
-    const eventFiles = readdirSync(categoryPath).filter(
-      (file) =>
-        (file.endsWith('.ts') || file.endsWith('.js')) &&
-        !file.startsWith('index.')
-    );
+    const eventFiles = readdirSync(categoryPath).filter(isLoadableModuleFile);
 
     for (const file of eventFiles) {
       const registered = await registerEvent(
@@ -100,11 +97,8 @@ export async function loadEvents(client: ExtendedClient): Promise<void> {
       const featureEventsPath = join(featuresPath, feature, 'events');
       if (!existsSync(featureEventsPath)) continue;
 
-      const eventFiles = readdirSync(featureEventsPath).filter(
-        (file) =>
-          (file.endsWith('.ts') || file.endsWith('.js')) &&
-          !file.startsWith('index.')
-      );
+      const eventFiles =
+        readdirSync(featureEventsPath).filter(isLoadableModuleFile);
 
       for (const file of eventFiles) {
         const registered = await registerEvent(
