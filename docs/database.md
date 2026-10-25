@@ -424,21 +424,6 @@ erDiagram
         integer session_count
         integer updated_at
     }
-
-    tts_user_settings {
-        text user_id PK
-        integer speaker_id
-        real speed
-        integer updated_at
-    }
-
-    tts_dictionary {
-        text guild_id PK
-        text word PK
-        text reading
-        text created_by
-        integer created_at
-    }
 ```
 
 ---
