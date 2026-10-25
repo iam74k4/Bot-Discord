@@ -16,7 +16,7 @@
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write \"src/**/*.ts\" \"docs/**/*.md\" \"README.md\" \"CONTRIBUTING.md\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"docs/**/*.md\" \"README.md\" \"CONTRIBUTING.md\"",
-    "type-check": "tsc --noEmit",
+    "type-check": "tsc --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -55,7 +55,7 @@
     "vitest": "^4.1.4"
   },
   "overrides": {
-    "undici": "6.29.0",
+    "undici": "6.29.1",
     "flatted": "3.4.2",
     "ws": "8.21.2"
   }
