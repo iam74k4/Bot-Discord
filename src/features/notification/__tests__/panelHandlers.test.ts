@@ -42,4 +42,22 @@ describe('notification panel handlers', () => {
       initialPeriod: 'week',
     });
   });
+
+  it('defaults stats to all time when no period is chosen', async () => {
+    const { handleStats } = await import('../application/stats.js');
+
+    const interaction = {
+      locale: 'en-US',
+      options: {
+        getString: vi.fn().mockReturnValue(null),
+      },
+    } as never;
+
+    await handleStats(interaction);
+
+    expect(showNotificationPanel).toHaveBeenCalledWith(interaction, 'en', {
+      initialView: 'stats',
+      initialPeriod: 'all',
+    });
+  });
 });

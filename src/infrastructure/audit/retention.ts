@@ -24,7 +24,10 @@ function cleanupOldAuditLogs(): void {
 
 export function startAuditRetention(): void {
   if (cleanupInterval) return;
-  cleanupInterval = startDailyCleanup(cleanupOldAuditLogs);
+  cleanupInterval = startDailyCleanup(
+    cleanupOldAuditLogs,
+    'Audit log retention'
+  );
 }
 
 export function stopAuditRetention(): void {

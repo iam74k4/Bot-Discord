@@ -1,8 +1,8 @@
 # Discord Bot
 
-![Build Status](https://img.shields.io/github/actions/workflow/status/iam74k4/DiscordBot/.github/workflows/ci.yml?style=flat-square)
-![Version](https://img.shields.io/github/v/release/iam74k4/DiscordBot?style=flat-square)
-![License](https://img.shields.io/github/license/iam74k4/DiscordBot?style=flat-square)
+![Build Status](https://img.shields.io/github/actions/workflow/status/iam74k4/Bot-Discord/.github/workflows/ci.yml?style=flat-square)
+![Version](https://img.shields.io/github/v/release/iam74k4/Bot-Discord?style=flat-square)
+![License](https://img.shields.io/github/license/iam74k4/Bot-Discord?style=flat-square)
 ![Node.js Version](https://img.shields.io/badge/node-22.12%2B-339933?style=flat-square&logo=node.js&logoColor=white)
 
 A modular Discord bot built with TypeScript and discord.js v14.
@@ -24,6 +24,7 @@ A modular Discord bot built with TypeScript and discord.js v14.
 
 - Slash command support with automatic registration
 - **Voice channel recording** (restricted past-audio recording with `/voice record`)
+- **Text-to-speech** (`/tts`): reads chat aloud in voice channels with VOICEVOX, so members who cannot or would rather not speak can still take part
 - VC join/leave and member-join notifications, plus per-user VC time stats
 - Community features (native Discord polls, VC roulette)
 - Admin system (`/admin` server settings, `/owner` bot-owner tools)
@@ -93,11 +94,15 @@ See [.env.example](.env.example) for all configuration options and [docs/deploym
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
 2. Create a new application or select existing one
 3. Go to "Bot" section and copy the token
-4. **Enable Privileged Intents**: Go to "Bot" > Enable `SERVER MEMBERS INTENT`
+4. **Enable Privileged Intents**: Go to "Bot" > Enable `SERVER MEMBERS INTENT`.
+   If you set `VOICEVOX_URL` (text-to-speech), also enable
+   `MESSAGE CONTENT INTENT`: the bot then requests it, and Discord refuses the
+   login (so the whole bot fails to start) when it is not enabled
 5. Go to "OAuth2" > "General" and copy the Client ID
 6. Go to "OAuth2" > "URL Generator":
    - Select scopes: `bot`, `applications.commands`
-   - Select bot permissions: `Send Messages`, `Use Slash Commands`, `Embed Links`
+   - Select bot permissions: `Send Messages`, `Use Slash Commands`,
+     `Embed Links`, `Connect` (voice features), `Speak` (`/tts`)
    - Use the generated URL to invite the bot to your server
 
 ## Usage
@@ -205,14 +210,14 @@ are gone — use `/community poll end` to close a short poll when you are done.
 
 ### Voice (`/voice`)
 
-| Command                             | Description                                   |
-| ----------------------------------- | --------------------------------------------- |
-| `/voice record <duration>`          | Record past audio from your voice channel     |
-| `/voice status`                     | Show buffer window, auto-join state, capacity |
-| `/voice autojoin enable`            | Allow the bot to join occupied voice channels |
-| `/voice autojoin disable`           | Stop joining and buffering in this server     |
-| `/voice autojoin exclude <channel>` | Keep the bot out of one voice channel         |
-| `/voice autojoin include <channel>` | Remove a channel from the exclusion list      |
+| Command                             | Description                                    |
+| ----------------------------------- | ---------------------------------------------- |
+| `/voice record <duration>`          | Record past audio from your voice channel      |
+| `/voice status`                     | Show buffer window, auto-join state, capacity  |
+| `/voice autojoin enable`            | Allow the bot to join occupied voice channels  |
+| `/voice autojoin disable`           | Stop auto-joining and buffering in this server |
+| `/voice autojoin exclude <channel>` | Stop auto-joining and buffering one channel    |
+| `/voice autojoin include <channel>` | Remove a channel from the exclusion list       |
 
 **Options:**
 
@@ -229,7 +234,9 @@ are gone — use `/community poll end` to close a short poll when you are done.
   chat saying audio is being kept and how to turn it off
 - Opt-out: `/voice autojoin disable` (whole server) or
   `/voice autojoin exclude <channel>` (one channel). Both also drop any
-  connection already buffering
+  connection already buffering. `/tts start` can still bring the bot in, but
+  deafened and without keeping audio, and the opt-outs leave such a reading
+  join alone
 - In-memory ring buffer of `AUDIO_BUFFER_DURATION` seconds (default: 300 = 5
   minutes), about **82MB per voice channel**, allocated the first time someone
   actually speaks — a channel the bot sits in silently costs nothing. Multiply
@@ -237,8 +244,9 @@ are gone — use `/community poll end` to close a short poll when you are done.
 - WAV format output at 48kHz/16bit/mono (~27.5MB for 5 minutes)
 - Private delivery: Recording responses and files are sent ephemerally
 - Automatic file cleanup after `RECORDING_RETENTION_HOURS` (default: 24 hours)
-- Memory monitoring against `MEMORY_LIMIT_MB` (RSS), disconnecting the oldest
-  connections when usage passes 85% of the budget
+- Memory monitoring against `MEMORY_LIMIT_MB` (RSS): when usage passes 85% of
+  the budget, connections holding audio buffers are disconnected first (oldest
+  first), and text-to-speech-only joins last
 
 **Notes:**
 
@@ -246,6 +254,53 @@ are gone — use `/community poll end` to close a short poll when you are done.
 - Bot must be in the same voice channel
 - Maximum concurrent VC connections: 5 (configurable)
 - Opus decoding uses **`opusscript`** (pure JS) instead of `@discordjs/opus` so installs stay free of vulnerable native prebuild chains; CPU use can be higher than a native Opus build under heavy voice load. See [`docs/quality.md`](docs/quality.md) for dependency overrides.
+
+### Text-to-speech (`/tts`)
+
+Reads chat aloud in a voice channel using [VOICEVOX](https://voicevox.hiroshiba.jp/).
+Available when the bot operator sets `VOICEVOX_URL` (see
+[docs/deployment.md](docs/deployment.md#text-to-speech-optional)).
+
+| Command                          | Description                                          |
+| -------------------------------- | ---------------------------------------------------- |
+| `/tts start`                     | Start reading this channel in your voice channel     |
+| `/tts stop`                      | Stop reading                                         |
+| `/tts skip`                      | Skip the message being read                          |
+| `/tts voice [speaker] [speed]`   | Show or change your own voice (searchable) and speed |
+| `/tts dict add <word> <reading>` | Teach the server how to read a word                  |
+| `/tts dict remove <word>`        | Remove a reading                                     |
+| `/tts dict list`                 | Show the server's dictionary                         |
+
+**How it reads:**
+
+- Messages from members **in the voice channel being read** are spoken, from
+  the channel where `/tts start` was run and from the voice channel's own chat
+- Start a message with `;` to keep it silent
+- The speaker's name is announced when the speaker changes (or after a minute
+  of quiet), so listeners know who is talking
+- URLs, code blocks, spoilers, and long messages are summarised (`URL省略`,
+  `コード省略`, `ネタバレ`, `以下略`); mentions and custom emoji are read as
+  names, other emoji are dropped, and trailing `www` is read as laughter.
+  Fullwidth and halfwidth forms are read as their plain form (`ＡＢＣ` as ABC,
+  `ｶﾀｶﾅ` as カタカナ)
+- Dictionary words match however they are typed: `alice`, `ALICE` and
+  `ａｌｉｃｅ` are one word, with one owner
+- Each member picks their own voice; it follows them across servers
+- Anyone can start reading or add dictionary words; only members in the
+  channel being read (or with Manage Server) can stop or skip, and only the
+  member who added a word (or Manage Server) can change or remove it
+- If the server has turned auto-join off, the bot joins deafened and keeps no
+  audio; it is unmuted only while a reading session is running. If auto-join
+  is turned back on during the session, `/tts stop` hands the channel back to
+  auto-join (and posts the buffering notice) instead of leaving
+- Stage channels are not supported: the bot would join as a listener and could
+  not be heard. In a text channel the bot cannot view, only the voice
+  channel's own chat is read, and `/tts start` says so
+- Credits: the public `/tts start` message names the VOICEVOX voices of the
+  people in the channel (for example `VOICEVOX:ずんだもん`, the default). Any
+  other character - someone who joins later, or switches voice, even from
+  another server - is credited in the voice channel's chat the first time it
+  is read in that session. Each character's own terms apply
 
 ### Memory
 
@@ -276,15 +331,15 @@ See [`docs/database.md`](docs/database.md) for schema details and retention beha
 | -------------------------- | ----------------------------------------------------------------------------------- |
 | `npm run dev`              | Start with hot-reload (development)                                                 |
 | `npm run build`            | Compile TypeScript to JavaScript                                                    |
-| `npm start`                | Run compiled JavaScript (production)                                                |
+| `npm start`                | Run compiled JavaScript locally (Railway runs `node dist/index.js` directly)        |
 | `npm run lint`             | Check code with ESLint                                                              |
 | `npm run lint:fix`         | Fix ESLint errors automatically                                                     |
 | `npm run format`           | Format code with Prettier                                                           |
 | `npm run format:check`     | Check code formatting                                                               |
-| `npm run type-check`       | Check TypeScript types                                                              |
+| `npm run type-check`       | Check TypeScript types (source and tests)                                           |
 | `npm test`                 | Run unit tests                                                                      |
 | `npm run test:watch`       | Run tests in watch mode                                                             |
-| `npm run test:coverage`    | Run tests with coverage report                                                      |
+| `npm run test:coverage`    | Run tests with coverage report and enforce the coverage floors (what CI runs)       |
 | `npm run audit:all`        | Run full + production-scoped `npm audit` (see [`docs/quality.md`](docs/quality.md)) |
 | `npm run cleanup-commands` | Remove registered Discord commands                                                  |
 
@@ -300,12 +355,14 @@ Feature-based architecture: each feature lives under `src/features/` and exports
 - `src/infrastructure/` contains shared runtime infrastructure such as database bootstrap, backup, health, and metrics.
 - `src/shared/` contains cross-feature utilities, shared types, and the shared help catalog.
 - `src/app-scripts/` contains TypeScript maintenance scripts, while root `scripts/` contains repo workflow shell scripts.
+- Dependency direction (features never import each other; lower layers never import features) is enforced by `src/__tests__/architecture.test.ts`.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full structure and lifecycle rules.
+See [`docs/architecture.md`](docs/architecture.md) for diagrams, the full directory tree and lifecycle rules.
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md): project structure and lifecycle
+- [`docs/architecture.md`](docs/architecture.md): system, runtime and dependency diagrams, directory structure, lifecycle
+- [`docs/operations.md`](docs/operations.md): staging (`develop`) and production (`main`) environments, releases, hotfixes, rollbacks
 - [`docs/development.md`](docs/development.md): command development, middleware, and local workflow scripts
 - [`docs/database.md`](docs/database.md): SQLite tables and persistence notes
 - [`docs/deployment.md`](docs/deployment.md): Railway deployment and CI/CD flow

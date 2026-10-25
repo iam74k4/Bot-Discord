@@ -40,6 +40,28 @@ describe('collectAnswers', () => {
     });
   });
 
+  it('reads exactly the ten option slots the command offers', () => {
+    const asked: number[] = [];
+    collectAnswers((index) => {
+      asked.push(index);
+      return `Choice ${index}`;
+    });
+
+    expect(asked).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
+  it('treats an empty string like an unused slot', () => {
+    expect(collectAnswers(options(['Ramen', '']))).toEqual({
+      error: 'notEnough',
+    });
+  });
+
+  it('reports an over-long answer even when too few are filled in', () => {
+    expect(
+      collectAnswers(options(['x'.repeat(MAX_ANSWER_LENGTH + 1)]))
+    ).toEqual({ error: 'tooLong' });
+  });
+
   it('accepts an answer exactly at the limit', () => {
     const exact = 'x'.repeat(MAX_ANSWER_LENGTH);
 

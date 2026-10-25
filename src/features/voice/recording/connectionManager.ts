@@ -1,4 +1,5 @@
 import {
+  AudioPlayer,
   VoiceConnection,
   VoiceConnectionStatus,
   createAudioPlayer,
@@ -22,12 +23,25 @@ import {
 } from '../../../shared/types/voice.js';
 import { channelMixRingManager } from './channelMixRing.js';
 
+export interface ConnectOptions {
+  /**
+   * Decode and buffer what people say (the `/voice record` ring). Defaults to
+   * true. Text-to-speech joins with `false` where the server has opted out of
+   * buffering, and the bot then also deafens itself so members can see it is
+   * not listening.
+   */
+  receive?: boolean;
+}
+
 /**
  * Voice connection manager
  */
 export class VoiceConnectionManager {
   private connections: Map<string, VoiceConnectionInfo> = new Map();
   private activeStreams: Map<string, Set<Readable>> = new Map();
+  /** One audio player per connection, used by text-to-speech playback. */
+  private players: Map<string, AudioPlayer> = new Map();
+  private readonly disconnectListeners = new Set<(channelId: string) => void>();
   /** In-flight connect promises keyed by channel id (dedupe concurrent joins). */
   private readonly connecting = new Map<
     string,
@@ -108,7 +122,8 @@ export class VoiceConnectionManager {
    */
   async connect(
     guild: Guild,
-    channel: VoiceChannel | StageChannel
+    channel: VoiceChannel | StageChannel,
+    options: ConnectOptions = {}
   ): Promise<VoiceConnection | null> {
     const channelId = channel.id;
     const guildId = guild.id;
@@ -140,7 +155,11 @@ export class VoiceConnectionManager {
       return null;
     }
 
-    const connectPromise = this.connectInternal(guild, channel);
+    const connectPromise = this.connectInternal(
+      guild,
+      channel,
+      options.receive !== false
+    );
     this.connecting.set(channelId, connectPromise);
     this.connectingGuilds.set(guildId, channelId);
     try {
@@ -155,7 +174,8 @@ export class VoiceConnectionManager {
 
   private async connectInternal(
     guild: Guild,
-    channel: VoiceChannel | StageChannel
+    channel: VoiceChannel | StageChannel,
+    receive: boolean
   ): Promise<VoiceConnection | null> {
     const channelId = channel.id;
     const guildId = guild.id;
@@ -197,12 +217,13 @@ export class VoiceConnectionManager {
 
     try {
       // Create voice connection
-      // selfDeaf: false is required to receive audio for recording
+      // selfDeaf: false is required to receive audio for recording; a
+      // connection that will not record deafens itself so that is visible.
       const connection = joinVoiceChannel({
         channelId: channel.id,
         guildId: guild.id,
         adapterCreator: guild.voiceAdapterCreator,
-        selfDeaf: false,
+        selfDeaf: !receive,
         selfMute: true,
       });
 
@@ -210,6 +231,7 @@ export class VoiceConnectionManager {
       const player = createAudioPlayer();
 
       connection.subscribe(player);
+      this.players.set(channelId, player);
 
       // Track active streams for cleanup on disconnect
       this.activeStreams.set(channelId, new Set());
@@ -222,8 +244,11 @@ export class VoiceConnectionManager {
       // Track subscribed users to avoid duplicate subscriptions
       const subscribedUsers = new Set<string>();
 
-      // Set up audio reception for all users
+      // Set up audio reception for all users. Read the flag on every event
+      // rather than capturing `receive`: enableReceive() can turn a deafened
+      // text-to-speech join into a listening one without reconnecting.
       connection.receiver.speaking.on('start', (userId) => {
+        if (this.connections.get(channelId)?.receiving === false) return;
         if (subscribedUsers.has(userId)) return;
         subscribedUsers.add(userId);
         logger.debug(
@@ -334,10 +359,12 @@ export class VoiceConnectionManager {
             return;
           }
           this.destroyStreamsForChannel(channelId);
+          this.releasePlayer(channelId);
           connection.destroy();
           this.connections.delete(channelId);
           channelMixRingManager.remove(channelId);
           logger.info(`Disconnected from voice channel ${channelId}`);
+          this.notifyDisconnect(channelId);
         }
       });
 
@@ -359,6 +386,7 @@ export class VoiceConnectionManager {
         guildId: guild.id,
         connectedAt: Date.now(),
         lastActivity: Date.now(),
+        receiving: receive,
       };
 
       this.connections.set(channelId, info);
@@ -378,15 +406,27 @@ export class VoiceConnectionManager {
   }
 
   /**
-   * Disconnect from a voice channel
+   * Disconnect from a voice channel. With `expected`, only when that is still
+   * the connection tracked there: a caller cleaning up its own join must not
+   * tear down a replacement someone else made in the meantime.
    */
-  async disconnect(channelId: string): Promise<void> {
+  async disconnect(
+    channelId: string,
+    expected?: VoiceConnection
+  ): Promise<void> {
     const info = this.connections.get(channelId);
     if (!info) return;
+    if (expected && info.connection !== expected) {
+      logger.debug(
+        `Not disconnecting ${channelId}: its connection was replaced`
+      );
+      return;
+    }
 
     try {
       // Destroy all active audio streams for this channel
       this.destroyStreamsForChannel(channelId);
+      this.releasePlayer(channelId);
 
       info.connection.destroy();
       this.connections.delete(channelId);
@@ -394,15 +434,143 @@ export class VoiceConnectionManager {
       channelMixRingManager.remove(channelId);
 
       logger.info(`Disconnected from voice channel ${channelId}`);
+      this.notifyDisconnect(channelId);
     } catch (error) {
       logger.error(
         `Error disconnecting from channel ${channelId}:`,
         getErrorMessage(error)
       );
       this.destroyStreamsForChannel(channelId);
+      this.releasePlayer(channelId);
       this.connections.delete(channelId);
       channelMixRingManager.remove(channelId);
+      this.notifyDisconnect(channelId);
     }
+  }
+
+  /**
+   * Run `listener` whenever a tracked connection goes away, however it went
+   * (explicit disconnect, kick, network loss). Returns an unsubscribe.
+   */
+  onDisconnect(listener: (channelId: string) => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
+  }
+
+  private notifyDisconnect(channelId: string): void {
+    for (const listener of this.disconnectListeners) {
+      try {
+        listener(channelId);
+      } catch (error) {
+        logger.error(
+          `Disconnect listener failed for ${channelId}:`,
+          getErrorMessage(error)
+        );
+      }
+    }
+  }
+
+  private releasePlayer(channelId: string): void {
+    const player = this.players.get(channelId);
+    if (!player) return;
+    try {
+      player.stop(true);
+    } catch {
+      // Player may already be stopped
+    }
+    this.players.delete(channelId);
+  }
+
+  /**
+   * The audio player attached to a channel's connection, if connected.
+   */
+  getPlayer(channelId: string): AudioPlayer | undefined {
+    return this.players.get(channelId);
+  }
+
+  /**
+   * Toggle the bot's self-mute without reconnecting. Text-to-speech unmutes
+   * while it is reading and mutes again afterwards, so the icon in the member
+   * list matches whether the bot can be heard.
+   */
+  setSelfMute(channelId: string, muted: boolean): boolean {
+    return this.updateVoiceState(channelId, { selfMute: muted });
+  }
+
+  /**
+   * Start listening on a connection that joined deafened for text-to-speech
+   * (`receive: false`), in place: reconnecting would end the reading session
+   * and race the bot's own leave/join voice-state events. False when the
+   * channel is not connected or is already listening.
+   */
+  enableReceive(channelId: string): boolean {
+    const info = this.connections.get(channelId);
+    if (!info || info.receiving !== false) return false;
+    info.receiving = true;
+    this.updateVoiceState(channelId, { selfDeaf: false });
+    logger.info(`Started receiving audio in voice channel ${channelId}`);
+    return true;
+  }
+
+  /** Change self-mute or self-deaf, keeping whatever is not given. */
+  private updateVoiceState(
+    channelId: string,
+    change: { selfMute?: boolean; selfDeaf?: boolean }
+  ): boolean {
+    const info = this.connections.get(channelId);
+    if (!info) return false;
+    const { connection } = info;
+    // Deafened exactly when not receiving: joinConfig can be rewritten by a
+    // late voice-state update from before enableReceive(), which would
+    // deafen a listening connection again.
+    const apply = () =>
+      connection.rejoin({
+        channelId,
+        selfDeaf: change.selfDeaf ?? info.receiving === false,
+        selfMute: change.selfMute ?? connection.joinConfig.selfMute,
+      });
+
+    // rejoin() on a connection that is still handshaking restarts the
+    // signalling, so wait for it to be ready rather than interrupting it.
+    if (connection.state.status === VoiceConnectionStatus.Ready) {
+      return apply();
+    }
+    connection.once(VoiceConnectionStatus.Ready, apply);
+    return true;
+  }
+
+  /**
+   * Wait for a channel's connection to finish connecting, and return it.
+   * Null when nothing is tracked, it does not become ready in time, or it is
+   * destroyed or replaced while waiting - a destroyed connection never
+   * reaches Ready, so waiting for it would only run out the clock.
+   */
+  async waitUntilReady(
+    channelId: string,
+    timeoutMs: number
+  ): Promise<VoiceConnection | null> {
+    const info = this.connections.get(channelId);
+    if (!info) return null;
+    const { connection } = info;
+
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), timeoutMs);
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Ready, stop.signal),
+        entersState(connection, VoiceConnectionStatus.Destroyed, stop.signal)
+          // A destroyed connection is a failed wait, not a finished one.
+          .then(() => Promise.reject(new Error('destroyed'))),
+      ]);
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+      stop.abort();
+    }
+    return this.connections.get(channelId)?.connection === connection
+      ? connection
+      : null;
   }
 
   private destroyStreamsForChannel(channelId: string): void {
@@ -450,11 +618,21 @@ export class VoiceConnectionManager {
   }
 
   /**
-   * Disconnect oldest connections if memory threshold is exceeded
+   * Shed connections when memory runs short: those holding a mix ring first
+   * (that is where the memory is), then other listening connections, then
+   * text-to-speech-only joins, which hold almost nothing - dropping one of
+   * those would end a reading session and free no memory. Oldest first
+   * within each group.
    */
   async disconnectOldest(count: number): Promise<void> {
+    const sheddingOrder = (channelId: string, info: VoiceConnectionInfo) => {
+      if (channelMixRingManager.has(channelId)) return 0;
+      return info.receiving === false ? 2 : 1;
+    };
     const sorted = Array.from(this.connections.entries()).sort(
-      (a, b) => a[1].connectedAt - b[1].connectedAt
+      (a, b) =>
+        sheddingOrder(a[0], a[1]) - sheddingOrder(b[0], b[1]) ||
+        a[1].connectedAt - b[1].connectedAt
     );
 
     for (let i = 0; i < Math.min(count, sorted.length); i++) {
