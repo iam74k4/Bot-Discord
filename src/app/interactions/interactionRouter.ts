@@ -11,6 +11,7 @@ import { createErrorEmbed } from '../../shared/utils/embed.js';
 import { metrics } from '../../infrastructure/metrics/index.js';
 import { t } from '../../locales/index.js';
 import { resolveLocale } from '../../locales/guildLocale.js';
+import { isGuildAllowed } from '../guildAllowlist.js';
 
 async function handleAutocompleteInteraction(
   client: ExtendedClient,
@@ -124,10 +125,47 @@ async function handleCommandExecution(
   }
 }
 
+/**
+ * A server outside ALLOWED_GUILD_IDS gets a short refusal rather than
+ * silence, so whoever typed the command knows it is the bot's configuration
+ * and not their permissions. See guildAllowlist.ts.
+ */
+async function refuseDisallowedGuild(
+  interaction: ChatInputCommandInteraction
+): Promise<void> {
+  logger.debug(
+    `Refused /${interaction.commandName} in ${interaction.guildId}: not in ALLOWED_GUILD_IDS`
+  );
+  const locale = resolveLocale(interaction);
+  await interaction
+    .reply({
+      content: t('common.guildNotAllowed', locale),
+      flags: MessageFlags.Ephemeral,
+    })
+    .catch((error: unknown) => {
+      logger.debug(
+        `Failed to refuse a disallowed server: ${getErrorMessage(error)}`
+      );
+    });
+}
+
 export async function routeInteraction(
   client: ExtendedClient,
   interaction: Interaction
 ): Promise<void> {
+  if (!isGuildAllowed(interaction.guildId)) {
+    if (interaction.isAutocomplete()) {
+      await interaction.respond([]).catch((error: unknown) => {
+        logger.debug(
+          `Failed to respond to autocomplete: ${getErrorMessage(error)}`
+        );
+      });
+    } else if (interaction.isChatInputCommand()) {
+      await refuseDisallowedGuild(interaction);
+    }
+    return;
+  }
+
   if (interaction.isAutocomplete()) {
     await handleAutocompleteInteraction(client, interaction);
     return;

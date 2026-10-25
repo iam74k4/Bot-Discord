@@ -12,7 +12,9 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       exclude: [
         'src/**/*.test.ts',
-        'src/__tests__/**',
+        // Test support code anywhere (src/__tests__/helpers, feature
+        // *.helpers.ts): scaffolding is not what the floors measure.
+        'src/**/__tests__/**',
         'src/shared/types/**',
         'src/index.ts',
         'src/client.ts',
@@ -20,13 +22,14 @@ export default defineConfig({
         'src/app-scripts/**', // CLI maintenance scripts
         'src/events/**', // Discord event handlers (integration)
       ],
-      // Current minimum thresholds: lines 46%, functions 52%, branches 38%, statements 45%
-      // (measured 49.7 / 56.2 / 41.2 / 48.5 — raise these as coverage grows)
+      // Floors sit a little under the measured coverage of production code
+      // (lines 97.7, functions 97.4, branches 94.2, statements 97.1) so CI
+      // fails when a change lands without tests, not on rounding noise.
       thresholds: {
-        lines: 46,
-        functions: 52,
-        branches: 38,
-        statements: 45,
+        lines: 96,
+        functions: 96,
+        branches: 93,
+        statements: 95,
       },
     },
   },

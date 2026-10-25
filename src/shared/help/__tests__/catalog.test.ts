@@ -203,6 +203,7 @@ describe('the real command definitions', () => {
       'general',
       'notification',
       'owner',
+      'tts',
       'voice',
     ]);
   });

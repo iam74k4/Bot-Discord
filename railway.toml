@@ -2,7 +2,12 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "npm start"
+# Run node directly: `npm start` keeps SIGTERM from reaching the bot, so the
+# graceful shutdown (final backup, closing VC sessions) never ran.
+startCommand = "node dist/index.js"
+# Time between SIGTERM and SIGKILL on redeploy. Must exceed
+# SHUTDOWN_TIMEOUT_MS (default 10s) so the shutdown can finish.
+drainingSeconds = 15
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
