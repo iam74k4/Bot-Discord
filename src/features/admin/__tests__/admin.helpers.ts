@@ -199,7 +199,15 @@ type EndHandler = () => unknown;
  * walks. `collect`/`end` invoke the registered handlers and wait for them,
  * which a plain EventEmitter would not do for async listeners.
  */
-export function createPanelHarness() {
+export interface PanelHarness {
+  reply: Mock;
+  editReply: Mock;
+  message: { createMessageComponentCollector: Mock };
+  collect(interaction: MessageComponentInteraction): Promise<void>;
+  end(): Promise<void>;
+}
+
+export function createPanelHarness(): PanelHarness {
   const handlers: { collect?: CollectHandler; end?: EndHandler } = {};
   const collector = {
     on: vi.fn((event: 'collect' | 'end', handler: CollectHandler) => {
