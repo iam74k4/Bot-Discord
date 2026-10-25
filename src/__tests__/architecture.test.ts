@@ -171,3 +171,19 @@ describe('layer discipline inside a feature', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+describe('test layout', () => {
+  /**
+   * Tests live in `__tests__/` directories. One that sat next to its module
+   * was compiled into `dist/` and shipped with the bot; the build now
+   * excludes `*.test.ts` anywhere, and this keeps the layout uniform.
+   */
+  it('keeps every test file in a __tests__ directory', () => {
+    const stray = readdirSync(SRC, { recursive: true, encoding: 'utf-8' })
+      .map((path) => path.replace(/\\/g, '/'))
+      .filter((path) => path.endsWith('.test.ts'))
+      .filter((path) => !path.split('/').includes('__tests__'));
+
+    expect(stray).toEqual([]);
+  });
+});

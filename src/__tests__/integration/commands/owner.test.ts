@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MessageFlags } from 'discord.js';
 import { createMockInteraction } from '../../helpers/discord.js';
+import { t } from '../../../locales/index.js';
 
 vi.mock('../../../infrastructure/database/connection.js', () => ({
   database: {
@@ -79,6 +80,13 @@ describe('Owner Command', () => {
       expect(interaction.reply).toHaveBeenCalledWith(
         expect.objectContaining({
           flags: MessageFlags.Ephemeral,
+          embeds: [
+            expect.objectContaining({
+              data: expect.objectContaining({
+                description: t('owner.errors.ownerOnly', 'en'),
+              }),
+            }),
+          ],
         })
       );
     });
@@ -95,7 +103,105 @@ describe('Owner Command', () => {
         await import('../../../features/admin/commands/owner.js');
       await command.execute(interaction);
 
-      expect(interaction.reply).toHaveBeenCalled();
+      expect(interaction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({
+          embeds: [
+            expect.objectContaining({
+              data: expect.objectContaining({
+                title: t('admin.panel.statsTitle', 'en'),
+              }),
+            }),
+          ],
+        })
+      );
+    });
+  });
+
+  describe('DB Subcommand', () => {
+    it('should list row counts of the tracked tables', async () => {
+      const interaction = createMockInteraction({
+        commandName: 'owner',
+        subcommandGroup: 'system',
+        subcommand: 'db',
+        user: { id: '987654321098765432' },
+      });
+
+      const { command } =
+        await import('../../../features/admin/commands/owner.js');
+      await command.execute(interaction);
+
+      const [[payload]] = vi.mocked(interaction.reply).mock
+        .calls as unknown as [
+        [{ embeds: Array<{ data: { fields: Array<{ value: string }> } }> }],
+      ];
+      expect(payload.embeds[0]!.data.fields[0]!.value).toBe(
+        [
+          '`guild_settings`: 5',
+          '`audit_logs`: 5',
+          '`notification_channels`: 5',
+          '`voice_sessions`: 5',
+        ].join('\n')
+      );
+    });
+  });
+
+  describe('Guilds Subcommand', () => {
+    it('should show an empty state when the bot is in no server', async () => {
+      const interaction = createMockInteraction({
+        commandName: 'owner',
+        subcommandGroup: 'system',
+        subcommand: 'guilds',
+        user: { id: '987654321098765432' },
+      });
+
+      const { command } =
+        await import('../../../features/admin/commands/owner.js');
+      await command.execute(interaction);
+
+      expect(interaction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({
+          embeds: [
+            expect.objectContaining({
+              data: expect.objectContaining({
+                title: t('admin.panel.guildsTitle', 'en'),
+                description: t('common.noData', 'en'),
+              }),
+            }),
+          ],
+        })
+      );
+    });
+  });
+
+  describe('Broadcast Subcommand', () => {
+    it('should refuse to broadcast when no server opted in', async () => {
+      const interaction = createMockInteraction({
+        commandName: 'owner',
+        subcommandGroup: 'system',
+        subcommand: 'broadcast',
+        options: { message: 'Hello' },
+        user: { id: '987654321098765432' },
+      });
+
+      const { command } =
+        await import('../../../features/admin/commands/owner.js');
+      const { awaitConfirmation } =
+        await import('../../../shared/utils/confirm.js');
+      await command.execute(interaction);
+
+      expect(awaitConfirmation).not.toHaveBeenCalled();
+      expect(interaction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({
+          flags: MessageFlags.Ephemeral,
+          embeds: [
+            expect.objectContaining({
+              data: expect.objectContaining({
+                description: t('owner.broadcast.noChannel', 'en'),
+              }),
+            }),
+          ],
+        })
+      );
     });
   });
 
@@ -117,7 +223,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
-                title: 'System Health Check',
+                title: t('admin.panel.healthTitle', 'en'),
               }),
             }),
           ]),
@@ -145,7 +251,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
-                title: 'Database Backups',
+                title: t('admin.panel.backupsTitle', 'en'),
               }),
             }),
           ]),
@@ -171,6 +277,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
+                // owner.ts hard-codes this title per locale (no locale key).
                 title: 'Backup Complete',
               }),
             }),
@@ -198,7 +305,7 @@ describe('Owner Command', () => {
           embeds: expect.arrayContaining([
             expect.objectContaining({
               data: expect.objectContaining({
-                title: 'Bot Metrics',
+                title: t('admin.panel.metricsTitle', 'en'),
               }),
             }),
           ]),

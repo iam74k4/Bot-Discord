@@ -8,6 +8,19 @@ import { connectionManager } from '../recording/connectionManager.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 
 /**
+ * What the bot is doing in the caller's (not excluded) channel. A
+ * text-to-speech-only join sits there deafened and keeps nothing, which is
+ * worth saying rather than leaving the member to guess from the bot's icon.
+ */
+function currentChannelKey(channelId: string) {
+  const connection = connectionManager.getConnection(channelId);
+  if (!connection) return 'record.autojoin.currentChannelNotKept' as const;
+  return connection.receiving === false
+    ? ('record.autojoin.currentChannelReadingOnly' as const)
+    : ('record.autojoin.currentChannelBuffered' as const);
+}
+
+/**
  * `/voice status` - recorder capacity plus whether this channel is buffered.
  */
 export async function executeStatusCommand(
@@ -38,10 +51,8 @@ export async function executeStatusCommand(
     voiceSettingsRepository.isChannelExcluded(guildId, memberChannelId)
   ) {
     currentChannelState = t('record.autojoin.currentChannelExcluded', locale);
-  } else if (connectionManager.getConnection(memberChannelId)) {
-    currentChannelState = t('record.autojoin.currentChannelBuffered', locale);
   } else {
-    currentChannelState = t('record.autojoin.currentChannelNone', locale);
+    currentChannelState = t(currentChannelKey(memberChannelId), locale);
   }
 
   const embed = createEmbed({
