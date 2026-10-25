@@ -2,6 +2,7 @@ import {
   ApplicationCommandOptionType,
   ChannelType,
   type ChatInputCommandInteraction,
+  InteractionContextType,
   PermissionFlagsBits,
 } from 'discord.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -22,22 +23,30 @@ vi.mock('../application/index.js', () => ({
 }));
 
 const { command } = await import('../commands/record.js');
+const { resolveCooldownMs } = await import('../../../middleware/index.js');
 const { parseDurationString } = await vi.importActual<
   typeof import('../recording/recordingService.js')
 >('../recording/recordingService.js');
 
 type OptionJSON = {
   name: string;
+  name_localizations?: Record<string, string>;
   type: ApplicationCommandOptionType;
   required?: boolean;
   options?: OptionJSON[];
-  choices?: Array<{ name: string; value: string }>;
+  choices?: Array<{
+    name: string;
+    name_localizations?: Record<string, string>;
+    value: string;
+  }>;
   channel_types?: ChannelType[];
 };
 
 const json = command.data.toJSON() as unknown as {
   name: string;
   options: OptionJSON[];
+  default_member_permissions?: string | null;
+  contexts?: InteractionContextType[];
 };
 
 function option(name: string, from: OptionJSON[] = json.options): OptionJSON {
@@ -95,12 +104,42 @@ describe('/voice command definition', () => {
     expect(seconds).toEqual([30, 60, 120, 180, 300]);
   });
 
-  it('is limited to server managers and rate limited', () => {
+  it('is limited to server managers, and checked again on every run', () => {
     expect(command.middleware).toEqual(['permissions', 'cooldown']);
     expect(command.options?.permissions).toEqual([
       PermissionFlagsBits.ManageGuild,
     ]);
-    expect(command.options?.cooldown).toBe(10_000);
+  });
+
+  it('is hidden from members by default and offered in servers only', () => {
+    expect(json.default_member_permissions).toBe(
+      PermissionFlagsBits.ManageGuild.toString()
+    );
+    expect(json.contexts).toEqual([InteractionContextType.Guild]);
+  });
+
+  it('rate limits recording, not looking at the status or changing settings', () => {
+    expect(resolveCooldownMs(command, 'voice record')).toBe(10_000);
+    expect(resolveCooldownMs(command, 'voice status')).toBe(3_000);
+    expect(resolveCooldownMs(command, 'voice autojoin exclude')).toBe(3_000);
+  });
+
+  it('labels the record duration as how far back to go, in Japanese too', () => {
+    const duration = option('duration', option('record').options);
+    expect(duration.name_localizations).toEqual({ ja: 'さかのぼる長さ' });
+    expect(duration.choices?.map((c) => c.name_localizations?.ja)).toEqual([
+      '直前30秒',
+      '直前1分',
+      '直前2分',
+      '直前3分',
+      '直前5分（最大）',
+    ]);
+    for (const sub of ['exclude', 'include']) {
+      expect(
+        option('channel', option(sub, option('autojoin').options).options)
+          .name_localizations
+      ).toEqual({ ja: 'チャンネル' });
+    }
   });
 });
 

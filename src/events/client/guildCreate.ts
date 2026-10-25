@@ -1,7 +1,7 @@
 import { Events } from 'discord.js';
 import { Event } from '../../shared/types/index.js';
 import { getErrorMessage, logger } from '../../shared/utils/logger.js';
-import { isGuildAllowed } from '../../app/guildAllowlist.js';
+import { isGuildAllowed } from '../../shared/utils/guildAllowlist.js';
 
 /**
  * GuildCreate - the bot was just added to a server.

@@ -82,6 +82,18 @@ class CooldownStore {
     }
   }
 
+  /**
+   * Clear `key` and every key beneath it (`voice` also clears `voice record`
+   * and `voice autojoin exclude`) for one user.
+   */
+  clearCooldownTree(key: string, userId: string): void {
+    for (const commandKey of [...this.cooldowns.keys()]) {
+      if (commandKey === key || commandKey.startsWith(`${key} `)) {
+        this.clearCooldown(commandKey, userId);
+      }
+    }
+  }
+
   clearAll(): void {
     for (const timer of this.timers.values()) {
       clearTimeout(timer);

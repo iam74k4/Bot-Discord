@@ -9,10 +9,13 @@ import { validateBackupFilename } from './types.js';
  * Local filesystem storage for backups
  */
 export class LocalStorage implements IBackupStorage {
-  private readonly backupDir: string;
-
-  constructor() {
-    this.backupDir = env.BACKUP_DIR;
+  /**
+   * Read on use, not in the constructor: the backup service is created when
+   * its module is imported, and reading a setting then would validate the
+   * whole configuration as a side effect of an import.
+   */
+  private get backupDir(): string {
+    return env.BACKUP_DIR;
   }
 
   /**

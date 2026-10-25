@@ -33,13 +33,15 @@ function isChannelExcluded(guildId: string, channelId: string): boolean {
   }
 }
 
-function addExclusion(guildId: string, channelId: string): void {
-  database
+/** @returns true when the channel was not excluded before */
+function addExclusion(guildId: string, channelId: string): boolean {
+  const result = database
     .prepare(
       `INSERT OR IGNORE INTO voice_autojoin_exclusions (guild_id, channel_id, created_at)
        VALUES (?, ?, ?)`
     )
     .run(guildId, channelId, Date.now());
+  return result.changes > 0;
 }
 
 function removeExclusion(guildId: string, channelId: string): boolean {

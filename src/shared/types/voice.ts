@@ -24,22 +24,55 @@ export interface RecordingOptions {
   userId: Snowflake;
   /** Guild ID */
   guildId: Snowflake;
+  /**
+   * Largest file Discord accepts from this interaction, in bytes
+   * (`interaction.attachmentSizeLimit`). Recordings that would not fit are
+   * split into equal, sample-aligned parts below it. Defaults to
+   * `DISCORD_LIMITS.FALLBACK_ATTACHMENT_BYTES`.
+   */
+  maxUploadBytes?: number;
+}
+
+/**
+ * One WAV file of a recording.
+ */
+export interface RecordingPart {
+  /** Where the retention copy was written */
+  filePath: string;
+  /** Size of the WAV file in bytes, header included */
+  size: number;
+  /**
+   * The same WAV in memory, so delivery does not read the file back from
+   * disk (and again on every retry).
+   */
+  data: Buffer;
+  /** Offset of the part's first sample from the start of the clip, in seconds */
+  startSeconds: number;
+  /** Offset just past the part's last sample, in seconds */
+  endSeconds: number;
 }
 
 /**
  * Recording result
  */
 export interface RecordingResult {
-  /** File path of the recorded audio */
+  /** File path of the first (or only) part */
   filePath: string;
-  /** File size in bytes */
+  /** Total size of every part in bytes */
   fileSize: number;
-  /** Duration in seconds */
+  /**
+   * Seconds actually saved. Shorter than requested when the bot has not
+   * been hearing the channel for that long yet.
+   */
   duration: number;
-  /** Whether the file was split */
+  /** Seconds that were asked for */
+  requestedDuration?: number;
+  /** Whether the recording was split into several files */
   isSplit: boolean;
-  /** Additional file paths if split */
+  /** File paths of parts 2..n when split */
   additionalFiles?: string[];
+  /** Every part in order, with its bytes */
+  parts?: RecordingPart[];
 }
 
 /**

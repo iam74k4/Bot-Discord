@@ -26,7 +26,7 @@ vi.mock('../../../shared/utils/logger.js', () => ({
   getErrorMessage: (e: unknown) => String(e),
 }));
 
-const { closeDatabase, database, getTableCount } =
+const { closeDatabase, database, databaseFilePath, getTableCount } =
   await import('../connection.js');
 
 let workDir: string;
@@ -83,6 +83,18 @@ describe('database connection', () => {
     expect(database.pragma('journal_mode', { simple: true })).toBe('wal');
   });
 
+  it('syncs at checkpoints (NORMAL) from the start rather than on every commit', () => {
+    // A fresh WAL connection reports FULL (2) until SQLite applies its
+    // build-time WAL default on the first transaction. Stating NORMAL (1)
+    // means no commit on the voice path ever waits for an fsync.
+    expect(database.pragma('synchronous', { simple: true })).toBe(1);
+  });
+
+  it('names the file it opens, for the backup worker and restore', () => {
+    expect(databaseFilePath()).toBe(dbFile());
+    expect(database.name).toBe(databaseFilePath());
+  });
+
   it('shares one connection between the proxy and getTableCount', () => {
     database.exec('CREATE TABLE a (x INTEGER)');
     database.exec('CREATE TABLE b (x INTEGER)');
@@ -121,6 +133,44 @@ describe('database connection', () => {
       'Database connection closed',
       'Database connection opened',
     ]);
+  });
+
+  it('refreshes planner statistics for the tables it queried before closing', () => {
+    database.exec('CREATE TABLE t (a INTEGER, b TEXT)');
+    database.exec('CREATE INDEX t_a ON t (a)');
+    const insert = database.prepare('INSERT INTO t (a, b) VALUES (?, ?)');
+    database.transaction(() => {
+      for (let i = 0; i < 3000; i++) insert.run(i % 50, 'x');
+    })();
+    database.prepare('SELECT * FROM t WHERE a = ?').all(3);
+
+    closeDatabase();
+
+    expect(
+      database.prepare("SELECT idx FROM sqlite_stat1 WHERE tbl = 't'").all()
+    ).toEqual([{ idx: 't_a' }]);
+  });
+
+  it('still closes the connection when optimizing fails', () => {
+    // exec() returns the connection itself, so its own pragma can fail.
+    const connection = database.exec('SELECT 1');
+    const pragma = connection.pragma.bind(connection);
+    vi.spyOn(connection, 'pragma').mockImplementation((source, options) => {
+      if (source === 'optimize')
+        throw new Error('attempt to write a readonly database');
+      return pragma(source, options);
+    });
+
+    closeDatabase();
+
+    expect(connection.open).toBe(false);
+    expect(logger.debug).toHaveBeenCalledWith(
+      'PRAGMA optimize before close was skipped:',
+      expect.objectContaining({
+        message: 'attempt to write a readonly database',
+      })
+    );
+    expect(debugMessages()).toContain('Database connection closed');
   });
 
   it('does nothing when closing a connection that was never opened', () => {

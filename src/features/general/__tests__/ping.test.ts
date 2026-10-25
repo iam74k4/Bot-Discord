@@ -155,10 +155,25 @@ describe('/general ping', () => {
     expect(fields[1].name).toBe(t('ping.apiLatency', 'en'));
   });
 
-  // KNOWN BUG (reported, ping.ts:31): the raw -1 is shown as "-1ms", which
-  // reads like a measurement. `it.fails` until a placeholder is shown; then
-  // change it to `it`.
-  it.fails('does not show the raw -1 before the first heartbeat', async () => {
+  // Regression: the raw -1 used to be shown as "-1ms", which reads like a
+  // (broken) measurement.
+  it.each<Locale>(['en', 'ja'])(
+    'says the gateway latency is not measured yet before the first heartbeat (%s)',
+    async (locale) => {
+      resolveLocale.mockReturnValue(locale);
+
+      const { editReply } = await ping({
+        deferReply: deferredAt(NOW),
+        wsPing: -1,
+      });
+
+      expect(embedAt(editReply).fields?.[1].value).toBe(
+        t('ping.notMeasured', locale)
+      );
+    }
+  );
+
+  it('does not show the raw -1 before the first heartbeat', async () => {
     const { editReply } = await ping({
       deferReply: deferredAt(NOW),
       wsPing: -1,

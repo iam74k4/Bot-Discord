@@ -1,5 +1,6 @@
 import type { Client } from 'discord.js';
 import { getTableCount } from '../database/connection.js';
+import { metrics, type EventLoopStats } from '../metrics/index.js';
 
 /**
  * Health status levels
@@ -28,6 +29,12 @@ export interface HealthStatus {
     ping: number;
   };
   services: Record<string, boolean>;
+  /**
+   * Main-thread delay and utilization over the current window; null when
+   * the monitor is not running. Shown, not used for the status: one long
+   * recording export would otherwise flip the bot to "degraded".
+   */
+  eventLoop?: EventLoopStats | null;
   timestamp: number;
 }
 
@@ -112,8 +119,22 @@ export function getHealthStatus(client: Client): HealthStatus {
     database,
     discord,
     services: Object.fromEntries(serviceStatus),
+    eventLoop: metrics.getEventLoopStats(),
     timestamp: Date.now(),
   };
+}
+
+function formatEventLoop(
+  eventLoop: EventLoopStats | null | undefined
+): string[] {
+  if (!eventLoop) return [];
+  return [
+    '**Event loop**',
+    `├ Delay p50 / p99: ${eventLoop.p50Ms} / ${eventLoop.p99Ms} ms`,
+    `├ Max delay: ${eventLoop.maxMs} ms`,
+    `└ Utilization: ${Math.round(eventLoop.utilization * 100)}%`,
+    '',
+  ];
 }
 
 /**
@@ -163,6 +184,7 @@ export function formatHealthStatus(health: HealthStatus): string {
     `├ Connected: ${health.database.connected ? '✅' : '❌'}`,
     `└ Tables: ${health.database.tables}`,
     '',
+    ...formatEventLoop(health.eventLoop),
     '**Services**',
     ...serviceLines,
   ];

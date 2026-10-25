@@ -1,3 +1,4 @@
+import { PermissionFlagsBits, PermissionsBitField } from 'discord.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const showSettingsPanel = vi.fn();
@@ -19,10 +20,8 @@ vi.mock('../../../infrastructure/audit/index.js', () => ({
   logAuditAction: vi.fn(),
 }));
 
-vi.mock('../../../shared/utils/discord.js', () => ({
-  interactionHasGuildPermission: vi.fn(() => true),
-  getSendableTextChannel: vi.fn(),
-}));
+/** A Manage Server holder, as Discord describes them on the interaction. */
+const MANAGER = new PermissionsBitField(PermissionFlagsBits.ManageGuild);
 
 describe('admin settings panel routing', () => {
   beforeEach(() => {
@@ -36,6 +35,7 @@ describe('admin settings panel routing', () => {
     const interaction = {
       locale: 'en-US',
       guild: { id: 'guild-1' },
+      memberPermissions: MANAGER,
       options: {
         getSubcommand: vi.fn().mockReturnValue('view'),
       },
@@ -58,6 +58,7 @@ describe('admin settings panel routing', () => {
     const interaction = {
       locale: 'ja',
       guild: { id: 'guild-1' },
+      memberPermissions: MANAGER,
       options: {
         getSubcommand: vi.fn().mockReturnValue('logs'),
       },

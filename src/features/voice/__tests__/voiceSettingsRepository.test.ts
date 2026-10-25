@@ -95,11 +95,13 @@ describe('voiceSettingsRepository', () => {
       expect(repo.listExclusions('guild-2')).toEqual([]);
     });
 
-    it('ignores a duplicate add instead of throwing', () => {
-      repo.addExclusion(GUILD, 'voice-1');
+    it('ignores a duplicate add instead of throwing, and says nothing was added', () => {
+      expect(repo.addExclusion(GUILD, 'voice-1')).toBe(true);
 
-      expect(() => repo.addExclusion(GUILD, 'voice-1')).not.toThrow();
+      expect(repo.addExclusion(GUILD, 'voice-1')).toBe(false);
       expect(repo.listExclusions(GUILD)).toEqual(['voice-1']);
+      // The same channel id in another guild is a new exclusion.
+      expect(repo.addExclusion('guild-2', 'voice-1')).toBe(true);
     });
 
     it('lists exclusions oldest first', () => {

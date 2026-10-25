@@ -2,14 +2,26 @@ import {
   type AttachmentBuilder,
   ChannelType,
   ChatInputCommandInteraction,
+  DiscordAPIError,
   type EmbedBuilder,
+  HTTPError,
   MessageFlags,
   PermissionFlagsBits,
+  RESTJSONErrorCodes,
 } from 'discord.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const getConnection = vi.hoisted(() => vi.fn());
+const connect = vi.hoisted(() => vi.fn());
+const getConnectedChannelInGuild = vi.hoisted(() => vi.fn());
+const isAtLimit = vi.hoisted(() => vi.fn());
 const recordAudio = vi.hoisted(() => vi.fn());
+const releaseCooldown = vi.hoisted(() => vi.fn());
+const announceBuffering = vi.hoisted(() => vi.fn());
+const settings = vi.hoisted(() => ({
+  autoJoin: true,
+  excluded: new Set<string>(),
+}));
 
 /** Mutable so individual tests can probe the limit and retry boundaries. */
 const limits = vi.hoisted(() => ({
@@ -21,20 +33,46 @@ const limits = vi.hoisted(() => ({
 vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: {
     getConnection,
+    connect,
+    getConnectedChannelInGuild,
+    isAtLimit,
   },
 }));
 
+vi.mock('../repositories/voiceSettingsRepository.js', () => ({
+  voiceSettingsRepository: {
+    isAutoJoinEnabled: () => settings.autoJoin,
+    isChannelExcluded: (_guildId: string, channelId: string) =>
+      settings.excluded.has(channelId),
+  },
+}));
+
+vi.mock('../application/announce.js', () => ({ announceBuffering }));
+
+vi.mock('../../../middleware/index.js', () => ({ releaseCooldown }));
+
 vi.mock('../recording/recordingService.js', () => ({
   parseDurationString: (value: string) => {
-    const seconds: Record<string, number> = { '30s': 30, '5m': 300, '6m': 360 };
+    const seconds: Record<string, number> = {
+      '30s': 30,
+      '1m': 60,
+      '5m': 300,
+      '6m': 360,
+    };
     if (value in seconds) return seconds[value];
     throw new Error('Invalid duration format');
   },
   recordAudio,
   RecordingNoAudibleAudioError: class RecordingNoAudibleAudioError extends Error {
-    constructor() {
+    constructor(readonly checkedSeconds?: number) {
       super('No audible audio');
       this.name = 'RecordingNoAudibleAudioError';
+    }
+  },
+  RecordingInProgressError: class RecordingInProgressError extends Error {
+    constructor() {
+      super('Recording already in progress for this channel');
+      this.name = 'RecordingInProgressError';
     }
   },
 }));
@@ -47,6 +85,7 @@ vi.mock('../../../config/index.js', async () => {
     ...actual,
     env: {
       ...actual.env,
+      MAX_CONCURRENT_VC_CONNECTIONS: 4,
       get MAX_RECORDING_DURATION() {
         return limits.maxRecording;
       },
@@ -69,9 +108,17 @@ vi.mock('../../../shared/utils/logger.js', () => ({
 }));
 
 import { executeRecordCommand } from '../application/record.js';
-import { RecordingNoAudibleAudioError } from '../recording/recordingService.js';
+import {
+  RecordingInProgressError,
+  RecordingNoAudibleAudioError,
+} from '../recording/recordingService.js';
 import { metrics } from '../../../infrastructure/metrics/index.js';
 import { t } from '../../../locales/index.js';
+import { logger } from '../../../shared/utils/logger.js';
+import { DISCORD_LIMITS } from '../../../config/index.js';
+import { COLORS } from '../../../shared/utils/constants/index.js';
+
+const MiB = 1024 * 1024;
 
 interface RecordInteractionOptions {
   duration?: string;
@@ -84,15 +131,30 @@ interface RecordInteractionOptions {
   channel?: object | null;
   /** Permissions the bot holds there; `null` when Discord cannot resolve any. */
   granted?: bigint[] | null;
+  /** Bot permissions in the voice channel (for the diagnosis). */
+  voiceGranted?: bigint[];
+  /** `interaction.attachmentSizeLimit`; undefined leaves it out. */
+  attachmentSizeLimit?: number;
 }
 
 function createRecordInteraction(
   followUpImpl: (payload: unknown) => Promise<unknown>,
   options: RecordInteractionOptions = {}
 ): ChatInputCommandInteraction {
+  const voiceGranted = options.voiceGranted ?? [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.Connect,
+  ];
   const voiceChannel =
     options.voiceChannel === undefined
-      ? { id: 'voice-1', name: 'General', type: ChannelType.GuildVoice }
+      ? {
+          id: 'voice-1',
+          name: 'General',
+          type: ChannelType.GuildVoice,
+          permissionsFor: () => ({
+            has: (flag: bigint) => voiceGranted.includes(flag),
+          }),
+        }
       : options.voiceChannel;
 
   const granted =
@@ -114,8 +176,11 @@ function createRecordInteraction(
 
   return {
     locale: options.locale ?? 'en-US',
+    commandName: 'voice',
     // No guildId keeps locale resolution off the database.
     guildId: null,
+    channelId: 'text-1',
+    attachmentSizeLimit: options.attachmentSizeLimit,
     user: { id: 'user-1', tag: 'User#0001' },
     member:
       options.hasMember === false ? null : { voice: { channel: voiceChannel } },
@@ -144,6 +209,12 @@ function createRecordInteraction(
 
 const delivered = async () => ({});
 
+/** Every file upload fails; plain messages (warnings) still go through. */
+const uploadsFail = (error: () => unknown) => async (payload: unknown) => {
+  if ((payload as Payload).files) throw error();
+  return {};
+};
+
 type Payload = {
   embeds?: EmbedBuilder[];
   files?: AttachmentBuilder[];
@@ -164,6 +235,7 @@ function lastEditEmbed(interaction: ChatInputCommandInteraction) {
   return edits[edits.length - 1].embeds![0].toJSON();
 }
 
+/** The single private reply - a refusal or the progress message. */
 function replyEmbed(interaction: ChatInputCommandInteraction) {
   expect(interaction.reply).toHaveBeenCalledTimes(1);
   const [payload] = payloadsOf(interaction.reply);
@@ -171,97 +243,161 @@ function replyEmbed(interaction: ChatInputCommandInteraction) {
   return payload.embeds![0].toJSON();
 }
 
+/** A WAV part as recordAudio returns it. */
+function part(name: string, size: number, start: number, end: number) {
+  return {
+    filePath: `/tmp/recordings/${name}`,
+    size,
+    data: Buffer.alloc(16, name.length),
+    startSeconds: start,
+    endSeconds: end,
+  };
+}
+
+function apiError(status: number, code: number) {
+  return new DiscordAPIError(
+    { message: 'rejected', code },
+    code,
+    status,
+    'POST',
+    '/webhooks/x',
+    {}
+  );
+}
+
+function splitResult() {
+  const parts = [
+    part('recording_part1.wav', 12 * MiB, 0, 150),
+    part('recording_part2.wav', 12 * MiB, 150, 300),
+  ];
+  return {
+    filePath: parts[0].filePath,
+    fileSize: 24 * MiB,
+    duration: 300,
+    requestedDuration: 300,
+    isSplit: true,
+    additionalFiles: [parts[1].filePath],
+    parts,
+  };
+}
+
+function resetState() {
+  vi.clearAllMocks();
+  limits.maxRecording = 300;
+  limits.buffer = 600;
+  limits.retryMax = 0;
+  settings.autoJoin = true;
+  settings.excluded.clear();
+  getConnection.mockReturnValue({ channelId: 'voice-1' });
+  getConnectedChannelInGuild.mockReturnValue(undefined);
+  isAtLimit.mockReturnValue(false);
+  connect.mockResolvedValue(null);
+  announceBuffering.mockResolvedValue(undefined);
+}
+
 describe('executeRecordCommand split delivery', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    limits.maxRecording = 300;
-    limits.buffer = 600;
-    limits.retryMax = 0;
-    getConnection.mockReturnValue({ channelId: 'voice-1' });
-    recordAudio.mockResolvedValue({
-      filePath: '/tmp/recording_part1.wav',
-      fileSize: 24 * 1024 * 1024,
-      duration: 300,
-      isSplit: true,
-      additionalFiles: ['/tmp/recording_part2.wav'],
-    });
+    resetState();
+    recordAudio.mockResolvedValue(splitResult());
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('notifies the user when a split part fails after retries', async () => {
-    let followUpCalls = 0;
-    const interaction = createRecordInteraction(async () => {
-      followUpCalls += 1;
-      if (followUpCalls === 1) {
-        return {};
-      }
-      throw new Error('upload failed');
-    });
+  it('turns the progress message into the result and sends the other parts after it', async () => {
+    const interaction = createRecordInteraction(delivered);
 
     await executeRecordCommand(interaction);
 
-    const payloads = vi
-      .mocked(interaction.followUp)
-      .mock.calls.map(([payload]) => payload as Record<string, unknown>);
+    const result = lastEditEmbed(interaction);
+    expect(result.title).toBe(t('record.success', 'en'));
+    expect(result.footer?.text).toBe(
+      t('record.fileSizeSplit', 'en', { size: '24.00', count: 2 })
+    );
+    const [edit] = payloadsOf(interaction.editReply);
+    expect(edit.files?.[0].name).toBe('recording_part1.wav');
 
-    const incomplete = payloads.find(
-      (payload) =>
-        Array.isArray(payload.embeds) &&
-        JSON.stringify(payload.embeds).includes(
-          t('record.errors.deliveryIncomplete', 'en')
-        )
+    const [second] = payloadsOf(interaction.followUp);
+    expect(second.content).toBe(
+      t('record.partLabel', 'en', {
+        part: 2,
+        total: 2,
+        from: '2:30',
+        to: '5:00',
+      })
+    );
+    expect(second.files?.[0].name).toBe('recording_part2.wav');
+    expect(second.flags).toBe(MessageFlags.Ephemeral);
+    expect(interaction.followUp).toHaveBeenCalledTimes(1);
+  });
+
+  it('uploads the parts from memory instead of reading them back from disk', async () => {
+    const interaction = createRecordInteraction(delivered);
+
+    await executeRecordCommand(interaction);
+
+    const [edit] = payloadsOf(interaction.editReply);
+    const [second] = payloadsOf(interaction.followUp);
+    const parts = splitResult().parts;
+    expect(edit.files?.[0].attachment).toEqual(parts[0].data);
+    expect(second.files?.[0].attachment).toEqual(parts[1].data);
+  });
+
+  it('labels parts without times when the result carries only paths', async () => {
+    recordAudio.mockResolvedValue({
+      filePath: '/tmp/recording_part1.wav',
+      fileSize: 24 * MiB,
+      duration: 300,
+      isSplit: true,
+      additionalFiles: ['/tmp/recording_part2.wav'],
+    });
+    const interaction = createRecordInteraction(delivered);
+
+    await executeRecordCommand(interaction);
+
+    const [second] = payloadsOf(interaction.followUp);
+    expect(second.content).toBe(
+      t('record.partLabelShort', 'en', { part: 2, total: 2 })
+    );
+    expect(second.files?.[0].attachment).toBe('/tmp/recording_part2.wav');
+  });
+
+  it('notifies the user when a split part fails after retries', async () => {
+    const interaction = createRecordInteraction(
+      uploadsFail(() => new Error('upload failed'))
     );
 
-    expect(incomplete).toBeDefined();
-    expect(incomplete?.flags).toBe(MessageFlags.Ephemeral);
+    await executeRecordCommand(interaction);
+
+    const payloads = payloadsOf(interaction.followUp);
+    const warning = payloads[payloads.length - 1];
+    expect(warning.flags).toBe(MessageFlags.Ephemeral);
+    expect(warning.embeds![0].toJSON().title).toBe(
+      t('record.errors.deliveryIncomplete', 'en')
+    );
+    // The delivered file stays: the result message is not overwritten.
+    expect(lastEditEmbed(interaction).title).toBe(t('record.success', 'en'));
   });
 
   it('does not warn when every split part is delivered', async () => {
-    const interaction = createRecordInteraction(async () => ({}));
+    const interaction = createRecordInteraction(delivered);
 
     await executeRecordCommand(interaction);
 
-    const payloads = vi
-      .mocked(interaction.followUp)
-      .mock.calls.map(([payload]) => payload as Record<string, unknown>);
-    const incomplete = payloads.find(
-      (payload) =>
-        Array.isArray(payload.embeds) &&
-        JSON.stringify(payload.embeds).includes(
-          t('record.errors.deliveryIncomplete', 'en')
-        )
+    expect(JSON.stringify(payloadsOf(interaction.followUp))).not.toContain(
+      t('record.errors.deliveryIncomplete', 'en')
     );
-
-    expect(incomplete).toBeUndefined();
-    expect(interaction.followUp).toHaveBeenCalledTimes(2);
   });
 
   it('counts the recording so /owner system metrics is not stuck at zero', async () => {
     const before = metrics.getSnapshot().voice;
 
-    await executeRecordCommand(createRecordInteraction(async () => ({})));
+    await executeRecordCommand(createRecordInteraction(delivered));
 
     const after = metrics.getSnapshot().voice;
     expect(after.recordings).toBe(before.recordings + 1);
     expect(after.totalSeconds).toBe(before.totalSeconds + 300);
-  });
-
-  it('labels each extra part and names the split in the footer', async () => {
-    const interaction = createRecordInteraction(delivered);
-
-    await executeRecordCommand(interaction);
-
-    const [main, part] = payloadsOf(interaction.followUp);
-    expect(main.embeds![0].toJSON().footer?.text).toBe(
-      'File size: 24.00MB (split into 2 files)'
-    );
-    expect(main.files?.[0].name).toBe('recording_part1.wav');
-    expect(part.content).toBe('Part 2/2');
-    expect(part.files?.[0].name).toBe('recording_part2.wav');
-    expect(part.flags).toBe(MessageFlags.Ephemeral);
   });
 
   it('falls back to generic attachment names when a path has no file name', async () => {
@@ -276,9 +412,12 @@ describe('executeRecordCommand split delivery', () => {
 
     await executeRecordCommand(interaction);
 
-    const [main, part] = payloadsOf(interaction.followUp);
-    expect(main.files?.[0].name).toBe('recording.wav');
-    expect(part.files?.[0].name).toBe('recording_part.wav');
+    expect(payloadsOf(interaction.editReply)[0].files?.[0].name).toBe(
+      'recording.wav'
+    );
+    expect(payloadsOf(interaction.followUp)[0].files?.[0].name).toBe(
+      'recording_part.wav'
+    );
   });
 
   it('retries a split part and stays quiet once it lands', async () => {
@@ -287,7 +426,7 @@ describe('executeRecordCommand split delivery', () => {
     let calls = 0;
     const interaction = createRecordInteraction(async () => {
       calls += 1;
-      if (calls === 2) throw new Error('rate limited');
+      if (calls === 1) throw new Error('socket hang up');
       return {};
     });
 
@@ -295,10 +434,8 @@ describe('executeRecordCommand split delivery', () => {
     await vi.runAllTimersAsync();
     await run;
 
-    const payloads = payloadsOf(interaction.followUp);
-    expect(payloads).toHaveLength(3);
-    expect(payloads[2].content).toBe('Part 2/2');
-    expect(JSON.stringify(payloads)).not.toContain(
+    expect(interaction.followUp).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(payloadsOf(interaction.followUp))).not.toContain(
       t('record.errors.deliveryIncomplete', 'en')
     );
   });
@@ -307,20 +444,20 @@ describe('executeRecordCommand split delivery', () => {
     vi.useFakeTimers();
     limits.retryMax = 3;
     let calls = 0;
-    // Call 1 is the main file; the extra part fails three times, then lands.
-    // Three retries are needed to tell 1s/2s/4s apart from 1s/2s/3s.
+    // The extra part fails three times, then lands. Three retries are needed
+    // to tell 1s/2s/4s apart from 1s/2s/3s.
     const interaction = createRecordInteraction(async () => {
       calls += 1;
-      if (calls >= 2 && calls <= 4) throw new Error('rate limited');
+      if (calls <= 3) throw new Error('socket hang up');
       return {};
     });
     const followUps = () => vi.mocked(interaction.followUp).mock.calls.length;
 
     const run = executeRecordCommand(interaction);
     for (const [delay, attemptsSoFar] of [
-      [1000, 2],
-      [2000, 3],
-      [4000, 4],
+      [1000, 1],
+      [2000, 2],
+      [4000, 3],
     ] as const) {
       await vi.advanceTimersByTimeAsync(delay - 1);
       expect(followUps()).toBe(attemptsSoFar);
@@ -329,94 +466,137 @@ describe('executeRecordCommand split delivery', () => {
     }
     await run;
 
+    expect(followUps()).toBe(4);
+  });
+
+  it('does not retry a part Discord rejected outright', async () => {
+    limits.retryMax = 3;
+    const interaction = createRecordInteraction(
+      uploadsFail(() => apiError(413, RESTJSONErrorCodes.RequestEntityTooLarge))
+    );
+
+    await executeRecordCommand(interaction);
+
+    // One attempt for the part, then the incomplete-delivery warning.
     const payloads = payloadsOf(interaction.followUp);
-    expect(payloads).toHaveLength(5);
-    expect(payloads[4].content).toBe('Part 2/2');
-    expect(JSON.stringify(payloads)).not.toContain(
+    expect(payloads).toHaveLength(2);
+    expect(payloads[1].embeds![0].toJSON().title).toBe(
       t('record.errors.deliveryIncomplete', 'en')
     );
   });
 
   it('warns about missing parts in the caller language', async () => {
-    let calls = 0;
     const interaction = createRecordInteraction(
-      async () => {
-        calls += 1;
-        if (calls === 1) return {};
-        throw new Error('upload failed');
-      },
+      uploadsFail(() => new Error('upload failed')),
       { locale: 'ja' }
     );
 
     await executeRecordCommand(interaction);
 
     const payloads = payloadsOf(interaction.followUp);
-    const last = payloads[payloads.length - 1];
-    expect(last.flags).toBe(MessageFlags.Ephemeral);
-    const warning = last.embeds![0].toJSON();
+    const warning = payloads[payloads.length - 1].embeds![0].toJSON();
     expect(warning.title).toBe(t('record.errors.deliveryIncomplete', 'ja'));
     expect(warning.description).toBe(
-      t('record.errors.deliveryIncompleteDesc', 'ja', { parts: '2', total: 2 })
+      t('record.errors.deliveryIncompleteDesc', 'ja', {
+        parts: '2',
+        total: 2,
+        command: '`/voice record`',
+      })
     );
   });
 
-  // KNOWN BUG (locales en.ts / ja.ts record.errors.deliveryIncompleteDesc):
-  // the warning above tells users to retry `/record`, which no longer exists;
-  // recording is `/voice record`. `it.fails` keeps the suite green until the
-  // text is fixed; then these start failing and should become plain `it`.
+  // Regression: the incomplete-delivery warning used to tell users to retry
+  // `/record`, a command that no longer exists; recording is `/voice record`.
   for (const locale of ['en', 'ja'] as const) {
-    it.fails(`points ${locale} users at /voice record to retry`, () => {
+    it(`points ${locale} users at /voice record to retry`, async () => {
+      const interaction = createRecordInteraction(
+        uploadsFail(() => new Error('upload failed')),
+        { locale }
+      );
+
+      await executeRecordCommand(interaction);
+
+      const payloads = payloadsOf(interaction.followUp);
       expect(
-        t('record.errors.deliveryIncompleteDesc', locale, {
-          parts: '2',
-          total: 2,
-        })
+        payloads[payloads.length - 1].embeds![0].toJSON().description
       ).toContain('`/voice record`');
+      expect(t('record.errors.deliveryIncompleteDesc', locale)).not.toContain(
+        '`/record`'
+      );
     });
   }
 
   it('lists every part that could not be delivered', async () => {
+    const parts = [
+      part('recording_part1.wav', 9 * MiB, 0, 100),
+      part('recording_part2.wav', 9 * MiB, 100, 200),
+      part('recording_part3.wav', 9 * MiB, 200, 300),
+    ];
     recordAudio.mockResolvedValue({
-      filePath: '/tmp/recording_part1.wav',
-      fileSize: 30 * 1024 * 1024,
-      duration: 300,
-      isSplit: true,
-      additionalFiles: ['/tmp/recording_part2.wav', '/tmp/recording_part3.wav'],
+      ...splitResult(),
+      fileSize: 27 * MiB,
+      additionalFiles: [parts[1].filePath, parts[2].filePath],
+      parts,
     });
-    let calls = 0;
-    const interaction = createRecordInteraction(async () => {
-      calls += 1;
-      if (calls === 1) return {};
-      if (calls <= 3) throw new Error('upload failed');
-      return {};
-    });
+    const interaction = createRecordInteraction(
+      uploadsFail(() => new Error('upload failed'))
+    );
 
     await executeRecordCommand(interaction);
 
     const payloads = payloadsOf(interaction.followUp);
     const warning = payloads[payloads.length - 1].embeds![0].toJSON();
-    expect(warning.title).toBe(t('record.errors.deliveryIncomplete', 'en'));
     expect(warning.description).toBe(
       t('record.errors.deliveryIncompleteDesc', 'en', {
         parts: '2, 3',
         total: 3,
+        command: '`/voice record`',
       })
+    );
+  });
+
+  it('does not fail the command when even the error message cannot be sent', async () => {
+    const interaction = createRecordInteraction(async () => {
+      throw new Error('gone');
+    });
+
+    await expect(executeRecordCommand(interaction)).resolves.toBeUndefined();
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Failed to report a recording failure:',
+      'gone'
+    );
+  });
+
+  it('never overwrites the delivered file when sending the warning fails', async () => {
+    let calls = 0;
+    const interaction = createRecordInteraction(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('upload failed'); // part 2
+      if (calls === 2) throw new Error('warning failed'); // the warning
+      return {};
+    });
+
+    await executeRecordCommand(interaction);
+
+    // The result message with the file is still the last edit.
+    expect(lastEditEmbed(interaction).title).toBe(t('record.success', 'en'));
+    const last = payloadsOf(interaction.followUp).at(-1)!;
+    expect(last.embeds![0].toJSON().title).toBe(
+      t('record.errors.failed', 'en')
     );
   });
 });
 
 describe('executeRecordCommand', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    limits.maxRecording = 300;
-    limits.buffer = 600;
-    limits.retryMax = 0;
-    getConnection.mockReturnValue({ channelId: 'voice-1' });
+    resetState();
     recordAudio.mockResolvedValue({
       filePath: '/tmp/recording.wav',
       fileSize: 2 * 1024 * 1024,
       duration: 300,
+      requestedDuration: 300,
       isSplit: false,
+      parts: [part('recording.wav', 2 * MiB, 0, 300)],
     });
   });
 
@@ -424,7 +604,7 @@ describe('executeRecordCommand', () => {
     vi.useRealTimers();
   });
 
-  describe('before deferring', () => {
+  describe('refusals, answered at once and privately', () => {
     it('refuses outside a guild', async () => {
       const interaction = createRecordInteraction(delivered, {
         hasGuild: false,
@@ -452,7 +632,7 @@ describe('executeRecordCommand', () => {
       expect(recordAudio).not.toHaveBeenCalled();
     });
 
-    it('asks the caller to join a voice channel first', async () => {
+    it('asks the caller to join a voice channel first, and gives the cooldown back', async () => {
       const interaction = createRecordInteraction(delivered, {
         voiceChannel: null,
       });
@@ -462,7 +642,7 @@ describe('executeRecordCommand', () => {
       const embed = replyEmbed(interaction);
       expect(embed.title).toBe(t('record.errors.notInVoice', 'en'));
       expect(embed.description).toBe(t('record.errors.notInVoiceDesc', 'en'));
-      expect(interaction.deferReply).not.toHaveBeenCalled();
+      expect(releaseCooldown).toHaveBeenCalledWith(interaction);
     });
 
     it('answers in the caller language', async () => {
@@ -494,36 +674,16 @@ describe('executeRecordCommand', () => {
       );
       expect(getConnection).not.toHaveBeenCalled();
     });
-  });
 
-  describe('after deferring', () => {
-    it('defers privately and explains when the bot is not buffering that channel', async () => {
-      getConnection.mockReturnValue(undefined);
-      const interaction = createRecordInteraction(delivered);
-
-      await executeRecordCommand(interaction);
-
-      expect(interaction.deferReply).toHaveBeenCalledWith({
-        flags: MessageFlags.Ephemeral,
-      });
-      expect(getConnection).toHaveBeenCalledWith('voice-1');
-      const embed = lastEditEmbed(interaction);
-      expect(embed.title).toBe(t('record.errors.botNotInVoice', 'en'));
-      expect(embed.description).toBe(
-        t('record.errors.botNotInVoiceDesc', 'en')
-      );
-      expect(recordAudio).not.toHaveBeenCalled();
-    });
-
-    it('treats an uncached bot member as not connected', async () => {
+    it('says the bot state is unknown when its member is not cached', async () => {
       const interaction = createRecordInteraction(delivered, {
         botMember: null,
       });
 
       await executeRecordCommand(interaction);
 
-      expect(lastEditEmbed(interaction).title).toBe(
-        t('record.errors.botNotInVoice', 'en')
+      expect(replyEmbed(interaction).description).toBe(
+        t('record.errors.botUnavailable', 'en')
       );
       expect(recordAudio).not.toHaveBeenCalled();
     });
@@ -533,16 +693,16 @@ describe('executeRecordCommand', () => {
       ['cannot view the channel', [PermissionFlagsBits.AttachFiles]],
       ['has no resolvable permissions', null],
     ])(
-      'refuses before recording when the bot %s',
+      'refuses before recording when the bot %s, naming the channel',
       async (_label, granted: bigint[] | null) => {
         const interaction = createRecordInteraction(delivered, { granted });
 
         await executeRecordCommand(interaction);
 
-        const embed = lastEditEmbed(interaction);
+        const embed = replyEmbed(interaction);
         expect(embed.title).toBe(t('record.errors.noPermission', 'en'));
         expect(embed.description).toBe(
-          t('record.errors.noPermissionDesc', 'en')
+          t('record.errors.noPermissionDesc', 'en', { channel: 'text-1' })
         );
         expect(recordAudio).not.toHaveBeenCalled();
       }
@@ -563,32 +723,31 @@ describe('executeRecordCommand', () => {
 
       await executeRecordCommand(interaction);
 
-      const embed = lastEditEmbed(interaction);
+      const embed = replyEmbed(interaction);
       expect(embed.title).toBe(t('record.errors.invalidDuration', 'en'));
       expect(embed.description).toBe(
         t('record.errors.invalidDurationDesc', 'en')
       );
+      expect(releaseCooldown).toHaveBeenCalled();
       expect(recordAudio).not.toHaveBeenCalled();
     });
 
-    it('rejects a duration above the recording maximum', async () => {
+    it('rejects a duration above the recording maximum, in words', async () => {
       const interaction = createRecordInteraction(delivered, {
         duration: '6m',
       });
 
       await executeRecordCommand(interaction);
 
-      const embed = lastEditEmbed(interaction);
+      const embed = replyEmbed(interaction);
       expect(embed.title).toBe(t('record.errors.durationTooLong', 'en'));
       expect(embed.description).toBe(
-        t('record.errors.durationTooLongDesc', 'en', { max: 300 })
+        t('record.errors.durationTooLongDesc', 'en', { max: '5 minutes' })
       );
       expect(recordAudio).not.toHaveBeenCalled();
     });
 
     it('accepts a duration exactly at the recording maximum', async () => {
-      limits.maxRecording = 300;
-
       await executeRecordCommand(
         createRecordInteraction(delivered, { duration: '5m' })
       );
@@ -603,14 +762,15 @@ describe('executeRecordCommand', () => {
       limits.buffer = 60;
       const interaction = createRecordInteraction(delivered, {
         duration: '5m',
+        locale: 'ja',
       });
 
       await executeRecordCommand(interaction);
 
-      const embed = lastEditEmbed(interaction);
-      expect(embed.title).toBe(t('record.errors.durationExceedsBuffer', 'en'));
+      const embed = replyEmbed(interaction);
+      expect(embed.title).toBe(t('record.errors.durationExceedsBuffer', 'ja'));
       expect(embed.description).toBe(
-        t('record.errors.durationExceedsBufferDesc', 'en', { buffer: 60 })
+        t('record.errors.durationExceedsBufferDesc', 'ja', { buffer: '1分' })
       );
       expect(recordAudio).not.toHaveBeenCalled();
     });
@@ -624,37 +784,197 @@ describe('executeRecordCommand', () => {
     });
   });
 
-  describe('recording', () => {
-    it("records the caller's channel and delivers one private file", async () => {
+  describe('when the bot is not keeping that channel', () => {
+    beforeEach(() => {
+      getConnection.mockReturnValue(undefined);
+    });
+
+    function notBufferedDescription(interaction: ChatInputCommandInteraction) {
+      const embed = replyEmbed(interaction);
+      expect(embed.title).toBe(t('record.errors.notBuffered', 'en'));
+      expect(recordAudio).not.toHaveBeenCalled();
+      expect(releaseCooldown).toHaveBeenCalledWith(interaction);
+      return embed.description;
+    }
+
+    const beforeJoin = () => t('record.notBuffered.beforeJoinNote', 'en');
+
+    it('explains that auto-join is off and how to turn it on', async () => {
+      settings.autoJoin = false;
+      const interaction = createRecordInteraction(delivered);
+
+      await executeRecordCommand(interaction);
+
+      expect(notBufferedDescription(interaction)).toBe(
+        `${t('record.notBuffered.autoJoinOff', 'en', {
+          command: '`/voice autojoin enable`',
+        })}\n${beforeJoin()}`
+      );
+      expect(connect).not.toHaveBeenCalled();
+    });
+
+    it('explains that the channel is excluded', async () => {
+      settings.excluded.add('voice-1');
+      const interaction = createRecordInteraction(delivered);
+
+      await executeRecordCommand(interaction);
+
+      expect(notBufferedDescription(interaction)).toContain(
+        t('record.notBuffered.excluded', 'en', {
+          channel: 'voice-1',
+          command: '`/voice autojoin include`',
+        })
+      );
+    });
+
+    it('names the other channel when the bot is busy elsewhere in the server', async () => {
+      getConnectedChannelInGuild.mockReturnValue('voice-2');
+      const interaction = createRecordInteraction(delivered);
+
+      await executeRecordCommand(interaction);
+
+      expect(notBufferedDescription(interaction)).toContain(
+        t('record.notBuffered.busyElsewhere', 'en', { other: 'voice-2' })
+      );
+      expect(connect).not.toHaveBeenCalled();
+    });
+
+    it('explains a text-to-speech-only connection keeps nothing', async () => {
+      getConnection.mockReturnValue({ channelId: 'voice-1', receiving: false });
+      getConnectedChannelInGuild.mockReturnValue('voice-1');
+      const interaction = createRecordInteraction(delivered);
+
+      await executeRecordCommand(interaction);
+
+      expect(notBufferedDescription(interaction)).toContain(
+        t('record.notBuffered.readOnly', 'en', { channel: 'voice-1' })
+      );
+    });
+
+    it('explains the bot is at its connection limit', async () => {
+      isAtLimit.mockReturnValue(true);
+      const interaction = createRecordInteraction(delivered);
+
+      await executeRecordCommand(interaction);
+
+      expect(notBufferedDescription(interaction)).toContain(
+        t('record.notBuffered.atLimit', 'en', { max: 4 })
+      );
+    });
+
+    it('names the missing voice permission', async () => {
       const interaction = createRecordInteraction(delivered, {
-        duration: '30s',
+        voiceGranted: [PermissionFlagsBits.ViewChannel],
       });
 
       await executeRecordCommand(interaction);
 
-      const [progress] = payloadsOf(interaction.editReply);
-      expect(progress.embeds![0].toJSON().title).toBe(
-        t('record.recording', 'en')
+      expect(notBufferedDescription(interaction)).toContain(
+        t('record.notBuffered.noPermission', 'en', { channel: 'voice-1' })
       );
-      expect(progress.embeds![0].toJSON().description).toBe(
-        `${t('record.recordingDesc', 'en', { duration: '30s' })}\n\n${t('record.durationNote', 'en')}`
+      expect(connect).not.toHaveBeenCalled();
+    });
+
+    it('joins now when nothing stands in the way, and says only later audio can be saved', async () => {
+      connect.mockResolvedValue({ joined: true });
+      const interaction = createRecordInteraction(delivered);
+
+      await executeRecordCommand(interaction);
+
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(announceBuffering).toHaveBeenCalledTimes(1);
+      const embed = replyEmbed(interaction);
+      expect(embed.title).toBe(t('record.notBuffered.startedTitle', 'en'));
+      expect(embed.description).toBe(
+        `${t('record.notBuffered.startedNow', 'en')}\n${beforeJoin()}`
       );
+      expect(recordAudio).not.toHaveBeenCalled();
+      expect(releaseCooldown).toHaveBeenCalledWith(interaction);
+    });
+
+    it('falls back to "not joined yet" when joining now fails', async () => {
+      connect.mockResolvedValue(null);
+      const interaction = createRecordInteraction(delivered);
+
+      await executeRecordCommand(interaction);
+
+      expect(notBufferedDescription(interaction)).toContain(
+        t('record.notBuffered.notYetJoined', 'en')
+      );
+      expect(announceBuffering).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('recording', () => {
+    it("records the caller's channel and turns the progress message into the result", async () => {
+      const interaction = createRecordInteraction(delivered, {
+        duration: '30s',
+        attachmentSizeLimit: 25 * MiB,
+      });
+
+      await executeRecordCommand(interaction);
+
+      const progress = replyEmbed(interaction);
+      expect(progress.title).toBe(t('record.recording', 'en'));
+      expect(progress.description).toBe(
+        `${t('record.recordingDesc', 'en', { duration: '30 seconds' })}\n\n${t(
+          'record.inProgressNote',
+          'en'
+        )}`
+      );
+      expect(progress.color).not.toBe(COLORS.WARNING);
+      expect(interaction.deferReply).not.toHaveBeenCalled();
 
       expect(recordAudio).toHaveBeenCalledWith({
         duration: 30,
         channelId: 'voice-1',
         userId: 'user-1',
         guildId: 'guild-1',
+        maxUploadBytes: 25 * MiB,
       });
 
-      expect(interaction.followUp).toHaveBeenCalledTimes(1);
-      const [result] = payloadsOf(interaction.followUp);
-      expect(result.flags).toBe(MessageFlags.Ephemeral);
-      expect(result.files).toHaveLength(1);
-      expect(result.files?.[0].name).toBe('recording.wav');
-      const embed = result.embeds![0].toJSON();
+      expect(interaction.followUp).not.toHaveBeenCalled();
+      const [edit] = payloadsOf(interaction.editReply);
+      expect(edit.files).toHaveLength(1);
+      expect(edit.files?.[0].name).toBe('recording.wav');
+      const embed = edit.embeds![0].toJSON();
       expect(embed.title).toBe(t('record.success', 'en'));
-      expect(embed.footer?.text).toBe('File size: 2.00MB');
+      expect(embed.footer?.text).toBe(
+        t('record.fileSize', 'en', { size: '2.00' })
+      );
+      expect(embed.description).toContain(t('record.saveWarning', 'en'));
+    });
+
+    it('splits for the fallback limit when the interaction carries none', async () => {
+      await executeRecordCommand(createRecordInteraction(delivered));
+
+      expect(recordAudio).toHaveBeenCalledWith(
+        expect.objectContaining({
+          maxUploadBytes: DISCORD_LIMITS.FALLBACK_ATTACHMENT_BYTES,
+        })
+      );
+    });
+
+    it('says how much was saved when the bot had not been listening long enough', async () => {
+      recordAudio.mockResolvedValue({
+        filePath: '/tmp/recording.wav',
+        fileSize: 1024,
+        duration: 40,
+        requestedDuration: 300,
+        isSplit: false,
+        parts: [part('recording.wav', 1024, 0, 40)],
+      });
+      const interaction = createRecordInteraction(delivered, { locale: 'ja' });
+
+      await executeRecordCommand(interaction);
+
+      const { description } = lastEditEmbed(interaction);
+      expect(description).toContain(
+        t('record.successDesc', 'ja', { duration: '40秒' })
+      );
+      expect(description).toContain(
+        t('record.trimmedNote', 'ja', { available: '40秒' })
+      );
     });
 
     it('names the attachment from a Windows-style path', async () => {
@@ -668,7 +988,7 @@ describe('executeRecordCommand', () => {
 
       await executeRecordCommand(interaction);
 
-      expect(payloadsOf(interaction.followUp)[0].files?.[0].name).toBe(
+      expect(payloadsOf(interaction.editReply)[0].files?.[0].name).toBe(
         'take.wav'
       );
     });
@@ -676,53 +996,99 @@ describe('executeRecordCommand', () => {
     it('retries the main file with exponential backoff', async () => {
       vi.useFakeTimers();
       limits.retryMax = 2;
-      let calls = 0;
-      const interaction = createRecordInteraction(async () => {
-        calls += 1;
-        if (calls === 1) throw new Error('rate limited');
-        return {};
-      });
+      const interaction = createRecordInteraction(delivered);
+      vi.mocked(interaction.editReply)
+        .mockRejectedValueOnce(new Error('socket hang up'))
+        .mockResolvedValue({} as never);
 
       const run = executeRecordCommand(interaction);
       await vi.advanceTimersByTimeAsync(999);
-      expect(interaction.followUp).toHaveBeenCalledTimes(1);
+      expect(interaction.editReply).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(1);
       await run;
 
-      expect(interaction.followUp).toHaveBeenCalledTimes(2);
-      expect(lastEditEmbed(interaction).title).toBe(
-        t('record.recording', 'en')
+      expect(interaction.editReply).toHaveBeenCalledTimes(2);
+      expect(lastEditEmbed(interaction).title).toBe(t('record.success', 'en'));
+    });
+
+    it('does not retry an upload Discord rejects as too large, and says so', async () => {
+      limits.retryMax = 3;
+      const interaction = createRecordInteraction(delivered, {
+        attachmentSizeLimit: 10 * MiB,
+      });
+      vi.mocked(interaction.editReply)
+        .mockRejectedValueOnce(
+          apiError(413, RESTJSONErrorCodes.RequestEntityTooLarge)
+        )
+        .mockResolvedValue({} as never);
+
+      await executeRecordCommand(interaction);
+
+      // One upload attempt, then the error edit.
+      expect(interaction.editReply).toHaveBeenCalledTimes(2);
+      const embed = lastEditEmbed(interaction);
+      expect(embed.title).toBe(t('record.errors.tooLarge', 'en'));
+      expect(embed.description).toBe(
+        t('record.errors.tooLargeDesc', 'en', {
+          size: '2.00',
+          limit: 10,
+          command: '`/voice record`',
+        })
       );
     });
 
-    it('reports a failure once the main file cannot be delivered', async () => {
-      const interaction = createRecordInteraction(async () => {
-        throw new Error('upload failed');
-      });
+    it('treats an HTML 413 from the edge as too large as well', async () => {
+      limits.retryMax = 3;
+      const interaction = createRecordInteraction(delivered);
+      vi.mocked(interaction.editReply)
+        .mockRejectedValueOnce(
+          new HTTPError(413, 'Payload Too Large', 'POST', '/x', {})
+        )
+        .mockResolvedValue({} as never);
+
+      await executeRecordCommand(interaction);
+
+      expect(interaction.editReply).toHaveBeenCalledTimes(2);
+      expect(lastEditEmbed(interaction).title).toBe(
+        t('record.errors.tooLarge', 'en')
+      );
+    });
+
+    it('reports a permission rejection from Discord as the permission problem', async () => {
+      const interaction = createRecordInteraction(delivered);
+      vi.mocked(interaction.editReply)
+        .mockRejectedValueOnce(
+          apiError(403, RESTJSONErrorCodes.MissingPermissions)
+        )
+        .mockResolvedValue({} as never);
+
+      await executeRecordCommand(interaction);
+
+      expect(lastEditEmbed(interaction).description).toBe(
+        t('record.errors.noPermissionDesc', 'en', { channel: 'text-1' })
+      );
+    });
+
+    it('reports a failure with an error id, keeping the raw error in the log only', async () => {
+      const interaction = createRecordInteraction(delivered);
+      vi.mocked(interaction.editReply)
+        .mockRejectedValueOnce(new Error('socket hang up'))
+        .mockResolvedValue({} as never);
 
       await executeRecordCommand(interaction);
 
       const embed = lastEditEmbed(interaction);
       expect(embed.title).toBe(t('record.errors.failed', 'en'));
+      const id = embed.description?.match(/`([0-9a-f]{6})`/)?.[1];
+      expect(id).toBeDefined();
       expect(embed.description).toBe(
-        t('record.errors.failedDesc', 'en', { error: 'upload failed' })
+        t('record.errors.failedDesc', 'en', { id: id! })
       );
-    });
-
-    it('says the window was silent instead of sending an empty file', async () => {
-      recordAudio.mockRejectedValue(new RecordingNoAudibleAudioError());
-      const before = metrics.getSnapshot().voice.recordings;
-      const interaction = createRecordInteraction(delivered);
-
-      await executeRecordCommand(interaction);
-
-      const embed = lastEditEmbed(interaction);
-      expect(embed.title).toBe(t('record.errors.noAudibleAudio', 'en'));
-      expect(embed.description).toBe(
-        t('record.errors.noAudibleAudioDesc', 'en')
+      expect(embed.description).not.toContain('socket hang up');
+      expect(logger.error).toHaveBeenCalledWith(
+        `[${id}] Recording failed for channel voice-1:`,
+        expect.stringContaining('socket hang up')
       );
-      expect(interaction.followUp).not.toHaveBeenCalled();
-      expect(metrics.getSnapshot().voice.recordings).toBe(before);
     });
 
     it('does not leak server file paths in the error shown to users', async () => {
@@ -736,7 +1102,6 @@ describe('executeRecordCommand', () => {
       await executeRecordCommand(interaction);
 
       const { description } = lastEditEmbed(interaction);
-      expect(description).toContain('[path]');
       expect(description).not.toContain('/var/lib');
       expect(description).not.toContain('Users');
     });
@@ -747,8 +1112,80 @@ describe('executeRecordCommand', () => {
 
       await executeRecordCommand(interaction);
 
+      expect(lastEditEmbed(interaction).title).toBe(
+        t('record.errors.failed', 'en')
+      );
+    });
+
+    it('says another recording is being saved instead of showing an internal message', async () => {
+      recordAudio.mockRejectedValue(new RecordingInProgressError());
+      const interaction = createRecordInteraction(delivered, { locale: 'ja' });
+
+      await executeRecordCommand(interaction);
+
+      const embed = lastEditEmbed(interaction);
+      expect(embed.title).toBe(t('record.errors.busy', 'ja'));
+      expect(embed.description).toBe(t('record.errors.busyDesc', 'ja'));
+      expect(releaseCooldown).toHaveBeenCalledWith(interaction);
+    });
+
+    it('says the window was silent instead of sending an empty file', async () => {
+      recordAudio.mockRejectedValue(new RecordingNoAudibleAudioError());
+      const before = metrics.getSnapshot().voice.recordings;
+      const interaction = createRecordInteraction(delivered, {
+        duration: '1m',
+      });
+
+      await executeRecordCommand(interaction);
+
+      const embed = lastEditEmbed(interaction);
+      expect(embed.title).toBe(t('record.errors.noAudibleAudio', 'en'));
+      expect(embed.description).toBe(
+        `${t('record.errors.noAudibleAudioDesc', 'en', {
+          duration: '1 minute',
+        })}\n${t('record.errors.noAudibleAudioLongerHint', 'en')}`
+      );
+      expect(interaction.followUp).not.toHaveBeenCalled();
+      expect(metrics.getSnapshot().voice.recordings).toBe(before);
+    });
+
+    it('names the length actually checked, and offers no longer window, when the bot has not heard that long', async () => {
+      // Asked for 1 minute; the bot had only been hearing the channel 13 s.
+      recordAudio.mockRejectedValue(new RecordingNoAudibleAudioError(13));
+      const interaction = createRecordInteraction(delivered, {
+        duration: '1m',
+      });
+
+      await executeRecordCommand(interaction);
+
       expect(lastEditEmbed(interaction).description).toBe(
-        t('record.errors.failedDesc', 'en', { error: 'disk full' })
+        t('record.errors.noAudibleAudioDesc', 'en', { duration: '13 seconds' })
+      );
+    });
+
+    it('offers no longer window when the bot has heard nothing yet', async () => {
+      recordAudio.mockRejectedValue(new RecordingNoAudibleAudioError(0));
+      const interaction = createRecordInteraction(delivered, {
+        duration: '30s',
+      });
+
+      await executeRecordCommand(interaction);
+
+      expect(lastEditEmbed(interaction).description).toBe(
+        t('record.errors.noAudibleAudioDesc', 'en', { duration: '30 seconds' })
+      );
+    });
+
+    it('does not suggest a longer window when the longest one was silent', async () => {
+      recordAudio.mockRejectedValue(new RecordingNoAudibleAudioError());
+      const interaction = createRecordInteraction(delivered, {
+        duration: '5m',
+      });
+
+      await executeRecordCommand(interaction);
+
+      expect(lastEditEmbed(interaction).description).toBe(
+        t('record.errors.noAudibleAudioDesc', 'en', { duration: '5 minutes' })
       );
     });
   });

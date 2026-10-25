@@ -31,6 +31,13 @@ export interface CommandOptions {
   permissions?: PermissionResolvable[];
   /** Cooldown in milliseconds */
   cooldown?: number;
+  /**
+   * Cooldowns per subcommand path, in milliseconds, e.g.
+   * `{ 'voice record': 10_000, 'voice autojoin': 2_000, 'voice status': 0 }`.
+   * The longest key that prefixes the invoked path wins; 0 turns the
+   * cooldown off for that path. Paths without a match use `cooldown`.
+   */
+  cooldowns?: Record<string, number>;
 }
 
 /**

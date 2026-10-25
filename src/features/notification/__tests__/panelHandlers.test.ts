@@ -43,6 +43,24 @@ describe('notification panel handlers', () => {
     });
   });
 
+  it('falls back to all time for a period it does not know', async () => {
+    const { handleStats } = await import('../application/stats.js');
+
+    const interaction = {
+      locale: 'en-US',
+      options: {
+        getString: vi.fn().mockReturnValue('fortnight'),
+      },
+    } as never;
+
+    await handleStats(interaction);
+
+    expect(showNotificationPanel).toHaveBeenCalledWith(interaction, 'en', {
+      initialView: 'stats',
+      initialPeriod: 'all',
+    });
+  });
+
   it('defaults stats to all time when no period is chosen', async () => {
     const { handleStats } = await import('../application/stats.js');
 

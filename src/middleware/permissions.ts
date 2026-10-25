@@ -1,7 +1,15 @@
-import { ChatInputCommandInteraction, PermissionsBitField } from 'discord.js';
-import { Command, MiddlewareResult } from '../shared/types/index.js';
+import {
+  ChatInputCommandInteraction,
+  type PermissionResolvable,
+} from 'discord.js';
+import { Command } from '../shared/types/index.js';
 import { t } from '../locales/index.js';
 import { resolveLocale } from '../locales/guildLocale.js';
+import {
+  formatPermissionNames,
+  memberServerPermissions,
+} from '../shared/utils/discord.js';
+import type { MiddlewareOutcome } from './types.js';
 
 /**
  * Check if user has required permissions
@@ -9,7 +17,7 @@ import { resolveLocale } from '../locales/guildLocale.js';
 export async function permissionsMiddleware(
   interaction: ChatInputCommandInteraction,
   command: Command
-): Promise<MiddlewareResult> {
+): Promise<MiddlewareOutcome> {
   const requiredPermissions = command.options?.permissions;
 
   if (!requiredPermissions || requiredPermissions.length === 0) {
@@ -21,36 +29,32 @@ export async function permissionsMiddleware(
   if (!interaction.guild || !interaction.member) {
     return {
       success: false,
+      title: t('common.serverOnlyTitle', locale),
       message: t('common.guildOnly', locale),
     };
   }
 
-  const memberPermissions = interaction.member.permissions;
+  // Server-wide permissions: a channel overwrite cannot grant these.
+  const memberPermissions = memberServerPermissions(interaction);
 
-  if (!(memberPermissions instanceof PermissionsBitField)) {
+  if (!memberPermissions) {
     return {
       success: false,
+      title: t('common.permissionDeniedTitle', locale),
       message: t('common.permissionsUnverifiable', locale),
     };
   }
 
-  const missingPermissions: string[] = [];
+  const missing: PermissionResolvable[] = requiredPermissions.filter(
+    (permission) => !memberPermissions.has(permission)
+  );
 
-  for (const permission of requiredPermissions) {
-    if (!memberPermissions.has(permission)) {
-      const permName =
-        typeof permission === 'string'
-          ? permission
-          : new PermissionsBitField(permission).toArray().join(', ');
-      missingPermissions.push(permName);
-    }
-  }
-
-  if (missingPermissions.length > 0) {
+  if (missing.length > 0) {
     return {
       success: false,
+      title: t('common.permissionDeniedTitle', locale),
       message: t('common.permissionsRequired', locale, {
-        permissions: missingPermissions.join(', '),
+        permissions: formatPermissionNames(missing, locale),
       }),
     };
   }

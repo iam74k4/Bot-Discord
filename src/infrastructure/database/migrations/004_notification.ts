@@ -27,16 +27,9 @@ export function up(): void {
     )
   `);
 
-  database.exec(`
-    CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user
-    ON voice_sessions(guild_id, user_id)
-  `);
-
-  database.exec(`
-    CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_channel
-    ON voice_sessions(guild_id, channel_id)
-  `);
-
+  // The (guild_id, user_id) and (guild_id, channel_id) indexes this used to
+  // create had no reader. 012 drops them from older databases; creating them
+  // here again would rebuild them on every boot only for 012 to drop them.
   database.exec(`
     CREATE INDEX IF NOT EXISTS idx_voice_sessions_joined_at
     ON voice_sessions(joined_at)

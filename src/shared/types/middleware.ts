@@ -4,6 +4,8 @@ import { Command } from './command.js';
 export interface MiddlewareResult {
   success: boolean;
   message?: string;
+  /** Heading for a rejection; each middleware has its own default. */
+  title?: string;
 }
 
 export type MiddlewareFunction = (

@@ -1,23 +1,34 @@
 import { ChatInputCommandInteraction, MessageFlags } from 'discord.js';
-import {
-  Command,
-  MiddlewareRegistry,
-  MiddlewareResult,
-} from '../shared/types/index.js';
+import { Command, MiddlewareName } from '../shared/types/index.js';
 import { permissionsMiddleware } from './permissions.js';
 import { cooldownMiddleware } from './cooldown/index.js';
-import { createErrorEmbed } from '../shared/utils/embed.js';
+import { createWarningEmbed } from '../shared/utils/embed.js';
 import { getErrorMessage, logger } from '../shared/utils/logger.js';
-import { t } from '../locales/index.js';
+import { t, type TranslationKey } from '../locales/index.js';
 import { resolveLocale } from '../locales/guildLocale.js';
+import type { MiddlewareOutcome } from './types.js';
 
-const middlewareRegistry: MiddlewareRegistry = {
+type BuiltInMiddleware = (
+  interaction: ChatInputCommandInteraction,
+  command: Command
+) => Promise<MiddlewareOutcome>;
+
+const middlewareRegistry: Record<MiddlewareName, BuiltInMiddleware> = {
   permissions: permissionsMiddleware,
   cooldown: cooldownMiddleware,
 };
 
+/** Heading for a rejection that did not bring its own title. */
+const DEFAULT_TITLES: Record<MiddlewareName, TranslationKey> = {
+  permissions: 'common.permissionDeniedTitle',
+  cooldown: 'common.cooldownTitle',
+};
+
 /**
  * Run all middleware for a command.
+ *
+ * A rejection is answered privately with a warning, not an error: being
+ * asked to wait or lacking a permission is not something that went wrong.
  * @returns true if all middleware passed, false otherwise
  */
 export async function runMiddleware(
@@ -34,12 +45,12 @@ export async function runMiddleware(
       continue;
     }
 
-    const result: MiddlewareResult = await middleware(interaction, command);
+    const result = await middleware(interaction, command);
 
     if (!result.success) {
       const locale = resolveLocale(interaction);
-      const embed = createErrorEmbed(
-        t('common.commandBlocked', locale),
+      const embed = createWarningEmbed(
+        result.title || t(DEFAULT_TITLES[name], locale),
         result.message || t('common.noPermission', locale)
       );
 
@@ -65,4 +76,9 @@ export async function runMiddleware(
   return true;
 }
 
-export { clearCooldown } from './cooldown/index.js';
+export {
+  clearCooldown,
+  releaseCooldown,
+  resolveCooldownMs,
+} from './cooldown/index.js';
+export type { MiddlewareOutcome } from './types.js';

@@ -8,8 +8,10 @@ import {
   Collection,
   CommandInteractionOptionResolver,
   ComponentType,
+  DiscordAPIError,
   GuildMember,
   InteractionContextType,
+  ModalBuilder,
   PermissionFlagsBits,
   PermissionsBitField,
   TextChannel,
@@ -29,6 +31,7 @@ import {
 } from '../../../app/interactions/commandRegistry.js';
 import type { Command } from '../../../shared/types/index.js';
 import type { ExtendedClient } from '../../../client.js';
+import { resolveCooldownMs } from '../../../middleware/index.js';
 import { en } from '../../../locales/en.js';
 
 /**
@@ -202,8 +205,14 @@ export function commandPaths(
 // Policy: who may use what, declared by hand
 // ---------------------------------------------------------------------------
 
-/** Who may run a help entry; `owner` means a configured bot owner. */
-export type AccessLevel = 'everyone' | 'manageGuild' | 'manageRoles' | 'owner';
+/**
+ * Who may run a help entry; `owner` means a configured bot owner, and
+ * `administrator` a command Discord shows only to administrators
+ * (`default_member_permissions` of `0`) with nothing narrower declared. No
+ * command here resolves to it today.
+ */
+export type AccessLevel =
+  'everyone' | 'manageGuild' | 'manageRoles' | 'administrator' | 'owner';
 
 export interface CommandPolicy {
   /** Discord's `default_member_permissions`: who sees it in the picker. */
@@ -212,6 +221,12 @@ export interface CommandPolicy {
   contexts: readonly InteractionContextType[] | null;
   /** Per-user cooldown the middleware enforces, or null for none. */
   cooldownMs: number | null;
+  /**
+   * Per-path exceptions to `cooldownMs`, keyed by path prefix (`voice
+   * record`, `community poll`): the longest matching key wins, and 0 means
+   * no cooldown for that path.
+   */
+  cooldownByPath?: Readonly<Record<string, number>>;
   /** Options that autocomplete, as `<path> <option>`. */
   autocomplete: readonly string[];
   /** Who may run each `/general help` entry (subcommand or group). */
@@ -233,7 +248,8 @@ export interface CommandPolicy {
 export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
   admin: {
     defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
-    contexts: null,
+    // Every subcommand acts on a server.
+    contexts: [InteractionContextType.Guild],
     cooldownMs: null,
     autocomplete: [],
     access: {
@@ -243,10 +259,15 @@ export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
   },
   community: {
     defaultMemberPermissions: null,
-    contexts: null,
-    // Guards the roulette animation against spam.
-    cooldownMs: 10_000,
-    autocomplete: [],
+    contexts: [InteractionContextType.Guild],
+    cooldownMs: null,
+    // Per path, so creating a poll never blocks ending it; the roulette
+    // cooldown covers its ~3.6 s animation.
+    cooldownByPath: {
+      'community poll': 3_000,
+      'community roulette': 5_000,
+    },
+    autocomplete: ['community poll end poll'],
     access: {
       'community poll': 'everyone',
       'community roulette': 'everyone',
@@ -276,13 +297,12 @@ export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
     },
   },
   owner: {
-    defaultMemberPermissions: null,
+    // Hidden from everyone but server admins in servers; Discord ignores it
+    // in the bot's DM, where the owner can always use it. Who may run it is
+    // checked against BOT_OWNER_IDS.
+    defaultMemberPermissions: 0n,
     // Owners run it from a DM with the bot too.
-    contexts: [
-      InteractionContextType.Guild,
-      InteractionContextType.BotDM,
-      InteractionContextType.PrivateChannel,
-    ],
+    contexts: [InteractionContextType.Guild, InteractionContextType.BotDM],
     cooldownMs: null,
     autocomplete: [],
     access: {
@@ -310,9 +330,13 @@ export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
     },
   },
   voice: {
-    defaultMemberPermissions: null,
-    contexts: null,
-    cooldownMs: 10_000,
+    // Hidden from members who could not run it anyway.
+    defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
+    contexts: [InteractionContextType.Guild],
+    // Settings and status only need the usual guard against double taps;
+    // recording is the expensive path.
+    cooldownMs: 3_000,
+    cooldownByPath: { 'voice record': 10_000 },
     autocomplete: [],
     // Recording captures other people's voices: never open to everyone.
     access: {
@@ -325,18 +349,13 @@ export const COMMAND_POLICY: Readonly<Record<string, CommandPolicy>> = {
 
 /**
  * Levels `/general help` shows an entry to beyond its `access`, keyed by
- * entry. Production bug: `/admin` declares one help permission,
- * `['manageGuild', 'manageRoles']`, for both of its groups, but `settings`
- * needs Manage Server and `role` needs Manage Roles, so help lists each group
- * to members it then refuses. Delete an entry once help is precise
- * (`subcommandPermissions` per group).
+ * entry: a known bug where help lists an entry to members the command then
+ * refuses. Empty since `/admin` declares `subcommandPermissions` per group;
+ * add an entry (with the bug it pins) rather than loosening `access`.
  */
 export const KNOWN_HELP_OVERREACH: Readonly<
   Record<string, readonly AccessLevel[]>
-> = {
-  'admin settings': ['manageRoles'],
-  'admin role': ['manageGuild'],
-};
+> = {};
 
 /** The `/general help` entry a path is listed under. */
 export function helpEntryOf(path: {
@@ -352,13 +371,32 @@ export function declaredAccess(path: CommandPath): AccessLevel | undefined {
   return COMMAND_POLICY[path.entry.json.name]?.access[helpEntryOf(path)];
 }
 
-/** The cooldown middleware's default when a command declares none. */
-export const DEFAULT_COOLDOWN_MS = 3_000;
+/** The cooldown the policy declares for a path, or null for none. */
+export function declaredCooldown(path: {
+  label: string;
+  entry: { json: { name: string } };
+}): number | null {
+  const policy = COMMAND_POLICY[path.entry.json.name];
+  if (!policy) return null;
+  const tokens = path.label.split(' ');
+  for (let length = tokens.length; length > 0; length--) {
+    const override = policy.cooldownByPath?.[tokens.slice(0, length).join(' ')];
+    if (override !== undefined) return override > 0 ? override : null;
+  }
+  return policy.cooldownMs;
+}
 
-/** The cooldown a command actually gets from its middleware, if any. */
-export function effectiveCooldown(command: Command): number | null {
+/**
+ * The cooldown a path actually gets from its command's middleware, if any,
+ * as the middleware resolves it (`options.cooldowns`, then
+ * `options.cooldown`, then the middleware default).
+ */
+export function effectiveCooldown(
+  command: Command,
+  pathLabel: string
+): number | null {
   if (!command.middleware?.includes('cooldown')) return null;
-  const cooldown = command.options?.cooldown ?? DEFAULT_COOLDOWN_MS;
+  const cooldown = resolveCooldownMs(command, pathLabel);
   return cooldown > 0 ? cooldown : null;
 }
 
@@ -446,6 +484,18 @@ export interface SmokeWorld {
   dmChannel: { id: string; type: ChannelType.DM; send: Mock };
   /** What `messages.fetch(id)` resolves in the text channel. */
   messages: Map<string, FetchableMessage>;
+}
+
+/** What Discord answers for a message that does not exist (any more). */
+function unknownMessageError(id: string): DiscordAPIError {
+  return new DiscordAPIError(
+    { message: 'Unknown Message', code: 10008 },
+    10008,
+    404,
+    'GET',
+    `/channels/${IDS.text}/messages/${id}`,
+    {}
+  );
 }
 
 function userStub(id: string, username: string, bot = false): User {
@@ -625,11 +675,15 @@ export function createWorld(
     isDMBased: () => false,
     isSendable: () => true,
     messages: {
-      fetch: vi.fn(async (id: string) => {
-        const message = messages.get(id);
-        if (!message) throw new Error('Unknown Message');
-        return message;
-      }),
+      // `fetch(id)`, or `fetch({ message: id, force })` to skip the cache.
+      fetch: vi.fn(
+        async (query: string | { message: string; force?: boolean }) => {
+          const id = typeof query === 'string' ? query : query.message;
+          const message = messages.get(id);
+          if (!message) throw unknownMessageError(id);
+          return message;
+        }
+      ),
     },
     toString: () => `<#${IDS.text}>`,
   };
@@ -1065,7 +1119,12 @@ export function invokeCommand(
 
   const record = (via: ResponseKind, payload: unknown) => {
     sent.push({ via, payload });
-    if (isRecord(payload) && Array.isArray(payload.components)) {
+    // A form is not a message: the confirm button stays where it was.
+    if (
+      via !== 'showModal' &&
+      isRecord(payload) &&
+      Array.isArray(payload.components)
+    ) {
       lastComponents = payload.components;
     }
   };
@@ -1344,6 +1403,7 @@ export function componentRowsOf(payload: unknown) {
 export function textsOf(payload: unknown): string[] {
   if (typeof payload === 'string') return [payload];
   if (!isRecord(payload)) return [];
+  if (isModal(payload)) return modalTexts(payload);
 
   const texts: string[] = [];
   if (typeof payload.content === 'string') texts.push(payload.content);
@@ -1372,9 +1432,126 @@ export function textsOf(payload: unknown): string[] {
   return texts;
 }
 
+/** One field of a form: a text input, select, radio group or checkbox. */
+interface LooseModalField {
+  type: number;
+  custom_id?: string;
+  placeholder?: string;
+  value?: string;
+  min_length?: number;
+  max_length?: number;
+  options?: Array<{ label: string; value: string; description?: string }>;
+}
+
+/** A form as `showModal` sends it: labelled fields (or legacy rows). */
+interface LooseModal {
+  title: string;
+  custom_id: string;
+  components: Array<{
+    type: number;
+    label?: string;
+    description?: string;
+    component?: LooseModalField;
+    components?: LooseModalField[];
+  }>;
+}
+
+/** Whether a payload is a form (`showModal`) rather than a message. */
+function isModal(payload: Record<string, unknown>): boolean {
+  return (
+    payload instanceof ModalBuilder ||
+    (typeof payload.custom_id === 'string' && typeof payload.title === 'string')
+  );
+}
+
+/** The fields of a form, whether labelled or in legacy action rows. */
+function modalFields(modal: LooseModal): LooseModalField[] {
+  return modal.components.flatMap((entry) =>
+    entry.component ? [entry.component] : (entry.components ?? [])
+  );
+}
+
+function modalTexts(payload: unknown): string[] {
+  let modal: LooseModal;
+  try {
+    modal = toJSONIfBuilder(payload) as LooseModal;
+  } catch {
+    return [];
+  }
+  const texts = [modal.title];
+  for (const entry of modal.components) {
+    if (entry.label) texts.push(entry.label);
+    if (entry.description) texts.push(entry.description);
+  }
+  for (const field of modalFields(modal)) {
+    if (field.placeholder) texts.push(field.placeholder);
+    for (const option of field.options ?? []) {
+      texts.push(option.label);
+      if (option.description) texts.push(option.description);
+    }
+  }
+  return texts;
+}
+
+/** Discord's documented form limits that a `showModal` payload breaks. */
+function modalLimitProblems(payload: unknown): string[] {
+  let modal: LooseModal;
+  try {
+    modal = toJSONIfBuilder(payload) as LooseModal;
+  } catch (error) {
+    return [
+      `the form does not serialise: ${error instanceof Error ? error.message : String(error)}`,
+    ];
+  }
+  const problems: string[] = [];
+  const within = (label: string, text: string | undefined, max: number) => {
+    if (text !== undefined && text.length > max) {
+      problems.push(`form ${label} is ${text.length} chars (max ${max})`);
+    }
+  };
+
+  if (!modal.title) problems.push('the form has no title');
+  within('title', modal.title, 45);
+  within('custom_id', modal.custom_id, 100);
+  if (modal.components.length === 0 || modal.components.length > 5) {
+    problems.push(`the form has ${modal.components.length} fields (1-5)`);
+  }
+  for (const entry of modal.components) {
+    if (entry.type === ComponentType.Label && !entry.label) {
+      problems.push('a form field has an empty label');
+    }
+    within('label', entry.label, 45);
+    within('field description', entry.description, 100);
+  }
+
+  const customIds = new Set<string>();
+  for (const field of modalFields(modal)) {
+    if (field.custom_id !== undefined) {
+      within('field custom_id', field.custom_id, 100);
+      if (customIds.has(field.custom_id)) {
+        problems.push(`form custom_id "${field.custom_id}" is used twice`);
+      }
+      customIds.add(field.custom_id);
+    }
+    within('placeholder', field.placeholder, 100);
+    within('prefilled value', field.value, field.max_length ?? 4000);
+    if (field.options) {
+      if (field.options.length === 0 || field.options.length > 25) {
+        problems.push(`a form field has ${field.options.length} options`);
+      }
+      for (const option of field.options) {
+        within('option label', option.label, 100);
+        within('option value', option.value, 100);
+      }
+    }
+  }
+  return problems;
+}
+
 /** Discord's documented message limits that a payload breaks. */
 export function messageLimitProblems(payload: unknown): string[] {
   if (!isRecord(payload)) return [];
+  if (isModal(payload)) return modalLimitProblems(payload);
   const problems: string[] = [];
 
   if (typeof payload.content === 'string' && payload.content.length > 2000) {
