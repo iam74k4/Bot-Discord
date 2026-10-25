@@ -116,7 +116,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs in order:
 1. **`npm run format:check`** (Prettier) — fails first if formatting drifts
 2. `npm run lint`
 3. `npm run type-check`
-4. `npm run test`
+4. `npm run test:coverage` (fails below the floors in `vitest.config.ts`)
 5. `npm audit` (high threshold for prod deps)
 6. `npm run build`
 

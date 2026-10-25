@@ -114,11 +114,11 @@ Tests are **colocated with features** and shared code:
 
 ### Commands
 
-| Command                 | Description                    |
-| ----------------------- | ------------------------------ |
-| `npm test`              | Run all tests once             |
-| `npm run test:watch`    | Run tests in watch mode        |
-| `npm run test:coverage` | Run tests with coverage report |
+| Command                 | Description                                                                   |
+| ----------------------- | ----------------------------------------------------------------------------- |
+| `npm test`              | Run all tests once                                                            |
+| `npm run test:watch`    | Run tests in watch mode                                                       |
+| `npm run test:coverage` | Run tests with coverage report and enforce the coverage floors (what CI runs) |
 
 ### Mock Patterns
 
@@ -169,20 +169,20 @@ const withParams = t('settings.language.changed', locale, {
 
 ## Available Scripts
 
-| Script                     | Description                          |
-| -------------------------- | ------------------------------------ |
-| `npm run dev`              | Start with hot-reload (development)  |
-| `npm run build`            | Compile TypeScript to JavaScript     |
-| `npm start`                | Run compiled JavaScript (production) |
-| `npm run lint`             | Check code with ESLint               |
-| `npm run lint:fix`         | Fix ESLint errors automatically      |
-| `npm run format`           | Format code with Prettier            |
-| `npm run format:check`     | Check code formatting                |
-| `npm run type-check`       | Check TypeScript types               |
-| `npm test`                 | Run unit tests                       |
-| `npm run test:watch`       | Run tests in watch mode              |
-| `npm run test:coverage`    | Run tests with coverage report       |
-| `npm run cleanup-commands` | Remove registered Discord commands   |
+| Script                     | Description                                                                   |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| `npm run dev`              | Start with hot-reload (development)                                           |
+| `npm run build`            | Compile TypeScript to JavaScript                                              |
+| `npm start`                | Run compiled JavaScript (production)                                          |
+| `npm run lint`             | Check code with ESLint                                                        |
+| `npm run lint:fix`         | Fix ESLint errors automatically                                               |
+| `npm run format`           | Format code with Prettier                                                     |
+| `npm run format:check`     | Check code formatting                                                         |
+| `npm run type-check`       | Check TypeScript types                                                        |
+| `npm test`                 | Run unit tests                                                                |
+| `npm run test:watch`       | Run tests in watch mode                                                       |
+| `npm run test:coverage`    | Run tests with coverage report and enforce the coverage floors (what CI runs) |
+| `npm run cleanup-commands` | Remove registered Discord commands                                            |
 
 ## Repo Workflow Scripts
 

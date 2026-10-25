@@ -1,3 +1,4 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { metrics } from '../index.js';
 
 describe('metrics service', () => {
@@ -130,19 +131,39 @@ describe('metrics service', () => {
       expect(snapshot.voice.totalSeconds).toBe(0);
     });
 
-    it('resets startTime', () => {
-      metrics.incrementCommand('test');
-      const before = metrics.getSnapshot().startTime;
+    describe('startTime', () => {
+      const T1 = new Date('2026-01-01T00:00:00Z').getTime();
+      const T2 = T1 + 90_000;
 
-      const start = Date.now();
-      while (Date.now() - start < 10) {
-        // busy wait ~10ms
-      }
+      beforeEach(() => {
+        vi.useFakeTimers();
+      });
 
-      metrics.reset();
-      const after = metrics.getSnapshot().startTime;
+      afterEach(() => {
+        vi.useRealTimers();
+      });
 
-      expect(after).toBeGreaterThanOrEqual(before);
+      it('moves startTime to the moment of the reset', () => {
+        vi.setSystemTime(T1);
+        metrics.reset();
+        expect(metrics.getSnapshot().startTime).toBe(T1);
+
+        vi.setSystemTime(T2);
+        metrics.reset();
+
+        expect(metrics.getSnapshot().startTime).toBe(T2);
+      });
+
+      it('restarts uptime from zero', () => {
+        vi.setSystemTime(T1);
+        metrics.reset();
+        vi.setSystemTime(T2);
+        expect(metrics.getSnapshot().uptimeSeconds).toBe(90);
+
+        metrics.reset();
+
+        expect(metrics.getSnapshot().uptimeSeconds).toBe(0);
+      });
     });
   });
 
@@ -170,6 +191,39 @@ describe('metrics service', () => {
       expect(output).toContain('**Voice**');
       expect(output).toContain('Recordings: 1');
       expect(output).toContain('Total Duration: 2 min');
+    });
+
+    it('lists at most five top commands, busiest first', () => {
+      const counts: Array<[string, number]> = [
+        ['a', 1],
+        ['b', 6],
+        ['c', 3],
+        ['d', 5],
+        ['e', 2],
+        ['f', 4],
+      ];
+      for (const [name, count] of counts) {
+        for (let i = 0; i < count; i++) metrics.incrementCommand(name);
+      }
+
+      const lines = metrics.formatForDisplay().split('\n');
+      const top = lines.slice(
+        lines.indexOf('└ Top Commands:') + 1,
+        lines.indexOf('')
+      );
+
+      expect(top).toEqual(['  b: 6', '  d: 5', '  f: 4', '  c: 3', '  e: 2']);
+    });
+
+    it('shows the error count and rounds the voice total to whole minutes', () => {
+      metrics.incrementError();
+      metrics.incrementError('ping');
+      metrics.recordVoiceRecording(89);
+
+      const output = metrics.formatForDisplay();
+
+      expect(output).toContain('├ Errors: 2');
+      expect(output).toContain('Total Duration: 1 min');
     });
 
     it('shows (none) for top commands when empty', () => {

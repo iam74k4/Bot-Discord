@@ -281,10 +281,10 @@ See [`docs/database.md`](docs/database.md) for schema details and retention beha
 | `npm run lint:fix`         | Fix ESLint errors automatically                                                     |
 | `npm run format`           | Format code with Prettier                                                           |
 | `npm run format:check`     | Check code formatting                                                               |
-| `npm run type-check`       | Check TypeScript types                                                              |
+| `npm run type-check`       | Check TypeScript types (source and tests)                                           |
 | `npm test`                 | Run unit tests                                                                      |
 | `npm run test:watch`       | Run tests in watch mode                                                             |
-| `npm run test:coverage`    | Run tests with coverage report                                                      |
+| `npm run test:coverage`    | Run tests with coverage report and enforce the coverage floors (what CI runs)       |
 | `npm run audit:all`        | Run full + production-scoped `npm audit` (see [`docs/quality.md`](docs/quality.md)) |
 | `npm run cleanup-commands` | Remove registered Discord commands                                                  |
 

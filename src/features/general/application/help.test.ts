@@ -104,3 +104,125 @@ describe('canUserSeeCommandWithContext', () => {
     ).toBe(true);
   });
 });
+
+describe('canUserSeeCommandWithContext permission matrix', () => {
+  const inGuild = { id: 'guild-1' };
+  const memberWith = (...bits: bigint[]) => ({
+    permissions: new PermissionsBitField(bits),
+  });
+  const command = (
+    requiredPermission: CommandInfo['requiredPermission']
+  ): CommandInfo => ({
+    name: 'demo',
+    description: { en: 'Demo', ja: 'デモ' },
+    requiredPermission,
+  });
+
+  it.each<{
+    title: string;
+    requiredPermission: CommandInfo['requiredPermission'];
+    userId?: string;
+    guild?: { id: string } | null;
+    member?: { permissions: PermissionsBitField } | null;
+    visible: boolean;
+  }>([
+    {
+      title: 'no requirement is visible even in DMs',
+      requiredPermission: undefined,
+      guild: null,
+      member: null,
+      visible: true,
+    },
+    {
+      title: '"everyone" is visible in DMs',
+      requiredPermission: 'everyone',
+      guild: null,
+      member: null,
+      visible: true,
+    },
+    {
+      title: 'a list containing "everyone" is visible to anyone',
+      requiredPermission: ['owner', 'everyone'],
+      guild: null,
+      member: null,
+      visible: true,
+    },
+    {
+      title: 'owner-only is hidden from other users',
+      requiredPermission: 'owner',
+      member: memberWith(PermissionsBitField.Flags.Administrator),
+      visible: false,
+    },
+    {
+      title: 'owner-only is visible to the owner',
+      requiredPermission: 'owner',
+      userId: 'owner-1',
+      visible: true,
+    },
+    {
+      title: 'Manage Roles unlocks manageRoles',
+      requiredPermission: 'manageRoles',
+      member: memberWith(PermissionsBitField.Flags.ManageRoles),
+      visible: true,
+    },
+    {
+      title: 'Manage Roles does not unlock manageGuild',
+      requiredPermission: 'manageGuild',
+      member: memberWith(PermissionsBitField.Flags.ManageRoles),
+      visible: false,
+    },
+    {
+      title: 'Administrator unlocks manageGuild',
+      requiredPermission: 'manageGuild',
+      member: memberWith(PermissionsBitField.Flags.Administrator),
+      visible: true,
+    },
+    {
+      title: 'guild permissions do not count outside a guild',
+      requiredPermission: 'manageGuild',
+      guild: null,
+      member: memberWith(PermissionsBitField.Flags.ManageGuild),
+      visible: false,
+    },
+    {
+      title: 'a missing member cannot hold guild permissions',
+      requiredPermission: ['manageGuild', 'manageRoles'],
+      member: null,
+      visible: false,
+    },
+    {
+      title: 'raw API permission strings are not trusted',
+      requiredPermission: 'manageGuild',
+      member: {
+        permissions: String(
+          PermissionsBitField.Flags.ManageGuild
+        ) as unknown as PermissionsBitField,
+      },
+      visible: false,
+    },
+  ])('$title', async ({ requiredPermission, visible, ...ctx }) => {
+    const { canUserSeeCommandWithContext } = await loadHelpModule();
+
+    expect(
+      canUserSeeCommandWithContext(command(requiredPermission), {
+        userId: ctx.userId ?? 'member-1',
+        guild: ctx.guild === undefined ? inGuild : ctx.guild,
+        member: ctx.member === undefined ? memberWith() : ctx.member,
+      })
+    ).toBe(visible);
+  });
+
+  it('reads the owner list from the configuration', async () => {
+    const { canUserSeeCommandWithContext } = await loadHelpModule({
+      BOT_OWNER_IDS: 'someone-else',
+    });
+
+    expect(
+      canUserSeeCommandWithContext(command('owner'), {
+        userId: 'owner-1',
+        guild: null,
+        member: null,
+      })
+    ).toBe(false);
+  });
+});

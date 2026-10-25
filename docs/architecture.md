@@ -44,6 +44,7 @@ The project uses feature-based architecture. Each feature owns its command entry
     │   │   ├── index.ts
     │   │   ├── commands/
     │   │   ├── application/
+    │   │   ├── __tests__/
     │   │   └── helpCatalog.ts
     │   ├── notification/
     │   │   ├── index.ts

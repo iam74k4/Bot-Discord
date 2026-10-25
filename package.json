@@ -16,7 +16,7 @@
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write \"src/**/*.ts\" \"docs/**/*.md\" \"README.md\" \"CONTRIBUTING.md\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"docs/**/*.md\" \"README.md\" \"CONTRIBUTING.md\"",
-    "type-check": "tsc --noEmit",
+    "type-check": "tsc --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
