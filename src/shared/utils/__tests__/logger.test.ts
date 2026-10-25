@@ -158,7 +158,8 @@ describe('secret masking', () => {
   // Built at runtime so no token-shaped literal sits in the source.
   const discordToken = `${'M'.repeat(24)}.${'G'.repeat(6)}.${'x'.repeat(27)}`;
   const apiKey = 'deadBEEF'.repeat(4);
-  const steamId = '76561198012345678';
+  // A 17-digit id: a 2015-2016 Discord snowflake or an old Steam64 id.
+  const oldSnowflake = '81384788765712384';
   const webhook =
     'https://discord.com/api/webhooks/123456789012345678/abc_DEF-ghi';
 
@@ -172,12 +173,6 @@ describe('secret masking', () => {
     logger.info(`key=${apiKey}`);
 
     expect(bodyOf(log)).toBe('key=[MASKED_APIKEY]');
-  });
-
-  it('partially masks 17-digit Steam IDs, keeping the ends', () => {
-    logger.info(`steam ${steamId}`);
-
-    expect(bodyOf(log)).toBe('steam 7656***5678');
   });
 
   it('masks webhook URLs', () => {
@@ -198,15 +193,14 @@ describe('secret masking', () => {
     expect(bodyOf(log)).toBe('user 1234567890123456789 joined');
   });
 
-  // KNOWN BUG (logger.ts, the Steam ID pattern `\b(\d{17})\b`): it matches any
+  // Regression: the obsolete Steam64 mask `\b(\d{17})\b` matched any
   // standalone 17-digit number, so snowflakes from 2015-2016 accounts, guilds
-  // and channels come out as "8138***2384". Steam64 IDs always start with
-  // 7656119; once the pattern is anchored on that prefix, this test starts
-  // failing: change `it.fails` to `it`.
-  it.fails('leaves a 17-digit Discord snowflake readable', () => {
-    logger.info('user 81384788765712384 joined');
+  // and channels were logged as "8138***2384". The mask was removed with the
+  // Steam feature; 17-digit ids must stay readable.
+  it('leaves a 17-digit Discord snowflake readable', () => {
+    logger.info(`user ${oldSnowflake} joined`);
 
-    expect(bodyOf(log)).toBe('user 81384788765712384 joined');
+    expect(bodyOf(log)).toBe(`user ${oldSnowflake} joined`);
   });
 
   it('masks string arguments too', () => {
@@ -222,7 +216,7 @@ describe('secret masking', () => {
       Password: 'hunter2',
       apiKey: 'k',
       steam_api_key: 'k2',
-      nested: { refreshToken: 'r', note: `id ${steamId}` },
+      nested: { refreshToken: 'r', note: `key ${apiKey}` },
       list: [{ secret: 's' }, `key ${apiKey}`, 7],
       name: 'bot',
     });
@@ -234,16 +228,18 @@ describe('secret masking', () => {
       Password: '[REDACTED]',
       apiKey: '[REDACTED]',
       steam_api_key: '[REDACTED]',
-      nested: { refreshToken: '[REDACTED]', note: 'id 7656***5678' },
+      nested: { refreshToken: '[REDACTED]', note: 'key [MASKED_APIKEY]' },
       list: [{ secret: '[REDACTED]' }, 'key [MASKED_APIKEY]', 7],
       name: 'bot',
     });
   });
 
   it('masks every occurrence, not just the first', () => {
-    logger.info(`${steamId} and ${steamId}`);
+    logger.info(`${apiKey} and ${webhook}, then ${apiKey}`);
 
-    expect(bodyOf(log)).toBe('7656***5678 and 7656***5678');
+    expect(bodyOf(log)).toBe(
+      '[MASKED_APIKEY] and [MASKED_WEBHOOK], then [MASKED_APIKEY]'
+    );
   });
 });
 

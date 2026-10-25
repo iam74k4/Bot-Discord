@@ -31,16 +31,19 @@ export function voiceMember(
 }
 
 export interface VoiceChannelStub {
+  id: string;
   name: string;
   type: ChannelType;
+  /** Live membership: tests add and remove members to simulate joins. */
   members: Collection<string, VoiceMemberStub>;
 }
 
 export function voiceChannel(
   members: VoiceMemberStub[],
-  options: { name?: string; type?: ChannelType } = {}
+  options: { id?: string; name?: string; type?: ChannelType } = {}
 ): VoiceChannelStub {
   return {
+    id: options.id ?? 'voice-1',
     name: options.name ?? 'Game Night',
     type: options.type ?? ChannelType.GuildVoice,
     members: new Collection(members.map((m) => [m.id, m])),
@@ -52,6 +55,9 @@ export interface CommandInteractionStub {
   reply: ReturnType<typeof vi.fn>;
   deferReply: ReturnType<typeof vi.fn>;
   editReply: ReturnType<typeof vi.fn>;
+  followUp: ReturnType<typeof vi.fn>;
+  showModal: ReturnType<typeof vi.fn>;
+  awaitModalSubmit: ReturnType<typeof vi.fn>;
   getString: ReturnType<typeof vi.fn>;
   getInteger: ReturnType<typeof vi.fn>;
 }
@@ -75,7 +81,11 @@ export function commandInteraction(
     guildId?: string | null;
     channelId?: string;
     textChannel?: unknown;
+    /** Other channels of the guild, by id, for `guild.channels.fetch`. */
+    guildChannels?: Record<string, unknown>;
     reply?: ReturnType<typeof vi.fn>;
+    editReply?: ReturnType<typeof vi.fn>;
+    awaitModalSubmit?: ReturnType<typeof vi.fn>;
   } = {}
 ): CommandInteractionStub {
   const values = options.values ?? {};
@@ -83,14 +93,37 @@ export function commandInteraction(
 
   const reply = options.reply ?? vi.fn().mockResolvedValue({});
   const deferReply = vi.fn().mockResolvedValue({});
-  const editReply = vi.fn().mockResolvedValue({});
+  const editReply = options.editReply ?? vi.fn().mockResolvedValue({});
+  const followUp = vi.fn().mockResolvedValue({});
+  const showModal = vi.fn().mockResolvedValue(undefined);
+  const awaitModalSubmit =
+    options.awaitModalSubmit ??
+    vi.fn().mockRejectedValue(new Error('Collector received no interactions'));
   const getString = vi.fn(read);
   const getInteger = vi.fn(read);
+
+  const guildChannels = options.guildChannels ?? {};
+  const channelFetch = vi.fn(async (id: string) => {
+    if (!(id in guildChannels)) throw new Error('Unknown Channel');
+    return guildChannels[id];
+  });
 
   const userId = options.userId ?? 'user-1';
   const interaction = {
     id: 'interaction-1',
-    guild: options.hasGuild === false ? null : { id: 'guild-1' },
+    commandName: 'community',
+    // When the command was run: its token lasts 15 minutes from here.
+    createdTimestamp: Date.now(),
+    guild:
+      options.hasGuild === false
+        ? null
+        : {
+            id: 'guild-1',
+            channels: {
+              fetch: channelFetch,
+              cache: new Collection(Object.entries(guildChannels)),
+            },
+          },
     guildId: options.guildId === undefined ? 'guild-1' : options.guildId,
     member:
       options.rawMember !== undefined
@@ -112,9 +145,22 @@ export function commandInteraction(
     reply,
     deferReply,
     editReply,
+    followUp,
+    showModal,
+    awaitModalSubmit,
   } as unknown as ChatInputCommandInteraction;
 
-  return { interaction, reply, deferReply, editReply, getString, getInteger };
+  return {
+    interaction,
+    reply,
+    deferReply,
+    editReply,
+    followUp,
+    showModal,
+    awaitModalSubmit,
+    getString,
+    getInteger,
+  };
 }
 
 /** The first embed of the payload passed in `call` of a reply/editReply mock. */

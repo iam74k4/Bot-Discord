@@ -74,6 +74,40 @@ describe('summarizeVoiceActivity', () => {
     expect(digest.left).toEqual([]);
   });
 
+  it('drops a reconnect to the same channel', () => {
+    const digest = summarizeVoiceActivity([
+      leave('a', 'vc1'),
+      join('a', 'vc1'),
+    ]);
+
+    // Not "moved from #vc1 to #vc1".
+    expect(isVoiceDigestEmpty(digest)).toBe(true);
+  });
+
+  it('drops a hop that returns to the starting channel', () => {
+    const digest = summarizeVoiceActivity([
+      leave('a', 'vc1'),
+      join('a', 'vc2'),
+      leave('a', 'vc2'),
+      join('a', 'vc1'),
+    ]);
+
+    expect(isVoiceDigestEmpty(digest)).toBe(true);
+  });
+
+  it('still reports a reconnect that ends somewhere else', () => {
+    const digest = summarizeVoiceActivity([
+      leave('a', 'vc1'),
+      join('a', 'vc1'),
+      leave('a', 'vc1'),
+      join('a', 'vc2'),
+    ]);
+
+    expect(digest.moved).toEqual([
+      { displayName: 'A', fromChannelId: 'vc1', toChannelId: 'vc2' },
+    ]);
+  });
+
   it('uses the most recent display name', () => {
     const digest = summarizeVoiceActivity([
       { userId: 'a', displayName: 'Old', channelId: 'vc1', kind: 'join' },

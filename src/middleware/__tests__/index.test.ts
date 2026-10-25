@@ -29,6 +29,8 @@ vi.mock('../permissions.js', () => ({ permissionsMiddleware }));
 vi.mock('../cooldown/index.js', () => ({
   cooldownMiddleware,
   clearCooldown: cooldownClear,
+  releaseCooldown: vi.fn(),
+  resolveCooldownMs: vi.fn(),
 }));
 
 const resolveLocale = vi.hoisted(() => vi.fn());
@@ -147,10 +149,11 @@ describe('runMiddleware', () => {
     expect(cooldownMiddleware).not.toHaveBeenCalled();
   });
 
-  it('tells the user why, in an ephemeral error embed', async () => {
+  it('tells the user why, in an ephemeral warning (not an error) embed', async () => {
     cooldownMiddleware.mockResolvedValue({
       success: false,
-      message: 'Please wait 2.0 seconds',
+      title: 'Slow down there',
+      message: 'You can use /x again in 2s.',
     });
     const { interaction: i, reply, editReply } = interaction();
 
@@ -160,11 +163,28 @@ describe('runMiddleware', () => {
     expect(editReply).not.toHaveBeenCalled();
     expect(reply.mock.calls[0][0].flags).toBe(MessageFlags.Ephemeral);
     expect(embedOf(reply)).toMatchObject({
-      title: t('common.commandBlocked', 'en'),
-      description: 'Please wait 2.0 seconds',
-      color: COLORS.ERROR,
+      title: 'Slow down there',
+      description: 'You can use /x again in 2s.',
+      color: COLORS.WARNING,
     });
   });
+
+  it.each([
+    ['cooldown', 'common.cooldownTitle'],
+    ['permissions', 'common.permissionDeniedTitle'],
+  ] as const)(
+    'titles an untitled %s rejection by the middleware that made it',
+    async (name, titleKey) => {
+      const middleware =
+        name === 'cooldown' ? cooldownMiddleware : permissionsMiddleware;
+      middleware.mockResolvedValue({ success: false, message: 'why' });
+      const { interaction: i, reply } = interaction();
+
+      await runMiddleware(i, command([name]));
+
+      expect(embedOf(reply).title).toBe(t(titleKey, 'en'));
+    }
+  );
 
   it.each([
     ['missing', undefined],
@@ -190,7 +210,7 @@ describe('runMiddleware', () => {
 
     expect(resolveLocale).toHaveBeenCalledWith(i);
     expect(embedOf(reply)).toMatchObject({
-      title: t('common.commandBlocked', 'ja'),
+      title: t('common.permissionDeniedTitle', 'ja'),
       description: t('common.noPermission', 'ja'),
     });
   });

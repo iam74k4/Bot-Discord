@@ -15,7 +15,11 @@ export async function executePingCommand(
   const acknowledgedAt =
     response.resource?.message?.createdTimestamp ?? Date.now();
   const roundtripLatency = acknowledgedAt - interaction.createdTimestamp;
+  // discord.js reports -1 until the first heartbeat is acknowledged, which
+  // is not a measurement.
   const wsLatency = interaction.client.ws.ping;
+  const apiLatency =
+    wsLatency >= 0 ? `${wsLatency}ms` : t('ping.notMeasured', locale);
 
   const embed = createEmbed({
     title: t('ping.title', locale),
@@ -28,7 +32,7 @@ export async function executePingCommand(
       },
       {
         name: t('ping.apiLatency', locale),
-        value: `${wsLatency}ms`,
+        value: apiLatency,
         inline: true,
       },
     ],

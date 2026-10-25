@@ -1,52 +1,74 @@
 import {
   ChannelType,
   ChatInputCommandInteraction,
-  type Guild,
+  type ColorResolvable,
   MessageFlags,
 } from 'discord.js';
 import { env } from '../../../config/index.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
-import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
-import { mapDiscordLocale, t, type Locale } from '../../../locales/index.js';
-import {
-  resolveGuildLocale,
-  resolveLocale,
-} from '../../../locales/guildLocale.js';
-import type { VoiceConnectionInfo } from '../../../shared/types/voice.js';
+import { commandMention } from '../../../shared/utils/commandMentions.js';
+import { releaseCooldown } from '../../../middleware/index.js';
+import { t, type Locale } from '../../../locales/index.js';
+import { resolveLocale } from '../../../locales/guildLocale.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 import { connectionManager } from '../recording/connectionManager.js';
-import { ttsSessions } from '../tts/sessionManager.js';
+import type { ReconcileOutcome } from './reconcile.js';
+import { auditVoiceSettingChange } from './settingsAudit.js';
+import {
+  disableAutoJoin,
+  enableAutoJoin,
+  excludeChannel,
+  includeChannel,
+} from './policy.js';
 
-/**
- * Stop the buffering in one channel. A deafened text-to-speech join keeps no
- * audio, so it is left alone and goes on reading. A listening connection is
- * dropped at once - the opt-out wins over reading through it - and if it was
- * being read through, the people there are told why and how to resume.
- * True when that ended a reading session.
- */
-async function stopBuffering(
-  guild: Guild,
-  channelId: string,
-  info: VoiceConnectionInfo
-): Promise<boolean> {
-  if (info.receiving === false) return false;
-  // Checked first: the disconnect ends the session.
-  const wasReading = ttsSessions.get(channelId) !== undefined;
-  // Only this connection: one that replaced it meanwhile (say, a deafened
-  // /tts start join) is not ours to remove.
-  await connectionManager.disconnect(channelId, info.connection);
-  if (wasReading) {
-    // Not awaited: a slow or rate-limited post must neither keep the bot
-    // buffering nor hold up the reply past Discord's 3 s window. It catches
-    // its own errors.
-    void noticeReadingStopped(guild, channelId);
+/** What a reconcile right after a change means for the admin. */
+export function describeReconcile(
+  outcome: ReconcileOutcome | undefined,
+  locale: Locale
+): string | null {
+  switch (outcome?.status) {
+    case 'joined':
+      return t('record.autojoin.joinedNow', locale, {
+        channel: outcome.channelId,
+      });
+    case 'none':
+      return t('record.autojoin.waitingForMembers', locale);
+    case 'already':
+      // A reading-only connection holds the guild's one voice slot without
+      // keeping anything; "turned on" alone would suggest otherwise.
+      return connectionManager.getConnection(outcome.channelId)?.receiving ===
+        false
+        ? t('record.autojoin.alreadyReadOnly', locale, {
+            channel: outcome.channelId,
+          })
+        : null;
+    default:
+      return null;
   }
-  return wasReading;
+}
+
+function answer(
+  interaction: ChatInputCommandInteraction,
+  locale: Locale,
+  lines: Array<string | null>,
+  color: ColorResolvable
+) {
+  return interaction.reply({
+    embeds: [
+      createEmbed({
+        title: t('record.autojoin.title', locale),
+        description: lines.filter(Boolean).join('\n\n'),
+        color,
+      }),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
 }
 
 /**
- * The opt-outs stop auto-join, not reading - but only mention reading where
+ * The opt-outs stop auto-join and buffering, not reading: a deafened
+ * text-to-speech join keeps nothing and stays. Only mention reading where
  * the bot can read at all.
  */
 function withTtsNote(description: string, locale: Locale): string {
@@ -55,32 +77,8 @@ function withTtsNote(description: string, locale: Locale): string {
     : description;
 }
 
-/** Best effort: a missing permission must not keep the bot buffering. */
-async function noticeReadingStopped(
-  guild: Guild,
-  channelId: string
-): Promise<void> {
-  try {
-    const channel = guild.channels.cache.get(channelId);
-    if (!channel?.isSendable()) return;
-    const locale = resolveGuildLocale(
-      guild.id,
-      mapDiscordLocale(guild.preferredLocale)
-    );
-    await channel.send({
-      embeds: [
-        createEmbed({
-          title: t('tts.stopped', locale),
-          description: t('tts.stoppedByOptOut', locale),
-          color: COLORS.WARNING,
-        }),
-      ],
-    });
-  } catch (error) {
-    logger.debug(
-      `Could not tell ${channelId} reading stopped: ${getErrorMessage(error)}`
-    );
-  }
+function readingStoppedLine(channelId: string, locale: Locale): string {
+  return t('record.autojoin.readingStopped', locale, { channel: channelId });
 }
 
 /**
@@ -105,43 +103,55 @@ export async function executeAutoJoinCommand(
     return;
   }
 
-  const guildId = interaction.guildId;
+  const guild = interaction.guild;
   const subcommand = interaction.options.getSubcommand();
   const minutes = Math.round(env.AUDIO_BUFFER_DURATION / 60);
+  const audit = (change: Parameters<typeof auditVoiceSettingChange>[3]) =>
+    auditVoiceSettingChange(
+      interaction.client,
+      guild,
+      interaction.user.id,
+      change,
+      { command: `voice autojoin ${subcommand}` }
+    );
 
-  if (subcommand === 'enable' || subcommand === 'disable') {
-    const enable = subcommand === 'enable';
-    voiceSettingsRepository.setAutoJoinEnabled(guildId, enable);
-
-    // Turning it off should stop the buffering already in progress, not just
-    // prevent the next join.
-    let readingStoppedIn: string | null = null;
-    if (!enable) {
-      for (const [channelId, info] of connectionManager.getAllConnections()) {
-        if (
-          info.guildId === guildId &&
-          (await stopBuffering(interaction.guild, channelId, info))
-        ) {
-          readingStoppedIn = channelId;
-        }
-      }
-    }
-
-    const description = enable
-      ? t('record.autojoin.enabled', locale, { minutes })
-      : withTtsNote(t('record.autojoin.disabled', locale), locale);
-    await interaction.reply({
-      embeds: [
-        createEmbed({
-          title: t('record.autojoin.title', locale),
-          description: readingStoppedIn
-            ? `${description}\n\n${t('record.autojoin.readingStopped', locale, { channel: readingStoppedIn })}`
-            : description,
-          color: enable ? COLORS.SUCCESS : COLORS.WARNING,
-        }),
+  if (subcommand === 'enable') {
+    const outcome = await enableAutoJoin(guild);
+    audit({ kind: 'autoJoinEnabled' });
+    await answer(
+      interaction,
+      locale,
+      [
+        t('record.autojoin.enabled', locale, { minutes }),
+        describeReconcile(outcome, locale),
       ],
-      flags: MessageFlags.Ephemeral,
-    });
+      COLORS.SUCCESS
+    );
+    return;
+  }
+
+  if (subcommand === 'disable') {
+    // Turning it off stops the buffering already in progress, not just the
+    // next join, and the reply waits until the bot has actually left.
+    const { dropped, readingStoppedIn } = await disableAutoJoin(guild);
+    audit({ kind: 'autoJoinDisabled' });
+    await answer(
+      interaction,
+      locale,
+      [
+        withTtsNote(
+          t('record.autojoin.disabled', locale, {
+            command: commandMention('voice autojoin enable'),
+          }),
+          locale
+        ),
+        dropped > 0 ? t('record.autojoin.disabledDropped', locale) : null,
+        ...readingStoppedIn.map((channelId) =>
+          readingStoppedLine(channelId, locale)
+        ),
+      ],
+      COLORS.SUCCESS
+    );
     return;
   }
 
@@ -150,11 +160,12 @@ export async function executeAutoJoinCommand(
     channel.type !== ChannelType.GuildVoice &&
     channel.type !== ChannelType.GuildStageVoice
   ) {
+    releaseCooldown(interaction);
     await interaction.reply({
       embeds: [
         createErrorEmbed(
           t('common.error', locale),
-          t('record.errors.notInVoiceDesc', locale)
+          t('record.errors.notVoiceChannel', locale)
         ),
       ],
       flags: MessageFlags.Ephemeral,
@@ -163,48 +174,58 @@ export async function executeAutoJoinCommand(
   }
 
   if (subcommand === 'exclude') {
-    voiceSettingsRepository.addExclusion(guildId, channel.id);
-
-    const info = connectionManager.getConnection(channel.id);
-    const readingStopped =
-      info !== undefined &&
-      (await stopBuffering(interaction.guild, channel.id, info));
-
-    const description = withTtsNote(
-      t('record.autojoin.excluded', locale, { channel: channel.id }),
-      locale
+    const { added, left, readingStopped } = await excludeChannel(
+      guild,
+      channel.id
     );
-    await interaction.reply({
-      embeds: [
-        createEmbed({
-          title: t('record.autojoin.title', locale),
-          description: readingStopped
-            ? `${description}\n\n${t('record.autojoin.readingStopped', locale, { channel: channel.id })}`
-            : description,
-          color: COLORS.WARNING,
-        }),
+    if (added) audit({ kind: 'channelExcluded', channelId: channel.id });
+    await answer(
+      interaction,
+      locale,
+      [
+        withTtsNote(
+          added
+            ? t('record.autojoin.excluded', locale, { channel: channel.id })
+            : t('record.autojoin.alreadyExcluded', locale, {
+                channel: channel.id,
+              }),
+          locale
+        ),
+        left
+          ? t('record.autojoin.excludedLeft', locale, { channel: channel.id })
+          : null,
+        readingStopped ? readingStoppedLine(channel.id, locale) : null,
       ],
-      flags: MessageFlags.Ephemeral,
-    });
+      added ? COLORS.SUCCESS : COLORS.INFO
+    );
     return;
   }
 
-  const removed = voiceSettingsRepository.removeExclusion(guildId, channel.id);
-  await interaction.reply({
-    embeds: [
-      removed
-        ? createEmbed({
-            title: t('record.autojoin.title', locale),
-            description: t('record.autojoin.included', locale, {
-              channel: channel.id,
-            }),
-            color: COLORS.SUCCESS,
-          })
-        : createErrorEmbed(
-            t('common.error', locale),
-            t('record.autojoin.notExcluded', locale, { channel: channel.id })
-          ),
+  const { removed, outcome } = await includeChannel(guild, channel.id);
+  if (!removed) {
+    // Nothing to undo: say so plainly, it is not an error.
+    await answer(
+      interaction,
+      locale,
+      [t('record.autojoin.notExcluded', locale, { channel: channel.id })],
+      COLORS.INFO
+    );
+    return;
+  }
+
+  audit({ kind: 'channelIncluded', channelId: channel.id });
+  const autoJoinOn = voiceSettingsRepository.isAutoJoinEnabled(guild.id);
+  await answer(
+    interaction,
+    locale,
+    [
+      t('record.autojoin.included', locale, { channel: channel.id }),
+      autoJoinOn
+        ? describeReconcile(outcome, locale)
+        : t('record.autojoin.includedWhileOff', locale, {
+            command: commandMention('voice autojoin enable'),
+          }),
     ],
-    flags: MessageFlags.Ephemeral,
-  });
+    autoJoinOn ? COLORS.SUCCESS : COLORS.WARNING
+  );
 }

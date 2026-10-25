@@ -1,4 +1,0 @@
-[phases.setup]
-nixPkgs = ['...', 'python311', 'pkg-config', 'libopus']
-nixLibs = ['...', 'libopus']
-aptPkgs = ['...', 'build-essential', 'libtool', 'autoconf', 'automake']

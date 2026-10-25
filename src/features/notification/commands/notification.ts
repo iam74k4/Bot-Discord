@@ -14,7 +14,11 @@ import {
   handleStatus,
   handleStats,
 } from '../application/index.js';
-import { interactionHasGuildPermission } from '../../../shared/utils/discord.js';
+import {
+  createPermissionDeniedEmbed,
+  interactionHasGuildPermission,
+} from '../../../shared/utils/discord.js';
+import { resolveLocale } from '../../../locales/guildLocale.js';
 
 export const command: Command = {
   data: new SlashCommandBuilder()
@@ -39,6 +43,7 @@ export const command: Command = {
             .addChannelOption((opt) =>
               opt
                 .setName('channel')
+                .setNameLocalizations({ ja: 'チャンネル' })
                 .setDescription('Text channel for notifications')
                 .setDescriptionLocalizations({ ja: '通知先テキストチャンネル' })
                 .addChannelTypes(ChannelType.GuildText)
@@ -67,6 +72,7 @@ export const command: Command = {
             .addChannelOption((opt) =>
               opt
                 .setName('channel')
+                .setNameLocalizations({ ja: 'チャンネル' })
                 .setDescription('Text channel for notifications')
                 .setDescriptionLocalizations({ ja: '通知先テキストチャンネル' })
                 .addChannelTypes(ChannelType.GuildText)
@@ -94,8 +100,11 @@ export const command: Command = {
         .addStringOption((opt) =>
           opt
             .setName('period')
-            .setDescription('Time period')
-            .setDescriptionLocalizations({ ja: '期間' })
+            .setNameLocalizations({ ja: '期間' })
+            .setDescription('Period (all time if omitted)')
+            .setDescriptionLocalizations({
+              ja: '集計する期間（未指定なら全期間）',
+            })
             .addChoices(
               {
                 name: 'Today',
@@ -103,13 +112,13 @@ export const command: Command = {
                 value: 'today',
               },
               {
-                name: 'This week',
-                name_localizations: { ja: '今週' },
+                name: 'Last 7 days',
+                name_localizations: { ja: '過去7日間' },
                 value: 'week',
               },
               {
-                name: 'This month',
-                name_localizations: { ja: '今月' },
+                name: 'Last 30 days',
+                name_localizations: { ja: '過去30日間' },
                 value: 'month',
               },
               {
@@ -145,16 +154,11 @@ export const command: Command = {
         PermissionFlagsBits.ManageGuild
       )
     ) {
-      const { createErrorEmbed } =
-        await import('../../../shared/utils/embed.js');
-      const { t } = await import('../../../locales/index.js');
-      const { resolveLocale } = await import('../../../locales/guildLocale.js');
-      const locale = resolveLocale(interaction);
       await interaction.reply({
         embeds: [
-          createErrorEmbed(
-            t('common.error', locale),
-            t('notification.errors.manageGuildRequired', locale)
+          createPermissionDeniedEmbed(
+            PermissionFlagsBits.ManageGuild,
+            resolveLocale(interaction)
           ),
         ],
         flags: MessageFlags.Ephemeral,

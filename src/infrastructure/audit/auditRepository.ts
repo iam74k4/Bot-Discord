@@ -55,14 +55,26 @@ function getAuditChannel(guildId: string): string | null {
   return guildSettingsRepository.getAuditChannel(guildId);
 }
 
-function getLogs(guildId: string, limit: number = 50): AuditLogRecord[] {
+/**
+ * A page of a guild's logs, newest first.
+ *
+ * Rows written in the same millisecond are ordered by id, so paging with
+ * `offset` never shows a row twice or skips one. With the
+ * `(guild_id, created_at)` index this reads only the rows it returns (plus
+ * the skipped ones); the rowid tie-break rides along in the index.
+ */
+function getLogs(
+  guildId: string,
+  limit: number = 50,
+  offset: number = 0
+): AuditLogRecord[] {
   const stmt = database.prepare(`
     SELECT * FROM audit_logs
     WHERE guild_id = ?
-    ORDER BY created_at DESC
-    LIMIT ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT ? OFFSET ?
   `);
-  return stmt.all(guildId, limit) as AuditLogRecord[];
+  return stmt.all(guildId, limit, Math.max(0, offset)) as AuditLogRecord[];
 }
 
 function getLogsCount(guildId: string): number {

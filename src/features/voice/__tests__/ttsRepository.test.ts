@@ -21,6 +21,7 @@ const { MAX_DICTIONARY_ENTRIES, ttsRepository } =
 const { up: ttsTables } =
   await import('../../../infrastructure/database/migrations/011_tts.js');
 const { logger } = await import('../../../shared/utils/logger.js');
+const { applyDictionary } = await import('../tts/textNormalizer.js');
 
 const T0 = new Date('2026-10-24T09:00:00.000Z').getTime();
 
@@ -29,6 +30,7 @@ describe('011_tts migration', () => {
     db.exec(
       'DROP TABLE IF EXISTS tts_user_settings; DROP TABLE IF EXISTS tts_dictionary;'
     );
+    ttsRepository.clearCache();
   });
 
   it('creates both tables and can run twice', () => {
@@ -78,6 +80,8 @@ describe('ttsRepository', () => {
       'DROP TABLE IF EXISTS tts_user_settings; DROP TABLE IF EXISTS tts_dictionary;'
     );
     ttsTables();
+    // The tables were replaced behind the repository's back.
+    ttsRepository.clearCache();
   });
 
   afterEach(() => {
@@ -143,6 +147,69 @@ describe('ttsRepository', () => {
       expect(() =>
         ttsRepository.setUserSettings('u1', { speakerId: 1, speed: 1 })
       ).toThrow();
+    });
+
+    describe('cache', () => {
+      const prepare = () => vi.spyOn(db, 'prepare');
+
+      afterEach(() => {
+        vi.restoreAllMocks();
+      });
+
+      it('reads a user from the database once, including "never chose"', () => {
+        ttsRepository.setUserSettings('u1', { speakerId: 8, speed: 1.25 });
+        const spy = prepare();
+
+        for (let i = 0; i < 3; i++) {
+          expect(ttsRepository.getUserSettings('u1')).toEqual({
+            speakerId: 8,
+            speed: 1.25,
+          });
+          expect(ttsRepository.getUserSettings('nobody')).toBeNull();
+        }
+
+        expect(spy).toHaveBeenCalledTimes(2);
+      });
+
+      it('sees a new choice at once after it is saved', () => {
+        ttsRepository.setUserSettings('u1', { speakerId: 8, speed: 1 });
+        expect(ttsRepository.getUserSettings('u1')?.speakerId).toBe(8);
+
+        ttsRepository.setUserSettings('u1', { speakerId: 2, speed: 1.5 });
+
+        expect(ttsRepository.getUserSettings('u1')).toEqual({
+          speakerId: 2,
+          speed: 1.5,
+        });
+      });
+
+      it('sees the first choice of someone cached as "never chose"', () => {
+        expect(ttsRepository.getUserSettings('u1')).toBeNull();
+
+        ttsRepository.setUserSettings('u1', { speakerId: 2, speed: 1 });
+
+        expect(ttsRepository.getUserSettings('u1')?.speakerId).toBe(2);
+      });
+
+      it('does not let a caller change what is cached', () => {
+        ttsRepository.setUserSettings('u1', { speakerId: 8, speed: 1 });
+        const read = ttsRepository.getUserSettings('u1')!;
+        read.speakerId = 99;
+
+        expect(ttsRepository.getUserSettings('u1')?.speakerId).toBe(8);
+      });
+
+      it('does not cache a failed read', () => {
+        db.exec('DROP TABLE tts_user_settings');
+        expect(ttsRepository.getUserSettings('u1')).toBeNull();
+
+        ttsTables();
+        db.prepare(
+          'INSERT INTO tts_user_settings (user_id, speaker_id, speed, updated_at) VALUES (?, ?, ?, ?)'
+        ).run('u1', 5, 1, 0);
+
+        expect(ttsRepository.getUserSettings('u1')?.speakerId).toBe(5);
+      });
     });
   });
 
@@ -281,6 +348,114 @@ describe('ttsRepository', () => {
       expect(ttsRepository.removeDictionaryEntry('g1', 'w')).toBe(false);
       expect(ttsRepository.getDictionaryEntry('g1', 'w')).toBeNull();
       expect(ttsRepository.getDictionaryEntry('g2', 'w')).not.toBeNull();
+    });
+
+    describe('compiled dictionary', () => {
+      afterEach(() => {
+        vi.restoreAllMocks();
+      });
+
+      const read = (guildId: string, text: string) =>
+        applyDictionary(text, ttsRepository.compiledDictionary(guildId));
+
+      it('applies a server’s words, longest first, case-insensitively', () => {
+        ttsRepository.upsertDictionaryEntry('g1', '東京', 'とうきょう', 'u1');
+        ttsRepository.upsertDictionaryEntry(
+          'g1',
+          '東京タワー',
+          'とうきょうたわー',
+          'u1'
+        );
+        ttsRepository.upsertDictionaryEntry('g1', 'BOT', 'ぼっと', 'u1');
+        ttsRepository.upsertDictionaryEntry('g2', '東京', 'ちがう', 'u1');
+
+        expect(read('g1', '東京タワーと東京の bot')).toBe(
+          'とうきょうたわーととうきょうの ぼっと'
+        );
+        expect(read('g3', '東京')).toBe('東京');
+      });
+
+      it('compiles a server’s dictionary once for every message', () => {
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
+        const spy = vi.spyOn(db, 'prepare');
+
+        const first = ttsRepository.compiledDictionary('g1');
+        for (let i = 0; i < 5; i++) {
+          expect(ttsRepository.compiledDictionary('g1')).toBe(first);
+        }
+        expect(ttsRepository.listDictionary('g1')).toHaveLength(1);
+
+        expect(spy).toHaveBeenCalledTimes(1);
+      });
+
+      it('uses a word from the next message on, once it is added', () => {
+        expect(read('g1', 'w')).toBe('w');
+
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
+
+        expect(read('g1', 'w')).toBe('わら');
+        expect(ttsRepository.listDictionary('g1')).toHaveLength(1);
+      });
+
+      it('uses a new reading at once when a word is updated', () => {
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
+        expect(read('g1', 'w')).toBe('わら');
+
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'くさ', 'u1');
+
+        expect(read('g1', 'w')).toBe('くさ');
+      });
+
+      it('stops using a word at once when it is removed', () => {
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
+        expect(read('g1', 'w')).toBe('わら');
+
+        ttsRepository.removeDictionaryEntry('g1', 'w');
+
+        expect(read('g1', 'w')).toBe('w');
+        expect(ttsRepository.listDictionary('g1')).toEqual([]);
+      });
+
+      it('leaves other servers cached when one changes', () => {
+        ttsRepository.upsertDictionaryEntry('g2', 'x', 'えっくす', 'u1');
+        const g2 = ttsRepository.compiledDictionary('g2');
+
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
+
+        expect(ttsRepository.compiledDictionary('g2')).toBe(g2);
+      });
+
+      it('reads a server again after it is forgotten', () => {
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
+        const before = ttsRepository.compiledDictionary('g1');
+
+        ttsRepository.forgetGuild('g1');
+
+        expect(ttsRepository.compiledDictionary('g1')).not.toBe(before);
+      });
+
+      it('does not let a caller change the cached list', () => {
+        ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
+        const list = ttsRepository.listDictionary('g1');
+        list[0].reading = 'changed';
+        list.pop();
+
+        expect(ttsRepository.listDictionary('g1')).toEqual([
+          { word: 'w', reading: 'わら', createdBy: 'u1' },
+        ]);
+      });
+
+      it('does not cache a failed read', () => {
+        db.exec('DROP TABLE tts_dictionary');
+        expect(read('g1', 'w')).toBe('w');
+
+        ttsTables();
+        db.prepare(
+          'INSERT INTO tts_dictionary (guild_id, word_key, word, reading, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+        ).run('g1', 'w', 'w', 'わら', 'u1', 0);
+
+        expect(read('g1', 'w')).toBe('わら');
+      });
     });
 
     it('list degrades to empty on a database failure', () => {

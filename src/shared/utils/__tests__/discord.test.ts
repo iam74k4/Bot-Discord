@@ -1,6 +1,7 @@
 import {
   ChatInputCommandInteraction,
   Guild,
+  GuildMember,
   PermissionFlagsBits,
   PermissionsBitField,
   TextChannel,
@@ -8,10 +9,17 @@ import {
 } from 'discord.js';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  checkPostableTextChannel,
+  createPermissionDeniedEmbed,
+  formatPermissionNames,
   getSendableTextChannel,
   hasPermission,
   interactionHasGuildPermission,
+  memberServerPermissions,
+  permissionNames,
 } from '../discord.js';
+import { t } from '../../../locales/index.js';
+import { COLORS } from '../constants/index.js';
 
 function createInteraction(
   permissions?: bigint[],
@@ -37,10 +45,12 @@ function createTextChannelMock(
   return channel;
 }
 
+/** Everything a bot needs to post an embed: View, Send, Embed Links. */
 const canSend = () =>
   new PermissionsBitField([
     PermissionFlagsBits.ViewChannel,
     PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.EmbedLinks,
   ]);
 
 const me = { id: 'bot-1' };
@@ -182,6 +192,21 @@ describe('discord utils', () => {
       expect(result).toBeNull();
     });
 
+    it.each([
+      ['send', PermissionFlagsBits.SendMessages],
+      ['embed links', PermissionFlagsBits.EmbedLinks],
+      ['see the channel', PermissionFlagsBits.ViewChannel],
+    ])('returns null when the bot cannot %s', async (_label, missing) => {
+      const granted = canSend().remove(missing);
+      const channel = createTextChannelMock(granted);
+      const { guild } = createGuild({ cached: { 'channel-1': channel } });
+
+      // Every background post is an embed; it would only fail.
+      await expect(
+        getSendableTextChannel(guild, 'channel-1')
+      ).resolves.toBeNull();
+    });
+
     it('returns null when the bot can see but not send', async () => {
       const channel = createTextChannelMock(
         new PermissionsBitField([PermissionFlagsBits.ViewChannel])
@@ -249,5 +274,160 @@ describe('discord utils', () => {
       ).resolves.toBeNull();
       expect(channel.permissionsFor).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('checkPostableTextChannel', () => {
+  it('names exactly the permissions the bot lacks, in a fixed order', async () => {
+    const channel = createTextChannelMock(
+      new PermissionsBitField([PermissionFlagsBits.SendMessages])
+    );
+    const { guild } = createGuild({ cached: { 'channel-1': channel } });
+
+    await expect(checkPostableTextChannel(guild, 'channel-1')).resolves.toEqual(
+      {
+        ok: false,
+        reason: 'missingPermissions',
+        channel,
+        missing: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.EmbedLinks,
+        ],
+      }
+    );
+  });
+
+  it('treats an unreadable permission set as granting nothing', async () => {
+    const channel = createTextChannelMock(null);
+    const { guild } = createGuild({ cached: { 'channel-1': channel } });
+
+    const check = await checkPostableTextChannel(guild, 'channel-1');
+
+    expect(check).toMatchObject({ ok: false, reason: 'missingPermissions' });
+  });
+
+  it('accepts a channel with everything needed', async () => {
+    const channel = createTextChannelMock(canSend());
+    const { guild } = createGuild({ cached: { 'channel-1': channel } });
+
+    await expect(checkPostableTextChannel(guild, 'channel-1')).resolves.toEqual(
+      { ok: true, channel }
+    );
+  });
+
+  it.each([
+    ['a missing channel', createGuild()],
+    [
+      'a voice channel',
+      createGuild({
+        cached: { 'channel-1': Object.create(VoiceChannel.prototype) },
+      }),
+    ],
+    [
+      'an uncached bot member',
+      createGuild({
+        cached: { 'channel-1': createTextChannelMock(canSend()) },
+        me: null,
+      }),
+    ],
+  ])('reports %s as unavailable', async (_label, { guild }) => {
+    await expect(checkPostableTextChannel(guild, 'channel-1')).resolves.toEqual(
+      { ok: false, reason: 'unavailable' }
+    );
+  });
+});
+
+describe('memberServerPermissions', () => {
+  const MANAGE_ROLES = new PermissionsBitField([
+    PermissionFlagsBits.ManageRoles,
+  ]);
+
+  function guildMember(permissions: () => PermissionsBitField) {
+    const member = Object.create(GuildMember.prototype) as GuildMember;
+    Object.defineProperty(member, 'permissions', { get: permissions });
+    return member;
+  }
+
+  it('uses a cached member’s server-wide permissions over the channel’s', () => {
+    // The channel grants Manage Permissions (the Manage Roles bit) through
+    // an overwrite; the member's roles do not.
+    const result = memberServerPermissions({
+      member: guildMember(() => new PermissionsBitField()),
+      memberPermissions: MANAGE_ROLES,
+    });
+
+    expect(result?.has(PermissionFlagsBits.ManageRoles)).toBe(false);
+  });
+
+  it('falls back to what Discord sent when the member’s roles are not cached', () => {
+    const result = memberServerPermissions({
+      member: guildMember(() => {
+        throw new Error('roles not cached');
+      }),
+      memberPermissions: MANAGE_ROLES,
+    });
+
+    expect(result).toBe(MANAGE_ROLES);
+  });
+
+  it('reads a stand-in member’s own field last, and gives up without one', () => {
+    expect(
+      memberServerPermissions({ member: { permissions: MANAGE_ROLES } })
+    ).toBe(MANAGE_ROLES);
+    expect(memberServerPermissions({ member: { permissions: 'x' } })).toBe(
+      null
+    );
+    expect(memberServerPermissions({ member: null })).toBe(null);
+  });
+});
+
+describe('permission names', () => {
+  it('names a permission the way the Discord client does, not by its flag', () => {
+    expect(permissionNames(PermissionFlagsBits.ManageGuild, 'ja')).toEqual([
+      'サーバー管理',
+    ]);
+    expect(permissionNames(PermissionFlagsBits.ManageGuild, 'en')).toEqual([
+      'Manage Server',
+    ]);
+    expect(permissionNames([PermissionFlagsBits.ManageRoles], 'ja')).toEqual([
+      'ロールの管理',
+    ]);
+  });
+
+  it('falls back to the flag name for a permission without a label', () => {
+    expect(permissionNames(PermissionFlagsBits.UseVAD, 'ja')).toEqual([
+      'UseVAD',
+    ]);
+  });
+
+  it('joins several names the way each language lists them', () => {
+    const both = [
+      PermissionFlagsBits.ManageGuild,
+      PermissionFlagsBits.ManageRoles,
+    ];
+
+    expect(formatPermissionNames(both, 'ja')).toBe(
+      '「サーバー管理」、「ロールの管理」'
+    );
+    expect(formatPermissionNames(both, 'en')).toBe(
+      'Manage Server and Manage Roles'
+    );
+    expect(formatPermissionNames(PermissionFlagsBits.ManageGuild, 'ja')).toBe(
+      '「サーバー管理」'
+    );
+  });
+
+  it('reports a missing permission as a warning naming it', () => {
+    const embed = createPermissionDeniedEmbed(
+      PermissionFlagsBits.ManageGuild,
+      'ja'
+    ).toJSON();
+
+    expect(embed).toMatchObject({
+      title: t('common.permissionDeniedTitle', 'ja'),
+      color: COLORS.WARNING,
+    });
+    expect(embed.description).toContain('「サーバー管理」');
+    expect(embed.description).not.toContain('ManageGuild');
   });
 });

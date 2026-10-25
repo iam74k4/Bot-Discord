@@ -1,4 +1,5 @@
 import { createApp } from './app/composition.js';
+import { enableCompileCache, flushCompileCache } from './app/compileCache.js';
 import { installProcessHandlers } from './app/processHandlers.js';
 import { loadConfig } from './config/index.js';
 import { getErrorMessage, logger } from './shared/utils/logger.js';
@@ -14,12 +15,19 @@ async function main(): Promise<void> {
   // Read and validate configuration before anything else can observe it.
   const config = loadConfig();
 
+  // Faster restarts; the volume keeps the cache across deployments.
+  if (config.isProduction) enableCompileCache(config.DATA_DIR);
+
   logger.info('Starting Discord bot...');
 
   const app = createApp(config);
   installProcessHandlers(app, config.SHUTDOWN_TIMEOUT_MS);
 
   await app.start();
+
+  // Everything startup needs has been compiled by now. Node would only write
+  // the cache at a clean exit, which a SIGKILL from the host never is.
+  flushCompileCache();
 
   logger.info('Discord bot started successfully');
 }

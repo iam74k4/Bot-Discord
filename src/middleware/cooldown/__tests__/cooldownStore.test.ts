@@ -266,6 +266,37 @@ describe('CooldownStore', () => {
     });
   });
 
+  describe('clearCooldownTree', () => {
+    it('clears a path and every path beneath it for that user only', () => {
+      cooldownStore.setCooldown('voice', 'user1', 5000);
+      cooldownStore.setCooldown('voice record', 'user1', 5000);
+      cooldownStore.setCooldown('voice autojoin exclude', 'user1', 5000);
+      cooldownStore.setCooldown('voice record', 'user2', 5000);
+      cooldownStore.setCooldown('voicemail', 'user1', 5000);
+
+      cooldownStore.clearCooldownTree('voice', 'user1');
+
+      expect(cooldownStore.isOnCooldown('voice', 'user1')).toBe(false);
+      expect(cooldownStore.isOnCooldown('voice record', 'user1')).toBe(false);
+      expect(
+        cooldownStore.isOnCooldown('voice autojoin exclude', 'user1')
+      ).toBe(false);
+      // Another user, and a command that merely starts with the same letters.
+      expect(cooldownStore.isOnCooldown('voice record', 'user2')).toBe(true);
+      expect(cooldownStore.isOnCooldown('voicemail', 'user1')).toBe(true);
+    });
+
+    it('leaves sibling paths of a subcommand alone', () => {
+      cooldownStore.setCooldown('voice record', 'user1', 5000);
+      cooldownStore.setCooldown('voice status', 'user1', 5000);
+
+      cooldownStore.clearCooldownTree('voice record', 'user1');
+
+      expect(cooldownStore.isOnCooldown('voice record', 'user1')).toBe(false);
+      expect(cooldownStore.isOnCooldown('voice status', 'user1')).toBe(true);
+    });
+  });
+
   describe('clearAll', () => {
     it('should clear all cooldowns', () => {
       cooldownStore.setCooldown('command1', 'user1', 5000);

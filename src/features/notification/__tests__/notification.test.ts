@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { ChannelType, MessageFlags } from 'discord.js';
+import { ChannelType, MessageFlags, PermissionFlagsBits } from 'discord.js';
 import {
   afterAll,
   beforeAll,
@@ -11,8 +11,11 @@ import {
 } from 'vitest';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { t } from '../../../locales/index.js';
+import { commandMention } from '../../../shared/utils/commandMentions.js';
+import { formatPermissionNames } from '../../../shared/utils/discord.js';
 import {
   GUILD_ID,
+  POSTING_PERMISSIONS,
   USER_ID,
   clearNotificationTables,
   createCommandInteraction,
@@ -90,6 +93,51 @@ function expectError(
   expect(embed.color).toBe(COLORS.ERROR);
 }
 
+/** The Manage Server refusal every settings subcommand shares. */
+function expectPermissionDenied(
+  fake: ReturnType<typeof createCommandInteraction>,
+  locale: 'en' | 'ja' = 'en'
+) {
+  const { payload, embed } = replyOf(fake);
+  expect(payload.flags).toBe(MessageFlags.Ephemeral);
+  expect(embed.title).toBe(t('common.permissionDeniedTitle', locale));
+  expect(embed.description).toBe(
+    t('common.permissionsRequired', locale, {
+      permissions: formatPermissionNames(
+        PermissionFlagsBits.ManageGuild,
+        locale
+      ),
+    })
+  );
+  expect(embed.color).toBe(COLORS.WARNING);
+}
+
+/**
+ * The confirmation for a set: where posts go, which language they come out
+ * in (an English reader on a server on "auto" is told they will be in
+ * Japanese, and why), then the next step.
+ */
+function setDescription(
+  keys: { body: Parameters<typeof t>[0]; next: Parameters<typeof t>[0] },
+  options: { hint?: boolean; locale?: 'en' | 'ja' } = {}
+) {
+  const locale = options.locale ?? 'en';
+  return [
+    t(keys.body, locale, { channel: TARGET }),
+    t('notification.language.line', locale, { language: '日本語' }),
+    ...(options.hint === false
+      ? []
+      : [
+          t('notification.language.autoHint', locale, {
+            language: '日本語',
+            command: commandMention('admin settings language'),
+          }),
+        ]),
+    '',
+    t(keys.next, locale, { command: commandMention('notification status') }),
+  ].join('\n');
+}
+
 const setHandlers = [
   {
     name: 'handleVoiceSet',
@@ -122,10 +170,13 @@ const removeHandlers = [
     type: 'voice',
     otherType: 'member_join',
     auditKind: 'Voice',
+    setCommand: 'notification voice set',
     keys: {
       title: 'notification.voice.removedTitle',
       body: 'notification.voice.removed',
       hint: 'notification.voice.disabledHint',
+      label: 'notification.summary.voice',
+      already: 'notification.voice.alreadyDisabled',
     },
   },
   {
@@ -134,10 +185,13 @@ const removeHandlers = [
     type: 'member_join',
     otherType: 'voice',
     auditKind: 'Welcome',
+    setCommand: 'notification welcome set',
     keys: {
       title: 'notification.welcome.removedTitle',
       body: 'notification.welcome.removed',
       hint: 'notification.welcome.disabledHint',
+      label: 'notification.summary.welcome',
+      already: 'notification.welcome.alreadyDisabled',
     },
   },
 ] as const;
@@ -178,10 +232,22 @@ describe('notification settings handlers', () => {
       const { payload, embed } = replyOf(fake);
       expect(payload.flags).toBe(MessageFlags.Ephemeral);
       expect(embed.title).toBe(t(keys.title, 'en'));
-      expect(embed.description).toBe(
-        `${t(keys.body, 'en', { channel: TARGET })}\n\n${t(keys.next, 'en')}`
-      );
+      expect(embed.description).toBe(setDescription(keys));
       expect(embed.color).toBe(COLORS.SUCCESS);
+    });
+
+    it('tells a Japanese reader the posts are in Japanese, with no hint', async () => {
+      const fake = createCommandInteraction({
+        guild: sendableGuild(),
+        channel: textOption(),
+        locale: 'ja',
+      });
+
+      await handler(fake.interaction);
+
+      expect(replyOf(fake).embed.description).toBe(
+        setDescription(keys, { hint: false, locale: 'ja' })
+      );
     });
 
     it('moves an existing configuration to the new channel', async () => {
@@ -252,7 +318,7 @@ describe('notification settings handlers', () => {
       }
     );
 
-    it('refuses a channel the bot cannot send messages in', async () => {
+    it('refuses a channel the bot cannot post in, naming what is missing', async () => {
       const fake = createCommandInteraction({
         guild: createGuild({
           cached: [createTextChannel(TARGET, { canSend: false })],
@@ -262,9 +328,42 @@ describe('notification settings handlers', () => {
 
       await handler(fake.interaction);
 
-      expectError(fake, 'notification.errors.channelNotSendable');
+      const { embed } = replyOf(fake);
+      expect(embed.color).toBe(COLORS.ERROR);
+      expect(embed.description).toBe(
+        t('notification.errors.channelMissingPermissions', 'en', {
+          channel: TARGET,
+          permissions: 'View Channels, Send Messages, and Embed Links',
+        })
+      );
       expect(notificationChannelRepository.get(GUILD_ID, type)).toBeNull();
       expect(notifySetup).not.toHaveBeenCalled();
+    });
+
+    it('refuses a channel where the bot can send but not embed links', async () => {
+      // Every notification is an embed: Send Messages alone is not enough.
+      const fake = createCommandInteraction({
+        guild: createGuild({
+          cached: [
+            createTextChannel(TARGET, {
+              permissions:
+                POSTING_PERMISSIONS & ~PermissionFlagsBits.EmbedLinks,
+            }),
+          ],
+        }),
+        channel: textOption(),
+        locale: 'ja',
+      });
+
+      await handler(fake.interaction);
+
+      expect(replyOf(fake).embed.description).toBe(
+        t('notification.errors.channelMissingPermissions', 'ja', {
+          channel: TARGET,
+          permissions: '「埋め込みリンク」',
+        })
+      );
+      expect(notificationChannelRepository.get(GUILD_ID, type)).toBeNull();
     });
 
     it('refuses a channel that no longer exists', async () => {
@@ -296,7 +395,7 @@ describe('notification settings handlers', () => {
 
   describe.each(removeHandlers)(
     '$name',
-    ({ handler, type, otherType, auditKind, keys }) => {
+    ({ handler, type, otherType, auditKind, setCommand, keys }) => {
       it('removes only its own configuration, audits it and confirms', async () => {
         notificationChannelRepository.set(GUILD_ID, type, 'chan-a');
         notificationChannelRepository.set(GUILD_ID, otherType, 'chan-b');
@@ -318,18 +417,27 @@ describe('notification settings handlers', () => {
         expect(payload.flags).toBe(MessageFlags.Ephemeral);
         expect(embed.title).toBe(t(keys.title, 'en'));
         expect(embed.description).toBe(
-          `${t(keys.body, 'en')}\n\n${t(keys.hint, 'en')}`
+          `${t(keys.body, 'en')}\n\n${t(keys.hint, 'en', {
+            command: commandMention(setCommand),
+          })}`
         );
         expect(embed.color).toBe(COLORS.SUCCESS);
       });
 
-      it('reports nothing to remove and does not audit', async () => {
+      it('says it is already off, names the set command and does not audit', async () => {
         notificationChannelRepository.set(GUILD_ID, otherType, 'chan-b');
         const fake = createCommandInteraction();
 
         await handler(fake.interaction);
 
-        expectError(fake, 'notification.errors.notConfigured');
+        // A no-op disable is information, not a red error.
+        const { payload, embed } = replyOf(fake);
+        expect(payload.flags).toBe(MessageFlags.Ephemeral);
+        expect(embed.title).toBe(t(keys.label, 'en'));
+        expect(embed.description).toBe(
+          t(keys.already, 'en', { command: commandMention(setCommand) })
+        );
+        expect(embed.color).toBe(COLORS.INFO);
         expect(notifyRemove).not.toHaveBeenCalled();
         expect(
           notificationChannelRepository.getEnabled(GUILD_ID, otherType)
@@ -418,6 +526,7 @@ describe('/notification command', () => {
         const [channelOption] = subcommands[0].options ?? [];
         expect(channelOption).toMatchObject({
           name: 'channel',
+          name_localizations: { ja: 'チャンネル' },
           required: true,
           channel_types: [ChannelType.GuildText],
         });
@@ -427,15 +536,38 @@ describe('/notification command', () => {
     it('offers the four stats periods the panel understands', () => {
       const [period] = (optionsByName.stats.options ?? []) as Array<{
         name: string;
-        choices?: Array<{ value: string }>;
+        name_localizations?: { ja?: string };
+        description_localizations?: { ja?: string };
+        choices?: Array<{
+          value: string;
+          name: string;
+          name_localizations?: { ja?: string };
+        }>;
       }>;
       expect(period.name).toBe('period');
+      // Japanese clients see a Japanese chip, and learn the default.
+      expect(period.name_localizations?.ja).toBe('期間');
+      expect(period.description_localizations?.ja).toBe(
+        '集計する期間（未指定なら全期間）'
+      );
       expect(period.choices?.map((c) => c.value)).toEqual([
         'today',
         'week',
         'month',
         'all',
       ]);
+      // The same labels as the panel's period menu: rolling windows, not
+      // calendar weeks and months.
+      expect(period.choices?.map((c) => c.name)).toEqual(
+        (['today', 'week', 'month', 'all'] as const).map((p) =>
+          t(`notification.stats.periods.${p}`, 'en')
+        )
+      );
+      expect(period.choices?.map((c) => c.name_localizations?.ja)).toEqual(
+        (['today', 'week', 'month', 'all'] as const).map((p) =>
+          t(`notification.stats.periods.${p}`, 'ja')
+        )
+      );
     });
 
     it('documents which subcommands need Manage Server', () => {
@@ -469,7 +601,7 @@ describe('/notification command', () => {
           channel: textOption(),
         });
 
-        expectError(fake, 'notification.errors.manageGuildRequired');
+        expectPermissionDenied(fake);
         expect(
           notificationChannelRepository
             .getAllForGuild(GUILD_ID)
@@ -488,7 +620,7 @@ describe('/notification command', () => {
         locale: 'ja',
       });
 
-      expectError(fake, 'notification.errors.manageGuildRequired', 'ja');
+      expectPermissionDenied(fake, 'ja');
     });
 
     it('lets anyone open their own stats', async () => {
@@ -521,7 +653,7 @@ describe('/notification command', () => {
         channel: textOption(),
       });
 
-      expectError(fake, 'notification.errors.manageGuildRequired');
+      expectPermissionDenied(fake);
     });
 
     it('still answers stats in a DM with a guild-only error', async () => {

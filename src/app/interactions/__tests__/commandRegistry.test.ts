@@ -7,6 +7,7 @@ import type { Command } from '../../../shared/types/index.js';
 import {
   buildCommandCollection,
   discoverFeatureCommands,
+  isLoadableModuleFile,
   toDeploymentPayload,
   type DiscoveredCommand,
 } from '../commandRegistry.js';
@@ -154,11 +155,10 @@ describe('discoverFeatureCommands', () => {
       expect(logger.error).not.toHaveBeenCalled();
     });
 
-    // KNOWN BUG (commandRegistry.ts, the `.ts || .js` filter): `ping.d.ts`
-    // ends in `.ts`, so it is imported, exports nothing at runtime, and logs
-    // "Invalid command file" for every command on every boot. Once the filter
-    // skips `.d.ts`, this test starts failing: change `it.fails` to `it`.
-    it.fails('does not treat .d.ts declaration files as commands', async () => {
+    // Regression: the old `.ts || .js` filter matched `ping.d.ts` (it ends in
+    // `.ts`), imported it, found no runtime export and logged "Invalid
+    // command file" for every command on every boot of the built bot.
+    it('does not treat .d.ts declaration files as commands', async () => {
       const dir = compiledTree();
 
       const discovered = await discoverFeatureCommands(dir);
@@ -289,5 +289,20 @@ describe('toDeploymentPayload', () => {
       name: 'echo',
       options: [expect.objectContaining({ name: 'text', required: true })],
     });
+  });
+});
+
+describe('isLoadableModuleFile', () => {
+  it.each([
+    ['ping.ts', true],
+    ['ping.js', true],
+    ['ping.d.ts', false],
+    ['ping.js.map', false],
+    ['ping.d.ts.map', false],
+    ['index.ts', false],
+    ['index.js', false],
+    ['README.md', false],
+  ])('%s -> %s', (file, expected) => {
+    expect(isLoadableModuleFile(file)).toBe(expected);
   });
 });

@@ -39,6 +39,8 @@ export interface VoiceDigest {
  * `from` is the channel they were in when the window opened and have since
  * left; `to` is the channel they are in now. Both set means a move, one set
  * means a plain join or leave, neither means the visit cancelled itself out.
+ * The same channel on both ends (a reconnect, or a hop that came back) also
+ * cancels out: nothing changed for anyone reading the channel.
  */
 interface NetEffect {
   displayName: string;
@@ -74,6 +76,7 @@ export function summarizeVoiceActivity(
   const digest: VoiceDigest = { joined: [], left: [], moved: [] };
 
   for (const { displayName, from, to } of effects.values()) {
+    if (from && from === to) continue;
     if (from && to) {
       digest.moved.push({ displayName, fromChannelId: from, toChannelId: to });
     } else if (to) {

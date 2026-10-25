@@ -83,7 +83,7 @@ const DOCUMENTED_SCHEMA: Record<string, TableShape> = {
     },
     indexes: {
       idx_audit_logs_created_at: ['created_at'],
-      idx_audit_logs_guild_id: ['guild_id'],
+      idx_audit_logs_guild_created: ['guild_id', 'created_at'],
     },
   },
   guild_settings: {
@@ -178,8 +178,6 @@ const DOCUMENTED_SCHEMA: Record<string, TableShape> = {
       created_at: col('INTEGER', { notNull: true }),
     },
     indexes: {
-      idx_voice_sessions_guild_channel: ['guild_id', 'channel_id'],
-      idx_voice_sessions_guild_user: ['guild_id', 'user_id'],
       idx_voice_sessions_joined_at: ['joined_at'],
     },
   },
@@ -328,6 +326,25 @@ describe('initializeDatabase', () => {
       );
     });
 
+    it('refuses to run anything when two migrations share a number', async () => {
+      const actualFs = await vi.importActual<typeof import('fs')>('fs');
+      vi.doMock('fs', () => ({
+        ...actualFs,
+        // What merging two branches that each added "the next" migration
+        // leaves behind.
+        readdirSync: (dir: string) => [
+          ...actualFs.readdirSync(dir),
+          '011_other_feature.ts',
+        ],
+      }));
+      const { initializeDatabase } = await loadRunner();
+
+      await expect(initializeDatabase()).rejects.toThrow(
+        'Migration number 011 is used by more than one file: 011_other_feature.ts, 011_tts.ts. Renumber one of them.'
+      );
+      expect(tableNames(db)).toEqual([]);
+    });
+
     it('warns about and skips a migration that exports no up function', async () => {
       // Vitest's module mock rejects reads of undeclared exports, so the
       // missing export is declared as undefined - what a real module yields.
@@ -384,7 +401,8 @@ describe('initializeDatabase', () => {
         '008',
         '009',
         '010',
-        '011'
+        '011',
+        '012'
       );
 
       expect(describeSchema(db)).toEqual(schemaBefore);
@@ -453,6 +471,16 @@ describe('initializeDatabase', () => {
      */
     async function buildLegacyDatabase(): Promise<void> {
       await runMigrations('001', '002', '003', '004', '006');
+      // Indexes 003 and 004 created before 012 superseded them.
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_audit_logs_guild_id ON audit_logs(guild_id)'
+      );
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user ON voice_sessions(guild_id, user_id)'
+      );
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_channel ON voice_sessions(guild_id, channel_id)'
+      );
 
       db.prepare(
         `INSERT INTO steam_users (discord_id, steam_id, steam_name, registered_at) VALUES ('u1', 's1', 'gamer', 1)`
@@ -513,6 +541,29 @@ describe('initializeDatabase', () => {
       }
       expect(indexNames(db)).not.toContain('idx_playtime_history_discord_id');
       expect(indexNames(db)).not.toContain('idx_playtime_history_recorded_at');
+    });
+
+    it('drops the indexes 012 superseded and does not bring them back on the next boot', async () => {
+      await buildLegacyDatabase();
+      const { SUPERSEDED_INDEXES } =
+        await import('../migrations/012_query_indexes.js');
+      expect(indexNames(db)).toEqual(
+        expect.arrayContaining([...SUPERSEDED_INDEXES])
+      );
+      const first = await loadRunner();
+
+      await first.initializeDatabase();
+
+      for (const name of SUPERSEDED_INDEXES) {
+        expect(indexNames(db)).not.toContain(name);
+      }
+      expect(indexNames(db)).toContain('idx_audit_logs_guild_created');
+
+      vi.resetModules();
+      const second = await loadRunner();
+      await second.initializeDatabase();
+
+      expect(describeSchema(db)).toEqual(DOCUMENTED_SCHEMA);
     });
 
     it('converges on the same schema as a fresh install', async () => {
