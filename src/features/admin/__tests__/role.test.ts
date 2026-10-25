@@ -501,6 +501,36 @@ describe('executeRoleCommand', () => {
       ]);
     });
 
+    // KNOWN BUG (reported, role.ts): the confirmation reply sits in the same
+    // `try` as the role change, so when Discord rejects the confirmation after
+    // the role was granted, the moderator is told "Failed to modify role."
+    // and a retry then says the member already has it. `it.fails` until the
+    // reply is outside that `try`; then change it to `it`.
+    it.fails(
+      'does not report a granted role as failed when only the confirmation is lost',
+      async () => {
+        const reply = vi
+          .fn()
+          .mockRejectedValueOnce(new Error('Unknown interaction'))
+          .mockResolvedValue({});
+        const { interaction, editReply, rolesAdd } = setup({
+          subcommand: 'add',
+          reply,
+        });
+
+        await executeRoleCommand(interaction).catch(() => undefined);
+
+        expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
+        const failed = t('admin.role.errors.failed', 'en');
+        const described = [...reply.mock.calls, ...editReply.mock.calls].map(
+          ([payload]) =>
+            (payload as { embeds?: Array<{ data?: { description?: string } }> })
+              .embeds?.[0]?.data?.description
+        );
+        expect(described).not.toContain(failed);
+      }
+    );
+
     it('warns instead of calling Discord when the member already has it', async () => {
       const { interaction, reply, rolesAdd } = setup({
         subcommand: 'add',

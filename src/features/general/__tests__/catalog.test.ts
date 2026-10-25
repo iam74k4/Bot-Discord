@@ -262,20 +262,23 @@ describe('catalog permissions', () => {
     expect(entriesOf(kick)[0].requiredPermission).toBe('everyone');
   });
 
-  // BUG (reported, catalog.ts:150): Discord reads a default permission of "0"
-  // as administrators only, but "0" sets no bit, so help lists the command to
-  // every member. Characterized until fixed; a fix should make this entry
-  // invisible to a member without permissions.
-  it('currently treats default permission 0 (administrators only) as open to everyone', () => {
-    const adminOnly = helpCommand(base().setDefaultMemberPermissions(0), {
-      category: DEMO,
-    });
+  // KNOWN BUG (reported, catalog.ts:150): Discord reads a default permission of
+  // "0" as administrators only, but "0" sets no bit, so help lists the command
+  // to every member. `it.fails` until derivePermission handles "0"; then
+  // change it to `it`.
+  it.fails(
+    'does not list default permission 0 (administrators only) to everyone',
+    () => {
+      const adminOnly = helpCommand(base().setDefaultMemberPermissions(0), {
+        category: DEMO,
+      });
 
-    expect(
-      (adminOnly.data.toJSON() as CommandJSON).default_member_permissions
-    ).toBe('0');
-    expect(entriesOf(adminOnly)[0].requiredPermission).toBe('everyone');
-  });
+      expect(
+        (adminOnly.data.toJSON() as CommandJSON).default_member_permissions
+      ).toBe('0');
+      expect(entriesOf(adminOnly)[0].requiredPermission).not.toBe('everyone');
+    }
+  );
 
   it('lets an explicit permission override the derived one', () => {
     const relaxed = helpCommand(

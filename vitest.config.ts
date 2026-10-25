@@ -12,7 +12,9 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       exclude: [
         'src/**/*.test.ts',
-        'src/__tests__/**',
+        // Test support code anywhere (src/__tests__/helpers, feature
+        // *.helpers.ts): scaffolding is not what the floors measure.
+        'src/**/__tests__/**',
         'src/shared/types/**',
         'src/index.ts',
         'src/client.ts',
@@ -20,13 +22,13 @@ export default defineConfig({
         'src/app-scripts/**', // CLI maintenance scripts
         'src/events/**', // Discord event handlers (integration)
       ],
-      // Floors sit a little under the measured coverage (lines 97.9,
-      // functions 98.1, branches 93.7, statements 97.1) so CI fails when a
-      // change lands without tests, not on rounding noise.
+      // Floors sit a little under the measured coverage of production code
+      // (lines 97.7, functions 97.4, branches 94.2, statements 97.1) so CI
+      // fails when a change lands without tests, not on rounding noise.
       thresholds: {
         lines: 96,
         functions: 96,
-        branches: 92,
+        branches: 93,
         statements: 95,
       },
     },

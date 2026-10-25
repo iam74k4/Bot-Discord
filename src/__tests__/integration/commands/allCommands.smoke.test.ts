@@ -11,8 +11,9 @@ import {
 /**
  * Runs every slash command path the registry discovers against the real
  * application code, so a command added under `src/features/<f>/commands/`
- * is smoke-tested with no change to this file (beyond declaring who may use
- * it in `COMMAND_POLICY`, which one test insists on).
+ * is smoke-tested once it is declared: who may use it in `COMMAND_POLICY`
+ * (command-smoke.helpers.ts), and each path in `REACHES` or `READ_ONLY`
+ * below. Tests insist on both, so nothing new slips through undeclared.
  *
  * Only true externals are replaced: the database is in-memory SQLite brought
  * up by the real migration runner, voice connections and the recorder are
@@ -912,11 +913,15 @@ describe('every command path with a declared cooldown', () => {
 
 /**
  * Paths that catch a failed response themselves instead of leaving it to the
- * router, with what they had already done by then. Production bug: role.ts
- * wraps the confirmation reply in the same `try` as the role change, so a
- * lost confirmation is reported as "Failed to modify role." although the
- * change went through (and was audited). A retry then says the member
- * already has the role.
+ * router, with what they had already done by then.
+ *
+ * KNOWN-BUG EXEMPTION: role.ts wraps the confirmation reply in the same `try`
+ * as the role change, so a lost confirmation is reported as "Failed to
+ * modify role." although the change went through (and was audited). The
+ * correct behaviour is pinned by the `it.fails` test "does not report a
+ * granted role as failed when only the confirmation is lost" in
+ * src/features/admin/__tests__/role.test.ts; when that bug is fixed, remove
+ * these entries so the router's private error applies to them too.
  */
 const HANDLES_OWN_FAILURE: Record<string, (world: SmokeWorld) => void> = {
   'admin role add': (w) =>
