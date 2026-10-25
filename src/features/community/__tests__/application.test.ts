@@ -58,7 +58,7 @@ vi.mock('../../../shared/utils/confirm.js', () => ({
 const { executePollCommand, autocompletePollToEnd } =
   await import('../poll/application.js');
 const { pollRepository } = await import('../poll/pollRepository.js');
-const { command } = await import('../commands/roulette.js');
+const { command } = await import('../commands/community.js');
 const { cooldownMiddleware, clearCooldown } =
   await import('../../../middleware/cooldown/index.js');
 const { up: nativePolls } =

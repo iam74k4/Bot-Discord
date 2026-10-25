@@ -53,7 +53,7 @@ const {
   REROLL_IDLE_MS,
   REROLL_MIN_INTERVAL_MS,
 } = await import('../application/roulette.js');
-const { command } = await import('../commands/roulette.js');
+const { command } = await import('../commands/community.js');
 const { MAX_ANSWER_LENGTH, POLL_DURATION_HOURS } =
   await import('../poll/application.js');
 const { cooldownMiddleware, clearCooldown, resolveCooldownMs } =
