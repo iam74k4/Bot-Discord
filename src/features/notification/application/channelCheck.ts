@@ -6,8 +6,7 @@ import {
 } from '../../../shared/utils/discord.js';
 
 export type NotificationChannelCheck =
-  | { ok: true; channel: TextChannel }
-  | { ok: false; message: string };
+  { ok: true; channel: TextChannel } | { ok: false; message: string };
 
 /**
  * Check a channel picked as a notification target before saving it, so setup

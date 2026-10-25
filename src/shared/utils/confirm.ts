@@ -158,8 +158,7 @@ function retryPathOf(interaction: PromptInteraction): string {
 type NoPressReason = 'timeout' | 'shutdown';
 
 type Wait =
-  | { press: ButtonInteraction }
-  | { press: null; reason: NoPressReason };
+  { press: ButtonInteraction } | { press: null; reason: NoPressReason };
 
 /** A promise plus the function that settles it. */
 function settleable(): { promise: Promise<void>; settle: () => void } {

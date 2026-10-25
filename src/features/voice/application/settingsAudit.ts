@@ -18,9 +18,7 @@ export type VoiceSettingChange =
 
 /** Where the change was made: a slash command (by its path), the panel or the notice button. */
 export type VoiceSettingSource =
-  | { command: string }
-  | 'statusPanel'
-  | 'noticeButton';
+  { command: string } | 'statusPanel' | 'noticeButton';
 
 function via(source: VoiceSettingSource, locale: Locale): string {
   if (source === 'statusPanel') {

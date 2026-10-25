@@ -158,8 +158,7 @@ function getDictionaryEntry(
       'SELECT word, reading, created_by FROM tts_dictionary WHERE guild_id = ? AND word_key = ?'
     )
     .get(guildId, dictionaryKey(word)) as
-    | { word: string; reading: string; created_by: string }
-    | undefined;
+    { word: string; reading: string; created_by: string } | undefined;
   return row
     ? { word: row.word, reading: row.reading, createdBy: row.created_by }
     : null;

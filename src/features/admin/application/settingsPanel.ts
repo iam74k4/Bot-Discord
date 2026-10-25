@@ -52,11 +52,7 @@ import {
 } from './languages.js';
 
 type SettingsPanelView =
-  | 'overview'
-  | 'language'
-  | 'audit'
-  | 'announcements'
-  | 'logs';
+  'overview' | 'language' | 'audit' | 'announcements' | 'logs';
 
 const PANEL_TIMEOUT = 120_000;
 const LOGS_PAGE_SIZE = 10;

@@ -679,8 +679,7 @@ interface OpusEncoderLike {
 /** Speech settings for the bundled Opus encoder; best effort. */
 function tuneEncoder(resource: AudioResource): void {
   const encoder = (resource as { encoder?: unknown }).encoder as
-    | OpusEncoderLike
-    | undefined;
+    OpusEncoderLike | undefined;
   if (!encoder) return;
   try {
     encoder.setBitrate?.(OPUS_BITRATE);

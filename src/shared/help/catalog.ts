@@ -6,11 +6,7 @@ import {
 import type { Command } from '../types/command.js';
 
 export type PermissionLevel =
-  | 'everyone'
-  | 'manageGuild'
-  | 'manageRoles'
-  | 'administrator'
-  | 'owner';
+  'everyone' | 'manageGuild' | 'manageRoles' | 'administrator' | 'owner';
 
 /** Help metadata a command declares alongside its definition. */
 export interface CommandHelp {

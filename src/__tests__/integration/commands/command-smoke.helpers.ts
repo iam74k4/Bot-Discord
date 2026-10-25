@@ -212,11 +212,7 @@ export function commandPaths(
  * command here resolves to it today.
  */
 export type AccessLevel =
-  | 'everyone'
-  | 'manageGuild'
-  | 'manageRoles'
-  | 'administrator'
-  | 'owner';
+  'everyone' | 'manageGuild' | 'manageRoles' | 'administrator' | 'owner';
 
 export interface CommandPolicy {
   /** Discord's `default_member_permissions`: who sees it in the picker. */

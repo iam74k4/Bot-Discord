@@ -480,11 +480,10 @@ describe('metrics service', () => {
         busy: 0.25,
         createHistogram: vi.fn(() => histogram),
         // Without `since`, a numbered baseline; with it, the share busy since.
-        utilization: vi.fn(
-          (since?: Elu): Elu =>
-            since
-              ? { idle: 0, active: 0, utilization: sampler.busy }
-              : { idle: ++marks, active: 0, utilization: 0 }
+        utilization: vi.fn((since?: Elu): Elu =>
+          since
+            ? { idle: 0, active: 0, utilization: sampler.busy }
+            : { idle: ++marks, active: 0, utilization: 0 }
         ),
       };
       return sampler;

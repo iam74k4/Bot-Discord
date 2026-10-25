@@ -26,12 +26,7 @@ import {
 import { runBackupSafely } from './backupRun.js';
 
 type AdminPanelView =
-  | 'stats'
-  | 'db'
-  | 'guilds'
-  | 'health'
-  | 'metrics'
-  | 'backups';
+  'stats' | 'db' | 'guilds' | 'health' | 'metrics' | 'backups';
 
 const PANEL_TIMEOUT = 120_000;
 /**

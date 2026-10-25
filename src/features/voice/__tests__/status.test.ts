@@ -205,8 +205,7 @@ function createPanel(
       collector.emit('collect', component);
       await done;
       const update = component.update.mock.calls[0] as unknown as
-        | [{ embeds: EmbedBuilder[]; components: unknown[] }]
-        | undefined;
+        [{ embeds: EmbedBuilder[]; components: unknown[] }] | undefined;
       return { component, payload: update?.[0] };
     },
   };
