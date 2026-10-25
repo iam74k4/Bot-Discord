@@ -255,6 +255,7 @@ import {
   type PermissionsBitField,
 } from 'discord.js';
 import type { Mock } from 'vitest';
+import { basename } from 'node:path';
 import { awaitConfirmationResult } from '../../../shared/utils/confirm.js';
 import {
   buildHelpCatalog,
@@ -703,6 +704,19 @@ describe('command discovery for the smoke run', () => {
       featuresWithCommandFiles()
     );
     expect(paths.length).toBeGreaterThanOrEqual(commands.length);
+  });
+
+  it('names every command file after the command it defines', () => {
+    // A file named after an old command (record.ts for /voice) sends whoever
+    // looks for /voice to the wrong place.
+    expect(
+      commands
+        .filter(({ command, filePath }) => {
+          const file = basename(filePath).replace(/\.(ts|js)$/, '');
+          return file !== command.data.name;
+        })
+        .map(({ command, filePath }) => `${filePath} → /${command.data.name}`)
+    ).toEqual([]);
   });
 
   it('keeps every scenario attached to a real command path', () => {

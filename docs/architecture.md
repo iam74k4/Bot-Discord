@@ -444,7 +444,7 @@ The design trades horizontal scale for simplicity, on purpose:
     │   │   ├── application/      # settings and system panels, roles, broadcasts, backups
     │   │   └── repositories/     # databaseStatsRepository
     │   ├── community/
-    │   │   ├── commands/         # roulette.ts (/community)
+    │   │   ├── commands/         # community.ts (/community)
     │   │   ├── application/      # roulette (with re-roll buttons)
     │   │   └── poll/             # Native polls: command, creation form, pollRepository
     │   ├── general/
@@ -458,7 +458,7 @@ The design trades horizontal scale for simplicity, on purpose:
     │   │   ├── stats/            # calendar (STATS_TIMEZONE day keys), periods
     │   │   └── tracking/         # voiceTracker
     │   └── voice/
-    │       ├── commands/         # record.ts (/voice), tts.ts (/tts)
+    │       ├── commands/         # voice.ts (/voice), tts.ts (/tts)
     │       ├── application/      # record, status panel, autojoin, onboarding, optOut, tts …
     │       ├── events/           # voiceStateUpdate, guildCreate, voiceChannelStatus, ttsMessage
     │       ├── recording/        # connectionManager, channelMixRing, chunkPlacer, recordingService
@@ -493,11 +493,6 @@ rules, the all-commands smoke harness - live in `src/__tests__/`.
 Not wrong enough to block work, but recorded so they get fixed on purpose
 rather than copied:
 
-- **Some command files are named after an old command.**
-  `voice/commands/record.ts` defines `/voice` and
-  `community/commands/roulette.ts` defines `/community`; both predate their
-  commands growing subcommands. Rename them (`voice.ts`, `community.ts`) in a
-  change of their own, when no other branch is editing them.
 - **`voice` is the largest feature.** That is the cost of the single
   connection owner described above, not an accident; split it only along the
   connection manager.

@@ -8,7 +8,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * The `/voice` command definition (commands/record.ts): what Discord is told
+ * The `/voice` command definition (commands/voice.ts): what Discord is told
  * about the command, and which handler each subcommand reaches. The handlers
  * themselves are covered in their own files.
  */
@@ -22,7 +22,7 @@ vi.mock('../application/index.js', () => ({
   executeStatusCommand,
 }));
 
-const { command } = await import('../commands/record.js');
+const { command } = await import('../commands/voice.js');
 const { resolveCooldownMs } = await import('../../../middleware/index.js');
 const { parseDurationString } = await vi.importActual<
   typeof import('../recording/recordingService.js')
