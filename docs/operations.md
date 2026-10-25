@@ -254,10 +254,29 @@ and takes one on demand.
    columns: older code ignores what it does not know about.
 3. When a migration **dropped or rewrote** data (as `010_native_polls.ts` did),
    older code cannot run against the new schema. Fix forward with a new
-   release instead, or restore the pre-release backup with the bot stopped.
-   Restoring is manual today: replacing `data/bot.db` under a running bot
-   corrupts it. Plan the restore before merging such a release, and say so in
-   its release PR.
+   release instead, or roll the code back **and** restore the pre-release
+   backup (below). Say which in the release PR before merging such a release.
+
+### Restoring a backup
+
+Replacing `data/bot.db` under a running bot corrupts it, so the bot restores
+at startup, before it opens the database:
+
+1. Find the backup's filename in `/owner system` → **Backups** (for example
+   `backup-2026-10-25T04-00-00-a1b2c3.db`).
+2. Set `RESTORE_BACKUP` to that filename on the bot service in Railway and
+   redeploy (changing a variable redeploys).
+3. The deploy log says
+   `Restored the database from <file>. The database it replaced is saved as <other file>; restore that to undo.`
+4. Delete `RESTORE_BACKUP`. Leaving it set is harmless - the same backup is
+   never restored twice - but the next restore should be a deliberate change.
+
+The backup has to pass SQLite's integrity check first. If it does not, or the
+file is missing, nothing is touched: the bot starts on the current database,
+logs the reason as an error and sends it to the alert webhook. The replaced
+database is kept as an ordinary backup, so it is listed in the panel and
+pruned by `BACKUP_RETENTION_DAYS` like the others; undoing a restore is
+restoring that file.
 
 Revert the change on `develop` (and `main`) too, or the next deploy brings it
 back.

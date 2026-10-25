@@ -15,6 +15,7 @@ import {
   initializeDatabase,
 } from '../infrastructure/database/index.js';
 import { backupService } from '../infrastructure/backup/index.js';
+import { restoreOnStartup } from '../infrastructure/backup/restore.js';
 import {
   startAuditRetention,
   stopAuditRetention,
@@ -40,6 +41,8 @@ import { cooldownStore } from '../middleware/cooldown/cooldownStore.js';
  */
 export interface AppDependencies {
   createClient(config: AppConfig): ExtendedClient;
+  /** Apply RESTORE_BACKUP, if set, before anything opens the database. */
+  restoreBackup(config: AppConfig): void;
   initializeDatabase(): Promise<void>;
   closeDatabase(): void;
   loadFeatures(): Promise<void>;
@@ -101,6 +104,7 @@ export function defaultDependencies(): AppDependencies {
     // requested only when an engine is configured.
     createClient: (config) =>
       createClient({ messageContent: Boolean(config.VOICEVOX_URL) }),
+    restoreBackup: restoreOnStartup,
     initializeDatabase,
     closeDatabase,
     loadFeatures,
@@ -136,6 +140,9 @@ export function createApp(
   const client = deps.createClient(config);
 
   async function start(): Promise<void> {
+    // A restore swaps the database file, so it must run before the first
+    // connection is opened.
+    deps.restoreBackup(config);
     await deps.initializeDatabase();
 
     await deps.loadFeatures();

@@ -38,6 +38,11 @@ export interface AppConfig {
   readonly RECORDINGS_DIR: string;
 
   readonly BACKUP_DIR: string;
+  /**
+   * Filename of a backup to restore at the next startup (applied once; see
+   * infrastructure/backup/restore.ts). Empty means no restore.
+   */
+  readonly RESTORE_BACKUP: string;
   readonly BACKUP_RETENTION_DAYS: number;
   readonly BACKUP_CRON: string;
   readonly SHUTDOWN_FINAL_BACKUP: boolean;
@@ -356,6 +361,7 @@ export function parseConfig(source: EnvSource): ConfigResult {
         { directory: true }
       ),
 
+      RESTORE_BACKUP: source.RESTORE_BACKUP?.trim() ?? '',
       BACKUP_RETENTION_DAYS: backupRetentionDays,
       BACKUP_CRON: source.BACKUP_CRON || '0 4 * * *',
       SHUTDOWN_FINAL_BACKUP: source.SHUTDOWN_FINAL_BACKUP !== 'false',

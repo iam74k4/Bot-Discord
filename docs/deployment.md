@@ -54,6 +54,7 @@ In Railway dashboard, add the following variables:
 | `DATABASE_PATH`                 | SQLite database path (must stay relative to repo root)                                    | No                |
 | `RECORDINGS_DIR`                | Generated recording files directory (must stay relative to repo root)                     | No                |
 | `BACKUP_DIR`                    | Backup output directory (must stay relative to repo root)                                 | No                |
+| `RESTORE_BACKUP`                | Backup filename to restore once at the next startup ([operations.md](operations.md))      | No                |
 | `VOICEVOX_URL`                  | VOICEVOX engine URL; enables `/tts` and the Message Content intent (see below)            | No                |
 
 `ALLOWED_GUILD_IDS` is for a staging bot ([operations.md](operations.md)). When set, the bot leaves any server outside the list as soon as it is added there, and refuses commands with a short notice in servers outside the list that it was already in - it does not leave those by itself, so a wrong value costs a config fix rather than every server. Startup lists them in the logs. Direct messages are always served.
