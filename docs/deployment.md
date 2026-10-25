@@ -11,7 +11,7 @@ This page sets up one environment. To run `develop` on a staging bot in your own
 1. Go to [Railway](https://railway.app/) and sign up/login
 2. Click "New Project" > "Deploy from GitHub repo"
 3. Select this repository
-4. Railway will automatically detect the Node.js project
+4. Railway builds the service from the repository's `Dockerfile` (`railway.toml` selects it)
 5. Open the service **Settings** → **Source** and set the **trigger branch** to **`main`** (never `develop` for production)
 
 ### 2. Configure Volume (Required for SQLite and file data)
@@ -62,14 +62,28 @@ If you enable voice recording in production, remember that `/voice record` now r
 
 Size the instance from `AUDIO_BUFFER_DURATION × 0.27MB × MAX_CONCURRENT_VC_CONNECTIONS` — about 410MB at the defaults — plus the bot's baseline, and set `MEMORY_LIMIT_MB` to the memory the host actually grants. That is the worst case, not the steady state: a channel's buffer is allocated on its first decoded audio chunk, so idle connections cost nothing. Servers that do not want the bot buffering their voice channels can turn it off per guild or per channel with `/voice autojoin`.
 
+### Build and runtime
+
+The service is built from the `Dockerfile`, which pins the exact Node release
+(`node:22.22.0-bookworm-slim`). A builder that picks "the latest 22.x" would
+make the runtime depend on build day, and native modules care: better-sqlite3
+13 crashes on Node 22.12. `.nvmrc` holds the same version; CI runs on it
+(`node-version-file`) and the **Docker Image** job fails if the image's Node
+and `.nvmrc` disagree, and loads every native module inside the image.
+
+To move to a newer Node, change `.nvmrc` and `NODE_IMAGE` in the `Dockerfile`
+together (and `engines` in `package.json` if the minimum rises).
+
 ### Shutdown and restarts
 
-`railway.toml` starts the bot with `node dist/index.js`, not `npm start`: npm
-does not pass SIGTERM on to node, so the graceful shutdown (final backup,
-closing open VC sessions, leaving voice channels) was skipped on every
-redeploy. `drainingSeconds = 15` gives that shutdown time to finish before
-Railway sends SIGKILL; keep it above `SHUTDOWN_TIMEOUT_MS / 1000`. A crash
-exits with code 1 so the `ON_FAILURE` restart policy brings the bot back.
+`railway.toml` starts the bot with `node dist/index.js`, which Railway runs in
+exec form for a Dockerfile build, so node itself receives SIGTERM. Neither
+`npm start` nor a shell wrapper passes the signal on, and the graceful shutdown
+(final backup, closing open VC sessions, leaving voice channels) used to be
+skipped on every redeploy. `drainingSeconds = 15` gives that shutdown time to
+finish before Railway sends SIGKILL; keep it above `SHUTDOWN_TIMEOUT_MS / 1000`.
+A crash exits with code 1 so the `ON_FAILURE` restart policy brings the bot
+back.
 
 After a redeploy, the old deployment's logs should end with
 `Received SIGTERM, initiating graceful shutdown...` and
@@ -160,11 +174,11 @@ Railway’s “Wait for CI” expects a workflow that runs on `push` to `main` (
 
 ## CI/CD
 
-- **GitHub Actions**: Lint, format-check, type-check (source and tests), tests with coverage floors, production dependency audit, and build on every pull request (any base branch) and on push to `main` and `develop`
+- **GitHub Actions**: Lint, format-check, type-check (source and tests), tests with coverage floors, production dependency audit, build, and a production Docker image build with a native-module smoke test, on every pull request (any base branch) and on push to `main` and `develop`
 - **CodeQL**: JavaScript/TypeScript analysis on `main` / `develop` (plus weekly schedule); review alerts under **Security → Code scanning**
 - **Release**: Push tag `v*` to create a GitHub Release with build artifacts; Railway deployment is intentionally handled outside the release workflow
 - **Branch strategy**: `feature/*` and `fix/*` → `develop` (squash) → `main` through a release PR (merge commit); `hotfix/*` → `main`, then back into `develop`. Railway **staging** tracks `develop` and **production** tracks `main` only - see [operations.md](operations.md).
-- **Runtime**: CI and release workflows run on Node.js `22.12.0`
+- **Runtime**: CI, release and the production image run on the Node.js version in `.nvmrc` (`22.22.0`)
 - **Local parity**: Run `./scripts/validate.sh` before push — it mirrors CI checks including `npm audit --omit=dev --audit-level=high`
 
 [← Back to README](../README.md)
