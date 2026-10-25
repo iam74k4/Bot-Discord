@@ -36,8 +36,13 @@ vi.mock('../../../shared/utils/logger.js', () => ({
   getErrorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
-const { MAX_QUEUE_LENGTH, playPcm, TtsSessionManager, ttsSessions } =
-  await import('../tts/sessionManager.js');
+const {
+  MAX_QUEUE_LENGTH,
+  PREFETCH_COUNT,
+  playPcm,
+  TtsSessionManager,
+  ttsSessions,
+} = await import('../tts/sessionManager.js');
 const { logger } = await import('../../../shared/utils/logger.js');
 
 type SpeechRequest = Parameters<
@@ -84,6 +89,7 @@ function harness({ auto = false } = {}) {
     text: string;
     speakerId: number;
     speed: number;
+    signal: AbortSignal;
     job: Deferred<Buffer>;
   }> = [];
   const plays: Array<{ text: string; job: Deferred<void> }> = [];
@@ -97,16 +103,22 @@ function harness({ auto = false } = {}) {
   const deps = {
     getPlayer: vi.fn(() => state.player),
     setSelfMute: vi.fn(() => true),
-    synthesize: vi.fn((text: string, speakerId: number, speed: number) => {
-      const job = deferred<Buffer>();
-      synths.push({ text, speakerId, speed, job });
-      if (state.failText !== null && text.includes(state.failText)) {
-        job.reject(new Error(`engine choked on ${text}`));
-      } else if (state.auto) {
-        job.resolve(Buffer.from(text));
+    synthesize: vi.fn(
+      (text: string, speakerId: number, speed: number, signal: AbortSignal) => {
+        const job = deferred<Buffer>();
+        synths.push({ text, speakerId, speed, signal, job });
+        // Like fetch: an aborted request rejects right away.
+        signal.addEventListener('abort', () =>
+          job.reject(new Error(`aborted ${text}`))
+        );
+        if (state.failText !== null && text.includes(state.failText)) {
+          job.reject(new Error(`engine choked on ${text}`));
+        } else if (state.auto) {
+          job.resolve(Buffer.from(text));
+        }
+        return job.promise;
       }
-      return job.promise;
-    }),
+    ),
     play: vi.fn((_player: AudioPlayer, pcm: Buffer) => {
       const job = deferred<void>();
       plays.push({ text: pcm.toString(), job });
@@ -125,6 +137,7 @@ function harness({ auto = false } = {}) {
     synths,
     plays,
     synthesized: () => synths.map((s) => s.text),
+    aborted: () => synths.filter((s) => s.signal.aborted).map((s) => s.text),
     played: () => plays.map((p) => p.text),
     start: (voiceChannelId = VC, guildId = GUILD, textChannelId = TEXT) =>
       manager.start({
@@ -348,7 +361,7 @@ describe('TtsSessionManager', () => {
       });
     });
 
-    it(`caps the queue at ${MAX_QUEUE_LENGTH}, dropping the oldest waiting line`, async () => {
+    it(`caps the queue at ${MAX_QUEUE_LENGTH}, dropping the oldest line not yet rendering`, async () => {
       const h = harness();
       h.start();
 
@@ -366,10 +379,55 @@ describe('TtsSessionManager', () => {
       for (const s of h.synths) s.job.resolve(Buffer.from(s.text));
       await flush();
 
-      const expected = ['L1'];
-      for (let i = 3; i <= MAX_QUEUE_LENGTH + 2; i++) expected.push(`L${i}`);
+      // L2 and L3 were already rendering, so L4 (the oldest line still
+      // waiting) is the one dropped.
+      const expected = ['L1', 'L2', 'L3'];
+      for (let i = 5; i <= MAX_QUEUE_LENGTH + 2; i++) expected.push(`L${i}`);
       expect(h.played()).toEqual(expected);
-      expect(h.played()).not.toContain('L2');
+      expect(h.synthesized()).not.toContain('L4');
+      expect(h.aborted()).toEqual([]);
+    });
+
+    it('sends no extra engine requests when a flood overflows the queue', async () => {
+      const h = harness();
+      h.start();
+      h.manager.enqueue(VC, line('L1'));
+      h.synths[0].job.resolve(Buffer.from('L1'));
+      await flush();
+      expect(h.played()).toEqual(['L1']); // and still playing
+
+      for (let i = 2; i <= 51; i++) h.manager.enqueue(VC, line(`L${i}`));
+      await flush();
+
+      // Only the playing line and the lookahead were ever rendered; nothing
+      // rendered was thrown away.
+      expect(h.deps.synthesize).toHaveBeenCalledTimes(1 + PREFETCH_COUNT);
+      expect(h.synthesized()).toEqual(['L1', 'L2', 'L3']);
+      expect(h.aborted()).toEqual([]);
+      expect(h.manager.queueLength(VC)).toBe(MAX_QUEUE_LENGTH);
+
+      // The rendered lines play first, then the newest lines that survived.
+      h.state.auto = true;
+      h.synths[1].job.resolve(Buffer.from('L2'));
+      h.synths[2].job.resolve(Buffer.from('L3'));
+      h.plays[0].job.resolve();
+      await flush();
+      const survivors = [];
+      for (let i = 51 - (MAX_QUEUE_LENGTH - PREFETCH_COUNT) + 1; i <= 51; i++) {
+        survivors.push(`L${i}`);
+      }
+      expect(h.played()).toEqual(['L1', 'L2', 'L3', ...survivors]);
+    });
+
+    it('passes each request an abort signal that stays live while it is wanted', async () => {
+      const h = harness({ auto: true });
+      h.start();
+
+      h.manager.enqueue(VC, line('one'));
+      await flush();
+
+      expect(h.synths[0].signal).toBeInstanceOf(AbortSignal);
+      expect(h.aborted()).toEqual([]);
     });
 
     it('synthesizes at most two lines ahead of the one being played', async () => {
@@ -519,6 +577,24 @@ describe('TtsSessionManager', () => {
       await flush();
       expect(h.played()).toEqual(['kept']);
     });
+
+    it('cancels the synthesis of a skipped line instead of waiting for it', async () => {
+      const h = harness();
+      h.start();
+      h.manager.enqueue(VC, line('skipped'));
+      h.manager.enqueue(VC, line('kept'));
+      await flush();
+
+      h.manager.skip(VC);
+      // 'skipped' is never resolved by the engine: the abort settles it.
+      h.synths[1].job.resolve(Buffer.from('kept'));
+      await flush();
+
+      expect(h.aborted()).toEqual(['skipped']);
+      expect(h.played()).toEqual(['kept']);
+      expect(logger.debug).toHaveBeenCalledWith('TTS synthesis cancelled');
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
   });
 
   describe('stopping mid-queue', () => {
@@ -540,6 +616,23 @@ describe('TtsSessionManager', () => {
 
       expect(h.played()).toEqual(['L1']);
       expect(h.manager.enqueue(VC, line('late'))).toBe(false);
+    });
+
+    it('cancels every request still rendering when the session stops', async () => {
+      const h = harness();
+      h.start();
+      h.manager.enqueue(VC, line('L1'));
+      h.manager.enqueue(VC, line('L2'));
+      h.manager.enqueue(VC, line('L3'));
+      await flush();
+      expect(h.synthesized()).toEqual(['L1', 'L2', 'L3']);
+
+      h.manager.stop(VC);
+      await flush();
+
+      expect(h.aborted()).toEqual(['L1', 'L2', 'L3']);
+      expect(h.deps.play).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
     });
 
     it('does not play a line whose synthesis finishes after stop', async () => {
@@ -655,6 +748,27 @@ describe('playPcm', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(done).toBe(true);
     expect(player.listenerCount('idle')).toBe(0);
+    // Stopped too, so the stuck clip cannot resume over the next one.
+    expect(player.stop).toHaveBeenCalledWith(true);
+  });
+
+  it.each([
+    ['an Error', new Error('player destroyed')],
+    ['anything else', 'player destroyed'],
+  ])('resolves and cleans up when the player throws %s', async (_l, thrown) => {
+    const player = new FakePlayer();
+    player.play.mockImplementation(() => {
+      throw thrown;
+    });
+
+    await playPcm(player as unknown as AudioPlayer, Buffer.alloc(4));
+
+    expect(logger.debug).toHaveBeenCalledWith(
+      'TTS playback error: player destroyed'
+    );
+    expect(player.listenerCount('idle')).toBe(0);
+    expect(player.listenerCount('error')).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -715,7 +829,12 @@ describe('ttsSessions (default wiring)', () => {
     ttsSessions.enqueue(VC, line('hello', { speakerId: 8, speed: 1.2 }));
     await flush();
 
-    expect(synthesize).toHaveBeenCalledWith('hello', 8, 1.2);
+    expect(synthesize).toHaveBeenCalledWith(
+      'hello',
+      8,
+      1.2,
+      expect.any(AbortSignal)
+    );
     expect(player.play).toHaveBeenCalledTimes(1);
     player.emit('idle');
     await flush();

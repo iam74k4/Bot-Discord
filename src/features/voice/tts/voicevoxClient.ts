@@ -33,6 +33,11 @@ export class VoicevoxError extends Error {
 
 /** ずんだもん (ノーマル): the voice most Japanese reading bots default to. */
 export const DEFAULT_SPEAKER_ID = 3;
+/**
+ * The character behind DEFAULT_SPEAKER_ID, for the credit line when the
+ * engine's voice list cannot be fetched.
+ */
+export const DEFAULT_CHARACTER = 'ずんだもん';
 export const MIN_SPEED = 0.5;
 export const MAX_SPEED = 2.0;
 
@@ -45,6 +50,8 @@ type FetchLike = typeof fetch;
 export class VoicevoxClient {
   private voices: VoicevoxVoice[] | null = null;
   private voicesFetchedAt = 0;
+  /** The /speakers request in flight, shared by everyone waiting on it. */
+  private voicesInFlight: Promise<VoicevoxVoice[]> | null = null;
 
   constructor(
     private readonly baseUrl: string,
@@ -64,12 +71,30 @@ export class VoicevoxClient {
     }
   }
 
-  /** Every talk style the engine offers, cached for ten minutes. */
+  /**
+   * Every talk style the engine offers, cached for ten minutes. Concurrent
+   * callers share one request, so a slow engine is not asked once per
+   * autocomplete keystroke. Throws when the engine cannot be reached.
+   */
   async listVoices(): Promise<VoicevoxVoice[]> {
     if (this.voices && this.now() - this.voicesFetchedAt < SPEAKER_CACHE_MS) {
       return this.voices;
     }
+    this.voicesInFlight ??= this.fetchVoices().finally(() => {
+      this.voicesInFlight = null;
+    });
+    return this.voicesInFlight;
+  }
 
+  /**
+   * The last list fetched, even when it is older than the cache allows, or
+   * null if none ever was. For answers that cannot wait on the engine.
+   */
+  cachedVoices(): VoicevoxVoice[] | null {
+    return this.voices;
+  }
+
+  private async fetchVoices(): Promise<VoicevoxVoice[]> {
     const response = await this.request('/speakers', { method: 'GET' });
     const speakers = (await response.json()) as RawSpeaker[];
 
@@ -93,16 +118,19 @@ export class VoicevoxClient {
   }
 
   /**
-   * Render text to 48 kHz stereo 16-bit PCM.
+   * Render text to 48 kHz stereo 16-bit PCM. Aborting `signal` cancels the
+   * request in flight and skips the step after it.
    */
   async synthesize(
     text: string,
     speakerId: number,
-    speed: number
+    speed: number,
+    signal?: AbortSignal
   ): Promise<Buffer> {
     const queryResponse = await this.request(
       `/audio_query?text=${encodeURIComponent(text)}&speaker=${speakerId}`,
-      { method: 'POST' }
+      { method: 'POST' },
+      signal
     );
     const query = (await queryResponse.json()) as Record<string, unknown>;
 
@@ -110,11 +138,15 @@ export class VoicevoxClient {
     query.outputSamplingRate = 48_000;
     query.outputStereo = true;
 
-    const wavResponse = await this.request(`/synthesis?speaker=${speakerId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(query),
-    });
+    const wavResponse = await this.request(
+      `/synthesis?speaker=${speakerId}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(query),
+      },
+      signal
+    );
     const wav = Buffer.from(await wavResponse.arrayBuffer());
 
     let audio;
@@ -139,12 +171,17 @@ export class VoicevoxClient {
     return audio.pcm;
   }
 
-  private async request(path: string, init: RequestInit): Promise<Response> {
+  private async request(
+    path: string,
+    init: RequestInit,
+    signal?: AbortSignal
+  ): Promise<Response> {
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}${path}`, {
         ...init,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       });
     } catch (error) {
       throw new VoicevoxError(

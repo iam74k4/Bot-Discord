@@ -1,5 +1,6 @@
 import {
   type AutocompleteInteraction,
+  ChannelType,
   type ChatInputCommandInteraction,
   Collection,
   type EmbedBuilder,
@@ -7,7 +8,7 @@ import {
   MessageFlags,
   PermissionFlagsBits,
 } from 'discord.js';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const connectionManager = vi.hoisted(() => ({
   getAllConnections: vi.fn(),
@@ -15,6 +16,7 @@ const connectionManager = vi.hoisted(() => ({
   connect: vi.fn(),
   disconnect: vi.fn(),
   waitUntilReady: vi.fn(),
+  enableReceive: vi.fn(),
 }));
 
 vi.mock('../recording/connectionManager.js', () => ({ connectionManager }));
@@ -74,6 +76,8 @@ vi.mock('../../../locales/guildLocale.js', () => ({ resolveLocale }));
 
 const { autocompleteTts, executeTtsCommand, handleTtsMessage } =
   await import('../application/tts.js');
+const { command: ttsCommand } = await import('../commands/tts.js');
+const { applyDictionary } = await import('../tts/textNormalizer.js');
 const { MAX_DICTIONARY_ENTRIES } =
   await import('../repositories/ttsRepository.js');
 const { t } = await import('../../../locales/index.js');
@@ -96,8 +100,12 @@ function fakeClient() {
   return {
     isAvailable: vi.fn().mockResolvedValue(true),
     listVoices: vi.fn().mockResolvedValue(VOICES),
+    cachedVoices: vi.fn((): typeof VOICES | null => null),
   };
 }
+
+/** The connection `connect` hands back, and `waitUntilReady` once ready. */
+const JOINED = { kind: 'connection' };
 
 let client: ReturnType<typeof fakeClient>;
 
@@ -145,6 +153,23 @@ interface CommandOptions {
   botPermissions?: bigint[] | null;
   userId?: string;
   displayName?: string;
+  /** The caller's voice channel is a Stage. */
+  stage?: boolean;
+  /** Who is in the caller's voice channel; defaults to the caller alone. */
+  members?: Array<{ id: string; bot?: boolean }>;
+  /** The bot's permissions in the channel the command was used in. */
+  appPermissions?: bigint[];
+  /** The channel the command was used in. */
+  channelId?: string;
+}
+
+/** A channel the bot can post in, as the guild cache returns it. */
+function sendableChannel(id: string) {
+  return {
+    id,
+    isSendable: () => true,
+    send: vi.fn(async (_payload: { embeds: EmbedBuilder[] }) => undefined),
+  };
 }
 
 function command(opts: CommandOptions = {}) {
@@ -153,9 +178,18 @@ function command(opts: CommandOptions = {}) {
     opts.botPermissions === undefined
       ? [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak]
       : opts.botPermissions;
+  const userId = opts.userId ?? USER;
+  const members = opts.members ?? [{ id: userId }];
   const voiceChannel = voiceId
     ? {
-        id: voiceId,
+        ...sendableChannel(voiceId),
+        type: opts.stage ? ChannelType.GuildStageVoice : ChannelType.GuildVoice,
+        isVoiceBased: () => true,
+        members: new Collection(
+          members.map(
+            (m) => [m.id, { id: m.id, user: { bot: m.bot ?? false } }] as const
+          )
+        ),
         permissionsFor: vi.fn(() =>
           botPermissions === null
             ? null
@@ -164,14 +198,24 @@ function command(opts: CommandOptions = {}) {
       }
     : null;
   const guild = fakeGuild(opts.me === undefined ? { id: 'bot' } : opts.me);
+  const textChannel = sendableChannel(TEXT);
+  const channels = guild.channels.cache as Collection<string, unknown>;
+  channels.set(TEXT, textChannel);
+  if (voiceChannel) channels.set(voiceChannel.id, voiceChannel);
   const values = opts.options ?? {};
+  const appPermissions = opts.appPermissions ?? [
+    PermissionFlagsBits.ViewChannel,
+  ];
 
   const interaction = {
     locale: opts.locale ?? 'en-US',
     guildId: GUILD,
-    channelId: TEXT,
+    channelId: opts.channelId ?? TEXT,
     guild,
-    user: { id: opts.userId ?? USER },
+    appPermissions: {
+      has: (flag: bigint) => appPermissions.includes(flag),
+    },
+    user: { id: userId },
     member: {
       displayName: opts.displayName ?? 'たろう',
       voice: { channel: voiceChannel, channelId: voiceId },
@@ -204,6 +248,7 @@ function command(opts: CommandOptions = {}) {
   return {
     interaction,
     voiceChannel,
+    textChannel,
     guild,
     run: () =>
       executeTtsCommand(interaction as unknown as ChatInputCommandInteraction),
@@ -265,9 +310,10 @@ beforeEach(() => {
   getVoicevoxClient.mockReturnValue(client);
   connectionManager.getAllConnections.mockReturnValue(new Map());
   connectionManager.getConnection.mockReturnValue(undefined);
-  connectionManager.connect.mockResolvedValue({ kind: 'connection' });
+  connectionManager.connect.mockResolvedValue(JOINED);
   connectionManager.disconnect.mockResolvedValue(undefined);
-  connectionManager.waitUntilReady.mockResolvedValue(true);
+  connectionManager.waitUntilReady.mockResolvedValue(JOINED);
+  connectionManager.enableReceive.mockReturnValue(true);
   mayAutoJoin.mockReturnValue(true);
   announceBuffering.mockResolvedValue(undefined);
   ttsSessions.getForGuild.mockReturnValue(undefined);
@@ -337,6 +383,24 @@ describe('/tts start', () => {
     expect(connectionManager.connect).not.toHaveBeenCalled();
   });
 
+  it.each<Locale>(['en', 'ja'])(
+    'refuses a Stage channel up front, where it could not be heard (%s)',
+    async (locale) => {
+      const { interaction, run } = start({ stage: true, locale });
+
+      await run();
+
+      expectError(
+        interaction,
+        t('tts.errors.stageUnsupported', locale),
+        t('tts.errors.stageUnsupportedDesc', locale)
+      );
+      expect(interaction.deferReply).not.toHaveBeenCalled();
+      expect(connectionManager.connect).not.toHaveBeenCalled();
+      expect(ttsSessions.start).not.toHaveBeenCalled();
+    }
+  );
+
   it('refuses while the bot is in another voice channel of this server', async () => {
     connectionManager.getAllConnections.mockReturnValue(
       new Map([
@@ -401,7 +465,7 @@ describe('/tts start', () => {
   });
 
   it('reports a connection that never becomes ready', async () => {
-    connectionManager.waitUntilReady.mockResolvedValue(false);
+    connectionManager.waitUntilReady.mockResolvedValue(null);
     const { interaction, run } = start();
 
     await run();
@@ -415,7 +479,9 @@ describe('/tts start', () => {
     );
     expect(ttsSessions.start).not.toHaveBeenCalled();
     // The join was made for this session; leaving it would strand the bot.
-    expect(connectionManager.disconnect).toHaveBeenCalledWith(VC);
+    // Only that join, though: a replacement made meanwhile is not removed.
+    expect(connectionManager.disconnect).toHaveBeenCalledTimes(1);
+    expect(connectionManager.disconnect).toHaveBeenCalledWith(VC, JOINED);
   });
 
   it('joins listening and announces buffering where auto-join is allowed', async () => {
@@ -474,7 +540,7 @@ describe('/tts start', () => {
       channelId: VC,
       receiving: true,
     });
-    connectionManager.waitUntilReady.mockResolvedValue(false);
+    connectionManager.waitUntilReady.mockResolvedValue(null);
     const { interaction, run } = start();
 
     await run();
@@ -490,7 +556,7 @@ describe('/tts start', () => {
     expect(ttsSessions.start).not.toHaveBeenCalled();
   });
 
-  it('starts the session, warms the voice list and explains how it works', async () => {
+  it('starts the session, credits the voice and explains how it works', async () => {
     const { interaction, run } = start();
 
     await run();
@@ -514,17 +580,144 @@ describe('/tts start', () => {
         value: t('tts.howTo', 'en', { voice: VC }),
       },
     ]);
-    expect(embed.footer?.text).toBe(t('tts.credit', 'en'));
+    // Public, and naming the character as VOICEVOX's terms require.
+    expect(embed.footer?.text).toBe(
+      t('tts.credit', 'en', { credits: 'VOICEVOX:ずんだもん' })
+    );
   });
 
-  it('does not fail when warming the voice list fails', async () => {
-    client.listVoices.mockRejectedValue(new Error('engine hiccup'));
-    const { interaction, run } = start();
+  describe('voice credits', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
 
-    await run();
-    await Promise.resolve();
+    const footer = (interaction: FakeCommand) =>
+      embedOf(edited(interaction)).footer?.text;
 
-    expect(embedOf(edited(interaction)).title).toBe(t('tts.started', 'en'));
+    it.each<[Locale, string]>([
+      ['en', 'VOICEVOX:ずんだもん and VOICEVOX:四国めたん'],
+      ['ja', 'VOICEVOX:ずんだもん、VOICEVOX:四国めたん'],
+    ])(
+      'names every character in use by the people in the channel (%s)',
+      async (locale, credits) => {
+        ttsRepository.getUserSettings.mockImplementation((id: string) =>
+          id === 'metan-fan'
+            ? { speakerId: 2, speed: 1 }
+            : id === 'amaama-fan'
+              ? { speakerId: 1, speed: 1 }
+              : null
+        );
+        const { interaction, run } = start({
+          locale,
+          members: [
+            { id: USER },
+            { id: 'metan-fan' },
+            // Another ずんだもん style: credited once.
+            { id: 'amaama-fan' },
+            // Bots are not read, so their settings do not count.
+            { id: 'some-bot', bot: true },
+          ],
+        });
+
+        await run();
+
+        expect(footer(interaction)).toBe(t('tts.credit', locale, { credits }));
+        expect(ttsRepository.getUserSettings).not.toHaveBeenCalledWith(
+          'some-bot'
+        );
+      }
+    );
+
+    it('falls back to the default character when the voice list fails', async () => {
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      client.listVoices.mockRejectedValue(new Error('engine hiccup'));
+      const { interaction, run } = start();
+
+      await run();
+
+      expect(embedOf(edited(interaction)).title).toBe(t('tts.started', 'en'));
+      expect(footer(interaction)).toBe(
+        t('tts.credit', 'en', { credits: 'VOICEVOX:ずんだもん' })
+      );
+    });
+
+    it('uses the cached voice list without waiting on the engine', async () => {
+      ttsRepository.getUserSettings.mockReturnValue({ speakerId: 2, speed: 1 });
+      client.cachedVoices.mockReturnValue(VOICES);
+      client.listVoices.mockReturnValue(new Promise(() => undefined));
+      const { interaction, run } = start();
+
+      await run();
+
+      expect(footer(interaction)).toBe(
+        t('tts.credit', 'en', {
+          credits: 'VOICEVOX:ずんだもん and VOICEVOX:四国めたん',
+        })
+      );
+    });
+
+    it('stops waiting on a slow engine after two seconds', async () => {
+      vi.useFakeTimers();
+      client.listVoices.mockReturnValue(new Promise(() => undefined));
+      const { interaction, run } = start();
+
+      const running = run();
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(interaction.editReply).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await running;
+
+      expect(footer(interaction)).toBe(
+        t('tts.credit', 'en', { credits: 'VOICEVOX:ずんだもん' })
+      );
+    });
+  });
+
+  describe('when the bot cannot view the channel the command was used in', () => {
+    it('reads only the voice chat and says why', async () => {
+      const { interaction, run } = start({ appPermissions: [] });
+
+      await run();
+
+      // Discord would never deliver this channel's messages.
+      expect(ttsSessions.start).toHaveBeenCalledWith(
+        expect.objectContaining({ voiceChannelId: VC, textChannelId: VC })
+      );
+      expect(embedOf(edited(interaction)).description).toBe(
+        `${t('tts.startedDescVoiceOnly', 'en', { voice: VC })}\n\n${t('tts.noViewPermission', 'en')}`
+      );
+    });
+
+    it('does not warn when the command was used in the voice chat itself', async () => {
+      const { interaction, run } = start({ appPermissions: [], channelId: VC });
+
+      await run();
+
+      expect(ttsSessions.start).toHaveBeenCalledWith(
+        expect.objectContaining({ textChannelId: VC })
+      );
+      expect(embedOf(edited(interaction)).description).toBe(
+        t('tts.startedDesc', 'en', { voice: VC })
+      );
+    });
+
+    it('also warns about Speak when both are missing', async () => {
+      const { interaction, run } = start({
+        appPermissions: [],
+        botPermissions: [PermissionFlagsBits.Connect],
+        locale: 'ja',
+      });
+
+      await run();
+
+      expect(embedOf(edited(interaction)).description).toBe(
+        [
+          t('tts.startedDescVoiceOnly', 'ja', { voice: VC }),
+          t('tts.noViewPermission', 'ja'),
+          t('tts.noSpeakPermission', 'ja', { voice: VC }),
+        ].join('\n\n')
+      );
+    });
   });
 
   it.each<[string, CommandOptions]>([
@@ -537,7 +730,7 @@ describe('/tts start', () => {
     await run();
 
     expect(embedOf(edited(interaction)).description).toBe(
-      `${t('tts.startedDesc', 'en', { voice: VC })}\n\n${t('tts.noSpeakPermission', 'en')}`
+      `${t('tts.startedDesc', 'en', { voice: VC })}\n\n${t('tts.noSpeakPermission', 'en', { voice: VC })}`
     );
     expect(ttsSessions.start).toHaveBeenCalled();
   });
@@ -549,7 +742,9 @@ describe('/tts start', () => {
 
     const embed = embedOf(edited(interaction));
     expect(embed.title).toBe(t('tts.started', 'ja'));
-    expect(embed.footer?.text).toBe(t('tts.credit', 'ja'));
+    expect(embed.footer?.text).toBe(
+      t('tts.credit', 'ja', { credits: 'VOICEVOX:ずんだもん' })
+    );
   });
 });
 
@@ -618,6 +813,7 @@ describe('/tts stop', () => {
 
   it('stops the session and leaves a connection made only for reading', async () => {
     connectionManager.getConnection.mockReturnValue({ receiving: false });
+    mayAutoJoin.mockReturnValue(false);
     const { interaction, run } = command({ subcommand: 'stop' });
 
     await run();
@@ -625,6 +821,7 @@ describe('/tts stop', () => {
     expect(ttsSessions.stop).toHaveBeenCalledWith(VC);
     expect(connectionManager.getConnection).toHaveBeenCalledWith(VC);
     expect(connectionManager.disconnect).toHaveBeenCalledWith(VC);
+    expect(connectionManager.enableReceive).not.toHaveBeenCalled();
 
     const payload = replied(interaction);
     expect(payload.flags).toBeUndefined();
@@ -647,6 +844,62 @@ describe('/tts stop', () => {
     expect(ttsSessions.stop).toHaveBeenCalledWith(VC);
     expect(connectionManager.disconnect).not.toHaveBeenCalled();
     expect(embedOf(replied(interaction)).title).toBe(t('tts.stopped', 'en'));
+  });
+});
+
+describe('/tts stop after auto-join was turned back on', () => {
+  beforeEach(() => {
+    ttsSessions.getForGuild.mockReturnValue({ voiceChannelId: VC });
+    connectionManager.getConnection.mockReturnValue({ receiving: false });
+    mayAutoJoin.mockReturnValue(true);
+  });
+
+  it('hands the occupied channel back to auto-join instead of leaving', async () => {
+    const { interaction, voiceChannel, run } = command({
+      subcommand: 'stop',
+      members: [{ id: USER }, { id: 'listener' }],
+    });
+
+    await run();
+
+    expect(ttsSessions.stop).toHaveBeenCalledWith(VC);
+    expect(mayAutoJoin).toHaveBeenCalledWith(GUILD, VC);
+    // In place: leaving and rejoining would race the bot's own voice events.
+    expect(connectionManager.enableReceive).toHaveBeenCalledWith(VC);
+    expect(connectionManager.disconnect).not.toHaveBeenCalled();
+    // Members are told their audio is now kept, as on any auto-join.
+    expect(announceBuffering).toHaveBeenCalledWith(voiceChannel);
+    expect(embedOf(replied(interaction)).title).toBe(t('tts.stopped', 'en'));
+  });
+
+  it.each<[string, Partial<CommandOptions>, () => void]>([
+    ['only bots are left', { members: [{ id: 'a-bot', bot: true }] }, () => {}],
+    [
+      'the channel is still excluded',
+      {},
+      () => mayAutoJoin.mockReturnValue(false),
+    ],
+    ['the channel is not cached', { voice: 'vc-uncached' }, () => {}],
+    [
+      'the connection cannot start listening',
+      {},
+      () => connectionManager.enableReceive.mockReturnValue(false),
+    ],
+  ])('leaves when %s', async (_label, opts, arrange) => {
+    arrange();
+    const { guild, run } = command({
+      subcommand: 'stop',
+      manager: true,
+      ...opts,
+    });
+    if (opts.voice === 'vc-uncached') {
+      (guild.channels.cache as Collection<string, unknown>).delete(VC);
+    }
+
+    await run();
+
+    expect(connectionManager.disconnect).toHaveBeenCalledWith(VC);
+    expect(announceBuffering).not.toHaveBeenCalled();
   });
 });
 
@@ -683,6 +936,12 @@ describe('/tts skip', () => {
 describe('/tts voice', () => {
   const voice = (opts: CommandOptions = {}) =>
     command({ subcommand: 'voice', ...opts });
+
+  /** A session reading the voice chat and the usual text channel. */
+  const session = () => ({
+    voiceChannelId: VC,
+    textChannelIds: new Set([VC, TEXT]),
+  });
 
   function currentText(
     label: string,
@@ -861,7 +1120,7 @@ describe('/tts voice', () => {
     });
 
     it('previews the new voice when the caller is being read', async () => {
-      ttsSessions.getForGuild.mockReturnValue({ voiceChannelId: VC });
+      ttsSessions.getForGuild.mockReturnValue(session());
       ttsRepository.listDictionary.mockReturnValue([
         { word: 'Taro', reading: 'たろー', createdBy: 'x' },
       ]);
@@ -884,7 +1143,7 @@ describe('/tts voice', () => {
     });
 
     it('does not preview for a caller outside the voice channel being read', async () => {
-      ttsSessions.getForGuild.mockReturnValue({ voiceChannelId: VC });
+      ttsSessions.getForGuild.mockReturnValue(session());
       const { run } = voice({ voice: 'vc-other', options: { speaker: 1 } });
 
       await run();
@@ -899,6 +1158,104 @@ describe('/tts voice', () => {
       await run();
 
       expect(ttsSessions.enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('public credit for a voice change during a session', () => {
+    it('posts the new voice and its credit in the channel the command was used in', async () => {
+      ttsSessions.getForGuild.mockReturnValue(session());
+      const { interaction, textChannel, voiceChannel, run } = voice({
+        voice: VC,
+        options: { speaker: 2 },
+      });
+
+      await run();
+
+      expect(textChannel.send).toHaveBeenCalledTimes(1);
+      expect(voiceChannel!.send).not.toHaveBeenCalled();
+      const embed = textChannel.send.mock.calls[0][0].embeds[0].toJSON();
+      expect(embed.description).toBe(
+        t('tts.voice.changed', 'en', {
+          user: USER,
+          voice: '四国めたん（ノーマル）',
+        })
+      );
+      expect(embed.footer?.text).toBe(
+        t('tts.voice.credit', 'en', { character: '四国めたん' })
+      );
+      // The caller's own confirmation stays private.
+      expect(embedOf(edited(interaction)).title).toBe(
+        t('tts.voice.setTitle', 'en')
+      );
+    });
+
+    it('uses the voice chat when the command came from a channel not being read', async () => {
+      ttsSessions.getForGuild.mockReturnValue(session());
+      const { textChannel, voiceChannel, run } = voice({
+        voice: VC,
+        channelId: 'elsewhere',
+        locale: 'ja',
+        options: { speaker: 2 },
+      });
+
+      await run();
+
+      expect(textChannel.send).not.toHaveBeenCalled();
+      expect(voiceChannel!.send).toHaveBeenCalledTimes(1);
+      const embed = voiceChannel!.send.mock.calls[0][0].embeds[0].toJSON();
+      expect(embed.footer?.text).toBe(
+        t('tts.voice.credit', 'ja', { character: '四国めたん' })
+      );
+    });
+
+    it('posts nothing when only the speed changed', async () => {
+      ttsSessions.getForGuild.mockReturnValue(session());
+      const { textChannel, run } = voice({
+        voice: VC,
+        options: { speed: 1.5 },
+      });
+
+      await run();
+
+      expect(ttsSessions.enqueue).toHaveBeenCalled();
+      expect(textChannel.send).not.toHaveBeenCalled();
+    });
+
+    it('posts nothing for a caller who is not being read', async () => {
+      ttsSessions.getForGuild.mockReturnValue(session());
+      const { textChannel, run } = voice({
+        voice: 'vc-other',
+        options: { speaker: 2 },
+      });
+
+      await run();
+
+      expect(textChannel.send).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, (channel: ReturnType<typeof sendableChannel>) => void]>([
+      [
+        'the post fails',
+        (c) => c.send.mockRejectedValue(new Error('Missing Access')),
+      ],
+      [
+        'the channel cannot be posted in',
+        (c) => Object.assign(c, { isSendable: () => false }),
+      ],
+    ])('still confirms the change when %s', async (_label, breakIt) => {
+      ttsSessions.getForGuild.mockReturnValue(session());
+      const { interaction, textChannel, run } = voice({
+        voice: VC,
+        options: { speaker: 2 },
+      });
+      breakIt(textChannel);
+
+      await run();
+
+      expect(ttsRepository.setUserSettings).toHaveBeenCalled();
+      expect(embedOf(edited(interaction)).title).toBe(
+        t('tts.voice.setTitle', 'en')
+      );
     });
   });
 });
@@ -933,6 +1290,46 @@ describe('/tts dict', () => {
 
       expect(embedOf(replied(interaction)).description).toBe(
         '・w → わら\n・草 → くさ'
+      );
+    });
+
+    it('shows markdown in words and readings as typed, not rendered', async () => {
+      ttsRepository.listDictionary.mockReturnValue([
+        {
+          word: '*bold*',
+          reading: '[Free Nitro](https://evil.example)',
+          createdBy: 'a',
+        },
+      ]);
+      const { interaction, run } = dict('list');
+
+      await run();
+
+      expect(embedOf(replied(interaction)).description).toBe(
+        '・\\*bold\\* → \\[Free Nitro](https://evil.example)'
+      );
+    });
+
+    it('stops before the embed limit and still counts the rest', async () => {
+      ttsRepository.listDictionary.mockReturnValue(
+        Array.from({ length: 45 }, (_, i) => ({
+          word: `${i}`.padStart(50, 'w'),
+          reading: 'あ'.repeat(100),
+          createdBy: 'a',
+        }))
+      );
+      const { interaction, run } = dict('list');
+
+      await run();
+
+      const description = embedOf(replied(interaction)).description!;
+      expect(description.length).toBeLessThanOrEqual(4096);
+      const lines = description.split('\n');
+      const shown = lines.length - 1;
+      expect(shown).toBeGreaterThan(0);
+      expect(shown).toBeLessThan(40);
+      expect(lines[shown]).toBe(
+        t('tts.dict.listMore', 'en', { count: 45 - shown })
       );
     });
 
@@ -1032,11 +1429,11 @@ describe('/tts dict', () => {
       expect(embed.color).toBe(COLORS.SUCCESS);
     });
 
-    it('reports an existing word as updated', async () => {
+    it('lets the member who added a word change it', async () => {
       ttsRepository.getDictionaryEntry.mockReturnValue({
         word: 'w',
         reading: 'わら',
-        createdBy: 'someone',
+        createdBy: USER,
       });
       const { interaction, run } = dict('add', {
         options: { word: 'w', reading: 'くさ' },
@@ -1044,8 +1441,85 @@ describe('/tts dict', () => {
 
       await run();
 
+      expect(ttsRepository.upsertDictionaryEntry).toHaveBeenCalledWith(
+        GUILD,
+        'w',
+        'くさ',
+        USER
+      );
       expect(embedOf(replied(interaction)).description).toBe(
         t('tts.dict.updated', 'en', { word: 'w', reading: 'くさ' })
+      );
+    });
+
+    it.each<Locale>(['en', 'ja'])(
+      "refuses to change another member's word, and writes nothing (%s)",
+      async (locale) => {
+        ttsRepository.getDictionaryEntry.mockReturnValue({
+          word: 'Taka',
+          reading: 'たか',
+          createdBy: 'someone-else',
+        });
+        const { interaction, run } = dict('add', {
+          locale,
+          options: { word: 'taka', reading: 'ばか' },
+        });
+
+        await run();
+
+        expectError(
+          interaction,
+          t('common.error', locale),
+          t('tts.dict.notOwner', locale)
+        );
+        expect(ttsRepository.upsertDictionaryEntry).not.toHaveBeenCalled();
+      }
+    );
+
+    it("lets a server manager change anyone's word", async () => {
+      ttsRepository.getDictionaryEntry.mockReturnValue({
+        word: 'Taka',
+        reading: 'ばか',
+        createdBy: 'someone-else',
+      });
+      const { interaction, run } = dict('add', {
+        manager: true,
+        options: { word: 'Taka', reading: 'たか' },
+      });
+
+      await run();
+
+      // The repository keeps the original author on an update.
+      expect(ttsRepository.upsertDictionaryEntry).toHaveBeenCalledWith(
+        GUILD,
+        'Taka',
+        'たか',
+        USER
+      );
+      expect(embedOf(replied(interaction)).description).toBe(
+        t('tts.dict.updated', 'en', { word: 'Taka', reading: 'たか' })
+      );
+    });
+
+    it('stores the text as typed but shows it without rendering markdown', async () => {
+      const reading = '[Discord Nitro 無料配布](https://evil.example)';
+      const { interaction, run } = dict('add', {
+        options: { word: 'nitro_*', reading },
+      });
+
+      await run();
+
+      expect(ttsRepository.upsertDictionaryEntry).toHaveBeenCalledWith(
+        GUILD,
+        'nitro_*',
+        reading,
+        USER
+      );
+      expect(embedOf(replied(interaction)).description).toBe(
+        t('tts.dict.added', 'en', {
+          word: 'nitro\\_\\*',
+          reading: '\\[Discord Nitro 無料配布](https://evil.example)',
+        })
       );
     });
 
@@ -1082,7 +1556,7 @@ describe('/tts dict', () => {
       ttsRepository.getDictionaryEntry.mockReturnValue({
         word: 'w',
         reading: 'わら',
-        createdBy: 'x',
+        createdBy: USER,
       });
       const { interaction, run } = dict('add', {
         options: { word: 'w', reading: 'くさ' },
@@ -1162,6 +1636,30 @@ describe('/tts dict', () => {
       expect(embed.color).toBe(COLORS.INFO);
     });
 
+    it('shows the word without rendering markdown', async () => {
+      ttsRepository.getDictionaryEntry.mockReturnValue({
+        word: '**x**',
+        reading: 'えっくす',
+        createdBy: USER,
+      });
+      const removed = dict('remove', { options: { word: '**x**' } });
+      await removed.run();
+      expect(embedOf(replied(removed.interaction)).description).toBe(
+        t('tts.dict.removed', 'en', { word: '\\*\\*x\\*\\*' })
+      );
+      expect(ttsRepository.removeDictionaryEntry).toHaveBeenCalledWith(
+        GUILD,
+        '**x**'
+      );
+
+      ttsRepository.getDictionaryEntry.mockReturnValue(null);
+      const missing = dict('remove', { options: { word: '||x||' } });
+      await missing.run();
+      expect(embedOf(replied(missing.interaction)).description).toBe(
+        t('tts.dict.notFound', 'en', { word: '\\|\\|x\\|\\|' })
+      );
+    });
+
     it('lets a server manager remove anyone’s word', async () => {
       ttsRepository.getDictionaryEntry.mockReturnValue(entry('someone-else'));
       const { run } = dict('remove', {
@@ -1176,6 +1674,33 @@ describe('/tts dict', () => {
         'w'
       );
     });
+  });
+});
+
+describe('/tts dict add option descriptions', () => {
+  it('give an example that is safe to copy', () => {
+    interface Option {
+      name: string;
+      description: string;
+      options?: Option[];
+    }
+    const json = ttsCommand.data.toJSON() as unknown as { options: Option[] };
+    const add = json.options
+      .find((o) => o.name === 'dict')
+      ?.options?.find((o) => o.name === 'add') as { options: Option[] };
+    const example = (name: string) =>
+      /e\.g\. (.+)\)$/.exec(
+        add!.options.find((o) => o.name === name)!.description
+      )![1];
+    const rule = { word: example('word'), reading: example('reading') };
+
+    // Words match inside other words: following the example must not
+    // rewrite ordinary chat.
+    const chat = 'Windows wow 草www Twitter見た？ web開発';
+    expect(applyDictionary(chat, [rule])).toBe(chat);
+    expect(applyDictionary(`${rule.word}で読む`, [rule])).toBe(
+      `${rule.reading}で読む`
+    );
   });
 });
 
@@ -1260,6 +1785,47 @@ describe('autocompleteTts', () => {
       await run();
 
       expect(choices()).toEqual([]);
+    });
+
+    it('answers from the last list at once and refreshes it in the background', async () => {
+      client.cachedVoices.mockReturnValue(VOICES);
+      client.listVoices.mockReturnValue(new Promise(() => undefined));
+      const { run, choices } = autocomplete('speaker', 'めたん');
+
+      await run();
+
+      expect(choices()).toEqual([{ name: '四国めたん（ノーマル）', value: 2 }]);
+      expect(client.listVoices).toHaveBeenCalledTimes(1);
+    });
+
+    it("answers within Discord's deadline when a cold engine is slow", async () => {
+      vi.useFakeTimers();
+      try {
+        client.listVoices.mockReturnValue(new Promise(() => undefined));
+        const { interaction, run, choices } = autocomplete('speaker', '');
+
+        const running = run();
+        await vi.advanceTimersByTimeAsync(1_999);
+        expect(interaction.respond).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await running;
+
+        expect(choices()).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps voice names within 100 characters', async () => {
+      client.listVoices.mockResolvedValue([
+        { id: 7, character: 'き'.repeat(80), style: 'す'.repeat(40) },
+      ]);
+      const { run, choices } = autocomplete('speaker', '');
+
+      await run();
+
+      expect(choices()[0].name).toHaveLength(100);
+      expect(choices()[0].value).toBe(7);
     });
   });
 

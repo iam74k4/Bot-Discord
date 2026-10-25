@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { PermissionFlagsBits } from 'discord.js';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * The parts of the connection manager text-to-speech relies on: one audio
@@ -20,6 +20,7 @@ vi.mock('@discordjs/voice', () => ({
     Disconnected: 'disconnected',
     Signalling: 'signalling',
     Connecting: 'connecting',
+    Destroyed: 'destroyed',
   },
   EndBehaviorType: { AfterSilence: 'after-silence' },
 }));
@@ -37,10 +38,14 @@ vi.mock('../../../config/index.js', () => ({
   AUDIO: { SAMPLE_RATE: 48000 },
 }));
 
+/** Channels whose mix ring exists, i.e. that have buffered audio. */
+const ringHolders = vi.hoisted(() => new Set<string>());
+
 vi.mock('../recording/channelMixRing.js', () => ({
   channelMixRingManager: {
     getOrCreate: vi.fn(() => ({ addMonoPcmInt16: vi.fn() })),
     remove: vi.fn(),
+    has: vi.fn((channelId: string) => ringHolders.has(channelId)),
   },
 }));
 
@@ -124,9 +129,9 @@ function makePlayer() {
 async function join(
   manager: Manager,
   options?: { receive?: boolean },
-  { id = 'vc-1', status = 'ready' } = {}
+  { id = 'vc-1', status = 'ready', guildId = 'guild-1' } = {}
 ) {
-  const channel = makeChannel(id);
+  const channel = makeChannel(id, guildId);
   const player = makePlayer();
   createAudioPlayer.mockReturnValueOnce(player);
   let fake!: ReturnType<typeof makeConnection>;
@@ -148,6 +153,7 @@ describe('VoiceConnectionManager (text-to-speech support)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    ringHolders.clear();
     entersState.mockResolvedValue(undefined);
     manager = new VoiceConnectionManager();
   });
@@ -302,23 +308,223 @@ describe('VoiceConnectionManager (text-to-speech support)', () => {
   });
 
   describe('waitUntilReady', () => {
-    it('is false for a channel that is not connected', async () => {
-      await expect(manager.waitUntilReady('vc-1', 1000)).resolves.toBe(false);
+    /** Statuses each connection has reached, and waiters per status. */
+    function controllableStates() {
+      const waiters: Array<{
+        connection: unknown;
+        status: string;
+        resolve: () => void;
+      }> = [];
+      entersState.mockImplementation(
+        (connection: unknown, status: string, signal: AbortSignal) =>
+          new Promise<unknown>((resolve, reject) => {
+            waiters.push({
+              connection,
+              status,
+              resolve: () => resolve(connection),
+            });
+            signal.addEventListener('abort', () =>
+              reject(new Error('The operation was aborted'))
+            );
+          })
+      );
+      return {
+        reach(connection: unknown, status: string) {
+          for (const w of waiters) {
+            if (w.connection === connection && w.status === status) {
+              w.resolve();
+            }
+          }
+        },
+      };
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('is null for a channel that is not connected', async () => {
+      await expect(manager.waitUntilReady('vc-1', 1000)).resolves.toBeNull();
       expect(entersState).not.toHaveBeenCalled();
     });
 
-    it('is true once the connection reaches Ready', async () => {
+    it('returns the connection once it reaches Ready', async () => {
+      const states = controllableStates();
       const { connection } = await join(manager);
 
-      await expect(manager.waitUntilReady('vc-1', 15_000)).resolves.toBe(true);
-      expect(entersState).toHaveBeenCalledWith(connection, 'ready', 15_000);
+      const waiting = manager.waitUntilReady('vc-1', 15_000);
+      states.reach(connection, 'ready');
+
+      await expect(waiting).resolves.toBe(connection);
+      expect(entersState).toHaveBeenCalledWith(
+        connection,
+        'ready',
+        expect.any(AbortSignal)
+      );
+      // Nothing is left listening once the wait is over.
+      for (const [, , signal] of entersState.mock.calls) {
+        expect((signal as AbortSignal).aborted).toBe(true);
+      }
     });
 
-    it('is false when the connection does not become ready in time', async () => {
+    it('is null when the connection does not become ready in time', async () => {
+      vi.useFakeTimers();
+      controllableStates();
       await join(manager);
-      entersState.mockRejectedValue(new Error('The operation was aborted'));
 
-      await expect(manager.waitUntilReady('vc-1', 15_000)).resolves.toBe(false);
+      let result: unknown = 'pending';
+      void manager.waitUntilReady('vc-1', 15_000).then((r) => {
+        result = r;
+      });
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(result).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(result).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('gives up at once when the connection is destroyed while waiting', async () => {
+      vi.useFakeTimers();
+      const states = controllableStates();
+      const { connection } = await join(manager);
+
+      const waiting = manager.waitUntilReady('vc-1', 15_000);
+      states.reach(connection, 'destroyed');
+
+      // No need to run out the 15 s: a destroyed connection never readies.
+      await expect(waiting).resolves.toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('is null when the channel got a different connection meanwhile', async () => {
+      const states = controllableStates();
+      const first = await join(manager);
+      const waiting = manager.waitUntilReady('vc-1', 15_000);
+
+      // The first connection goes away and a fresh join replaces it.
+      await manager.disconnect('vc-1');
+      const second = await join(manager);
+      states.reach(first.connection, 'ready');
+
+      await expect(waiting).resolves.toBeNull();
+      expect(manager.getConnection('vc-1')?.connection).toBe(second.connection);
+    });
+  });
+
+  describe('disconnect with an expected connection', () => {
+    it('leaves a replacement connection alone', async () => {
+      const first = await join(manager);
+      await manager.disconnect('vc-1');
+      const second = await join(manager);
+
+      await manager.disconnect('vc-1', first.connection as never);
+
+      expect(second.connection.destroy).not.toHaveBeenCalled();
+      expect(manager.getConnection('vc-1')?.connection).toBe(second.connection);
+    });
+
+    it('disconnects when it is still the connection tracked there', async () => {
+      const { connection } = await join(manager);
+
+      await manager.disconnect('vc-1', connection as never);
+
+      expect(connection.destroy).toHaveBeenCalled();
+      expect(manager.getConnection('vc-1')).toBeUndefined();
+    });
+  });
+
+  describe('enableReceive', () => {
+    it('is false for a channel that is not connected', () => {
+      expect(manager.enableReceive('vc-1')).toBe(false);
+    });
+
+    it('is false for a connection that already listens', async () => {
+      const { connection } = await join(manager);
+
+      expect(manager.enableReceive('vc-1')).toBe(false);
+      expect(connection.rejoin).not.toHaveBeenCalled();
+    });
+
+    it('undeafens a reading-only join in place and starts receiving', async () => {
+      const { connection } = await join(manager, { receive: false });
+      connection.receiver.speaking.emit('start', 'user-1');
+      expect(connection.receiver.subscribe).not.toHaveBeenCalled();
+
+      expect(manager.enableReceive('vc-1')).toBe(true);
+
+      expect(manager.getConnection('vc-1')?.receiving).toBe(true);
+      expect(connection.rejoin).toHaveBeenCalledWith({
+        channelId: 'vc-1',
+        selfDeaf: false,
+        selfMute: true,
+      });
+      expect(connection.destroy).not.toHaveBeenCalled();
+      connection.receiver.speaking.emit('start', 'user-1');
+      expect(connection.receiver.subscribe).toHaveBeenCalledWith(
+        'user-1',
+        expect.anything()
+      );
+    });
+
+    it('waits for a connection that is still handshaking', async () => {
+      const { connection, fireOnce } = await join(
+        manager,
+        { receive: false },
+        { status: 'connecting' }
+      );
+
+      expect(manager.enableReceive('vc-1')).toBe(true);
+      expect(connection.rejoin).not.toHaveBeenCalled();
+
+      fireOnce('ready');
+      expect(connection.rejoin).toHaveBeenCalledWith({
+        channelId: 'vc-1',
+        selfDeaf: false,
+        selfMute: true,
+      });
+    });
+  });
+
+  describe('disconnectOldest', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function joinAt(
+      at: number,
+      id: string,
+      options?: { receive?: boolean }
+    ) {
+      vi.setSystemTime(at);
+      // Discord allows one connection per guild, so each is its own guild.
+      return join(manager, options, { id, guildId: `guild-${id}` });
+    }
+
+    it('sheds the connections holding audio buffers before reading-only joins', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      await joinAt(1_000, 'tts-oldest', { receive: false });
+      await joinAt(2_000, 'silent');
+      await joinAt(3_000, 'ring-newer');
+      await joinAt(2_500, 'ring-older');
+      ringHolders.add('ring-newer').add('ring-older');
+
+      await manager.disconnectOldest(1);
+      expect([...manager.getAllConnections().keys()].sort()).toEqual(
+        ['ring-newer', 'silent', 'tts-oldest'].sort()
+      );
+
+      await manager.disconnectOldest(1);
+      expect([...manager.getAllConnections().keys()].sort()).toEqual(
+        ['silent', 'tts-oldest'].sort()
+      );
+
+      // A listening connection with no buffer yet still goes before reading.
+      await manager.disconnectOldest(1);
+      expect([...manager.getAllConnections().keys()]).toEqual(['tts-oldest']);
+
+      await manager.disconnectOldest(1);
+      expect(manager.getConnectionCount()).toBe(0);
     });
   });
 

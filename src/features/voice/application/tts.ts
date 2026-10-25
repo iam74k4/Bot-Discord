@@ -1,13 +1,18 @@
+import type { VoiceConnection } from '@discordjs/voice';
 import {
   type AutocompleteInteraction,
+  ChannelType,
   type ChatInputCommandInteraction,
+  escapeMarkdown,
   type Guild,
   type Message,
   MessageFlags,
   PermissionFlagsBits,
+  type VoiceBasedChannel,
 } from 'discord.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
+import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
 import { t, type Locale } from '../../../locales/index.js';
 import { resolveLocale } from '../../../locales/guildLocale.js';
 import { connectionManager } from '../recording/connectionManager.js';
@@ -16,7 +21,7 @@ import {
   MAX_DICTIONARY_ENTRIES,
   ttsRepository,
 } from '../repositories/ttsRepository.js';
-import { ttsSessions } from '../tts/sessionManager.js';
+import { ttsSessions, type TtsSessionInfo } from '../tts/sessionManager.js';
 import {
   buildMessageSpeech,
   isMarkedSilent,
@@ -25,9 +30,12 @@ import {
 } from '../tts/textNormalizer.js';
 import {
   clampSpeed,
+  DEFAULT_CHARACTER,
   DEFAULT_SPEAKER_ID,
   getVoicevoxClient,
   voiceLabel,
+  type VoicevoxClient,
+  type VoicevoxVoice,
 } from '../tts/voicevoxClient.js';
 import { announceBuffering } from './announce.js';
 
@@ -46,6 +54,16 @@ const DEFAULT_SPEED = 1;
 const CONNECT_TIMEOUT_MS = 15_000;
 const AUTOCOMPLETE_LIMIT = 25;
 const LIST_LIMIT = 40;
+/** Room left in the 4,096-character embed description for the list. */
+const LIST_MAX_CHARS = 3_900;
+/** Discord rejects autocomplete choice names longer than this. */
+const CHOICE_NAME_MAX = 100;
+/**
+ * How long to wait for the engine's voice list when the answer cannot wait
+ * longer: autocomplete must answer within Discord's 3 s, and the start
+ * message should not hang on a slow engine just to name the voices.
+ */
+const VOICE_LIST_WAIT_MS = 2_000;
 
 type GuildInteraction = ChatInputCommandInteraction<'cached'>;
 
@@ -71,6 +89,77 @@ function connectedChannelInGuild(guildId: string): string | undefined {
 
 function formatSpeed(speed: number): string {
   return String(Number(speed.toFixed(2)));
+}
+
+/**
+ * User text going into an embed. Embeds render markdown, masked links
+ * included, and escapeMarkdown leaves those alone unless asked.
+ */
+function md(text: string): string {
+  return escapeMarkdown(text, { maskedLink: true });
+}
+
+function humanMembers(channel: VoiceBasedChannel) {
+  return channel.members.filter((member) => !member.user.bot);
+}
+
+/**
+ * The engine's voice list without waiting on a slow engine: the last list
+ * straight away when there is one (refreshed in the background once stale),
+ * otherwise a fetch bounded to `waitMs`. A fetch that runs over keeps going
+ * and fills the cache for next time; a failure yields an empty list.
+ */
+async function voicesWithin(
+  client: VoicevoxClient,
+  waitMs: number
+): Promise<VoicevoxVoice[]> {
+  const fetching = client.listVoices().catch((error: unknown) => {
+    logger.debug(`Could not list VOICEVOX voices: ${getErrorMessage(error)}`);
+    return [];
+  });
+  const cached = client.cachedVoices();
+  if (cached) return cached;
+
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<VoicevoxVoice[]>((resolve) => {
+    timer = setTimeout(() => resolve([]), waitMs);
+  });
+  try {
+    return await Promise.race([fetching, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * The credit line VOICEVOX and its characters' terms require
+ * ("VOICEVOX:ずんだもん"), for the default voice plus the voices of everyone
+ * in the channel now. Falls back to the default character when the engine
+ * cannot list its voices.
+ */
+async function voiceCredits(
+  client: VoicevoxClient,
+  voiceChannel: VoiceBasedChannel,
+  locale: Locale
+): Promise<string> {
+  const speakerIds = new Set([DEFAULT_SPEAKER_ID]);
+  for (const member of humanMembers(voiceChannel).values()) {
+    speakerIds.add(
+      ttsRepository.getUserSettings(member.id)?.speakerId ?? DEFAULT_SPEAKER_ID
+    );
+  }
+
+  const voices = await voicesWithin(client, VOICE_LIST_WAIT_MS);
+  const characters = new Set<string>();
+  for (const id of speakerIds) {
+    const voice = voices.find((v) => v.id === id);
+    if (voice) characters.add(voice.character);
+  }
+  if (characters.size === 0) characters.add(DEFAULT_CHARACTER);
+
+  return new Intl.ListFormat(locale, { type: 'conjunction' }).format(
+    [...characters].map((character) => `VOICEVOX:${character}`)
+  );
 }
 
 export async function executeTtsCommand(
@@ -131,6 +220,17 @@ async function handleStart(
     return;
   }
 
+  // On a Stage the bot joins the audience, and Discord drops audio from the
+  // audience: reading would report success and never be heard.
+  if (voiceChannel.type === ChannelType.GuildStageVoice) {
+    await replyError(
+      interaction,
+      t('tts.errors.stageUnsupported', locale),
+      t('tts.errors.stageUnsupportedDesc', locale)
+    );
+    return;
+  }
+
   const busyChannelId = connectedChannelInGuild(interaction.guildId);
   if (busyChannelId && busyChannelId !== voiceChannel.id) {
     await replyError(
@@ -153,20 +253,19 @@ async function handleStart(
     return;
   }
 
-  const joinedNow = !connectionManager.getConnection(voiceChannel.id);
-  if (joinedNow) {
+  // The join this call made, if any; null when the bot was already there.
+  let joined: VoiceConnection | null = null;
+  if (!connectionManager.getConnection(voiceChannel.id)) {
     // Reading never overrides a server's choice not to have audio buffered:
     // where auto-join is off, the bot joins deafened and keeps nothing.
     const receive = voiceSettingsRepository.mayAutoJoin(
       interaction.guildId,
       voiceChannel.id
     );
-    const connection = await connectionManager.connect(
-      interaction.guild,
-      voiceChannel,
-      { receive }
-    );
-    if (!connection) {
+    joined = await connectionManager.connect(interaction.guild, voiceChannel, {
+      receive,
+    });
+    if (!joined) {
       await replyError(
         interaction,
         t('tts.errors.cannotJoin', locale),
@@ -186,8 +285,10 @@ async function handleStart(
     ))
   ) {
     // Without a session nothing would ever remove a join made for reading.
-    if (joinedNow) {
-      await connectionManager.disconnect(voiceChannel.id);
+    // Only that join, though: if it died while we waited, whatever is in the
+    // channel now (say, a fresh auto-join) is not ours to remove.
+    if (joined) {
+      await connectionManager.disconnect(voiceChannel.id, joined);
     }
     await replyError(
       interaction,
@@ -197,32 +298,41 @@ async function handleStart(
     return;
   }
 
+  // Discord only delivers messages from channels the bot can view, while a
+  // slash command works anywhere the member can use it. Reading History is
+  // not needed: new messages arrive over the gateway, not from history.
+  const canReadHere =
+    interaction.channelId === voiceChannel.id ||
+    interaction.appPermissions.has(PermissionFlagsBits.ViewChannel);
+
   ttsSessions.start({
     guildId: interaction.guildId,
     voiceChannelId: voiceChannel.id,
-    textChannelId: interaction.channelId,
+    // The voice chat is always read; add this channel only if it can be.
+    textChannelId: canReadHere ? interaction.channelId : voiceChannel.id,
     startedBy: interaction.user.id,
   });
-
-  // Warm the voice list so the first `/tts voice` autocomplete is instant.
-  void client.listVoices().catch(() => undefined);
 
   const me = interaction.guild.members.me;
   const canSpeak = me
     ? (voiceChannel.permissionsFor(me)?.has(PermissionFlagsBits.Speak) ?? false)
     : false;
 
-  const description = t('tts.startedDesc', locale, {
-    voice: voiceChannel.id,
-  });
+  const description = [
+    canReadHere
+      ? t('tts.startedDesc', locale, { voice: voiceChannel.id })
+      : t('tts.startedDescVoiceOnly', locale, { voice: voiceChannel.id }),
+    ...(canReadHere ? [] : [t('tts.noViewPermission', locale)]),
+    ...(canSpeak
+      ? []
+      : [t('tts.noSpeakPermission', locale, { voice: voiceChannel.id })]),
+  ].join('\n\n');
 
   await interaction.editReply({
     embeds: [
       createEmbed({
         title: t('tts.started', locale),
-        description: canSpeak
-          ? description
-          : `${description}\n\n${t('tts.noSpeakPermission', locale)}`,
+        description,
         color: COLORS.SUCCESS,
         fields: [
           {
@@ -230,7 +340,10 @@ async function handleStart(
             value: t('tts.howTo', locale, { voice: voiceChannel.id }),
           },
         ],
-        footer: t('tts.credit', locale),
+        // Public on purpose: VOICEVOX requires listeners to see the credit.
+        footer: t('tts.credit', locale, {
+          credits: await voiceCredits(client, voiceChannel, locale),
+        }),
       }),
     ],
   });
@@ -282,9 +395,13 @@ async function handleStop(
 
   ttsSessions.stop(voiceChannelId);
 
-  // A connection made only to read has no reason to stay.
+  // A connection made only to read has no reason to stay - unless auto-join
+  // was turned on while it sat there deafened, in which case the channel is
+  // handed back to auto-join instead of being left unbuffered.
   if (connectionManager.getConnection(voiceChannelId)?.receiving === false) {
-    await connectionManager.disconnect(voiceChannelId);
+    if (!(await resumeAutoJoin(interaction.guild, voiceChannelId))) {
+      await connectionManager.disconnect(voiceChannelId);
+    }
   }
 
   await interaction.reply({
@@ -296,6 +413,28 @@ async function handleStop(
       }),
     ],
   });
+}
+
+/**
+ * Turn a deafened reading connection into the listening one auto-join would
+ * have made, if auto-join now covers the channel and people are in it.
+ * In place: the bot does not leave, and members are told it is listening.
+ */
+async function resumeAutoJoin(
+  guild: Guild,
+  voiceChannelId: string
+): Promise<boolean> {
+  const channel = guild.channels.cache.get(voiceChannelId);
+  if (
+    !channel?.isVoiceBased() ||
+    !voiceSettingsRepository.mayAutoJoin(guild.id, voiceChannelId) ||
+    humanMembers(channel).size === 0 ||
+    !connectionManager.enableReceive(voiceChannelId)
+  ) {
+    return false;
+  }
+  await announceBuffering(channel);
+  return true;
 }
 
 async function handleSkip(
@@ -400,6 +539,11 @@ async function handleVoice(
       speakerId,
       speed,
     });
+    // This reply is private, but everyone hears the new voice: credit it
+    // where they can see it.
+    if (speakerId !== current.speakerId) {
+      await announceVoiceChange(interaction, session, voice, locale);
+    }
   }
 
   await interaction.editReply({
@@ -417,6 +561,42 @@ async function handleVoice(
   });
 }
 
+/**
+ * Post a voice change, with its credit, to a channel being read: the one
+ * the command was used in if it is, else the voice channel's own chat. Best
+ * effort - a missing permission must not fail the change itself.
+ */
+async function announceVoiceChange(
+  interaction: GuildInteraction,
+  session: TtsSessionInfo,
+  voice: VoicevoxVoice,
+  locale: Locale
+): Promise<void> {
+  const channelId = session.textChannelIds.has(interaction.channelId)
+    ? interaction.channelId
+    : session.voiceChannelId;
+  try {
+    const channel = interaction.guild.channels.cache.get(channelId);
+    if (!channel?.isSendable()) return;
+    await channel.send({
+      embeds: [
+        createEmbed({
+          description: t('tts.voice.changed', locale, {
+            user: interaction.user.id,
+            voice: voiceLabel(voice),
+          }),
+          color: COLORS.INFO,
+          footer: t('tts.voice.credit', locale, { character: voice.character }),
+        }),
+      ],
+    });
+  } catch (error) {
+    logger.debug(
+      `Could not announce a voice change in ${channelId}: ${getErrorMessage(error)}`
+    );
+  }
+}
+
 async function handleDictionary(
   interaction: GuildInteraction,
   locale: Locale
@@ -426,12 +606,20 @@ async function handleDictionary(
 
   if (subcommand === 'list') {
     const entries = ttsRepository.listDictionary(guildId);
-    const shown = entries.slice(0, LIST_LIMIT);
-    const lines = shown.map((entry) => `・${entry.word} → ${entry.reading}`);
-    if (entries.length > shown.length) {
+    // Up to LIST_LIMIT lines, stopping early rather than letting the embed
+    // cut the description - and the "N more" line with it.
+    const lines: string[] = [];
+    let length = 0;
+    for (const entry of entries.slice(0, LIST_LIMIT)) {
+      const line = `・${md(entry.word)} → ${md(entry.reading)}`;
+      if (length + line.length + 1 > LIST_MAX_CHARS) break;
+      lines.push(line);
+      length += line.length + 1;
+    }
+    if (entries.length > lines.length) {
       lines.push(
         t('tts.dict.listMore', locale, {
-          count: entries.length - shown.length,
+          count: entries.length - lines.length,
         })
       );
     }
@@ -459,7 +647,7 @@ async function handleDictionary(
       await replyError(
         interaction,
         t('common.error', locale),
-        t('tts.dict.notFound', locale, { word })
+        t('tts.dict.notFound', locale, { word: md(word) })
       );
       return;
     }
@@ -479,7 +667,7 @@ async function handleDictionary(
       embeds: [
         createEmbed({
           title: t('tts.dict.removedTitle', locale),
-          description: t('tts.dict.removed', locale, { word }),
+          description: t('tts.dict.removed', locale, { word: md(word) }),
           color: COLORS.INFO,
         }),
       ],
@@ -506,7 +694,23 @@ async function handleDictionary(
     return;
   }
 
-  const exists = ttsRepository.getDictionaryEntry(guildId, word) !== null;
+  const existing = ttsRepository.getDictionaryEntry(guildId, word);
+  const exists = existing !== null;
+  // Changing a word is as restricted as removing it: otherwise anyone could
+  // rewrite someone's reading (their name, say) and the rule would mean
+  // nothing.
+  if (
+    existing &&
+    existing.createdBy !== interaction.user.id &&
+    !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)
+  ) {
+    await replyError(
+      interaction,
+      t('common.error', locale),
+      t('tts.dict.notOwner', locale)
+    );
+    return;
+  }
   if (
     !exists &&
     ttsRepository.countDictionary(guildId) >= MAX_DICTIONARY_ENTRIES
@@ -530,9 +734,10 @@ async function handleDictionary(
     embeds: [
       createEmbed({
         title: t('tts.dict.addedTitle', locale),
-        description: exists
-          ? t('tts.dict.updated', locale, { word, reading })
-          : t('tts.dict.added', locale, { word, reading }),
+        description: t(exists ? 'tts.dict.updated' : 'tts.dict.added', locale, {
+          word: md(word),
+          reading: md(reading),
+        }),
         color: COLORS.SUCCESS,
       }),
     ],
@@ -547,12 +752,16 @@ export async function autocompleteTts(
 
   if (focused.name === 'speaker') {
     const client = getVoicevoxClient();
-    const voices = client ? await client.listVoices().catch(() => []) : [];
+    // Discord gives autocomplete 3 s; never spend them all on the engine.
+    const voices = client ? await voicesWithin(client, VOICE_LIST_WAIT_MS) : [];
     await interaction.respond(
       voices
         .filter((voice) => voiceLabel(voice).toLowerCase().includes(query))
         .slice(0, AUTOCOMPLETE_LIMIT)
-        .map((voice) => ({ name: voiceLabel(voice), value: voice.id }))
+        .map((voice) => ({
+          name: voiceLabel(voice).slice(0, CHOICE_NAME_MAX),
+          value: voice.id,
+        }))
     );
     return;
   }
@@ -568,7 +777,7 @@ export async function autocompleteTts(
         )
         .slice(0, AUTOCOMPLETE_LIMIT)
         .map((entry) => ({
-          name: `${entry.word} → ${entry.reading}`.slice(0, 100),
+          name: `${entry.word} → ${entry.reading}`.slice(0, CHOICE_NAME_MAX),
           value: entry.word,
         }))
     );

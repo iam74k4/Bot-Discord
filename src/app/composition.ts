@@ -1,5 +1,5 @@
 import { once } from 'node:events';
-import { Events } from 'discord.js';
+import { Events, GatewayIntentBits } from 'discord.js';
 import { createClient, type ExtendedClient } from '../client.js';
 import type { AppConfig } from '../config/index.js';
 import { loadCommands } from '../handlers/commandHandler.js';
@@ -74,6 +74,27 @@ interface ShutdownStep {
   run(): void | Promise<void>;
 }
 
+/**
+ * Discord closes the gateway with 4014 ("Used disallowed intents") when the
+ * bot asks for a privileged intent the Developer Portal has not enabled. The
+ * error names neither the intent nor the setting, and Message Content is
+ * only asked for because VOICEVOX_URL is set - so spell that out.
+ */
+export function disallowedIntentsHint(
+  error: unknown,
+  client: ExtendedClient
+): string | null {
+  if (!(error instanceof Error) || !/disallowed intents/i.test(error.message)) {
+    return null;
+  }
+  const readsChat = client.options.intents.has(
+    GatewayIntentBits.MessageContent
+  );
+  return readsChat
+    ? 'Discord refused a privileged intent. In the Developer Portal, open Bot > Privileged Gateway Intents and enable SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT. Message Content is requested because VOICEVOX_URL is set (text-to-speech); unset VOICEVOX_URL to run without /tts.'
+    : 'Discord refused a privileged intent. In the Developer Portal, open Bot > Privileged Gateway Intents and enable SERVER MEMBERS INTENT.';
+}
+
 export function defaultDependencies(): AppDependencies {
   return {
     // Text-to-speech is the only reader of chat, so the privileged intent is
@@ -88,7 +109,13 @@ export function defaultDependencies(): AppDependencies {
     startAllFeatures,
     stopAllFeatures,
     login: async (client, token) => {
-      await client.login(token);
+      try {
+        await client.login(token);
+      } catch (error) {
+        const hint = disallowedIntentsHint(error, client);
+        if (hint) logger.error(hint);
+        throw error;
+      }
     },
     awaitReady: async (client) => {
       if (!client.isReady()) {

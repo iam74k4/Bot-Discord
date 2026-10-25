@@ -199,8 +199,9 @@ describe('/voice status', () => {
       await executeStatusCommand(interaction);
 
       expect(getConnection).toHaveBeenCalledWith('voice-1');
+      // They are in a voice channel; it is just not being kept.
       expect(currentChannelLine(statusEmbed(interaction))).toBe(
-        t('record.autojoin.currentChannelNone', 'en')
+        t('record.autojoin.currentChannelNotKept', 'en')
       );
     });
 

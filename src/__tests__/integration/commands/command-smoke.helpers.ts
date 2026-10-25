@@ -1151,6 +1151,8 @@ export function invokeCommand(
     member: inGuild ? world.actor : null,
     // What Discord sends as the member's permissions in this channel.
     memberPermissions: inGuild ? world.actor.permissions : null,
+    // And the bot's: it can see and post in the text channel.
+    appPermissions: new PermissionsBitField(TEXT_CHANNEL_PERMISSIONS),
     guild: inGuild ? world.guild : null,
     guildId: inGuild ? world.guild.id : null,
     channel,

@@ -75,17 +75,21 @@ describe('/voice status with text-to-speech connections', () => {
     isChannelExcluded.mockReturnValue(false);
   });
 
-  it('does not report a text-to-speech-only connection as buffering', async () => {
-    getConnection.mockReturnValue({ channelId: VC, receiving: false });
-    const fake = interaction();
+  it.each<'en' | 'ja'>(['en', 'ja'])(
+    'says a text-to-speech-only connection is only reading (%s)',
+    async (locale) => {
+      getConnection.mockReturnValue({ channelId: VC, receiving: false });
+      const fake = interaction(locale);
 
-    await run(fake);
+      await run(fake);
 
-    expect(getConnection).toHaveBeenCalledWith(VC);
-    expect(currentChannelLine(fake)).toBe(
-      t('record.autojoin.currentChannelNone', 'en')
-    );
-  });
+      expect(getConnection).toHaveBeenCalledWith(VC);
+      // Not "buffered", and not "you are not in a voice channel" either.
+      expect(currentChannelLine(fake, locale)).toBe(
+        t('record.autojoin.currentChannelReadingOnly', locale)
+      );
+    }
+  );
 
   it.each([
     ['a receiving connection', { channelId: VC, receiving: true }],
@@ -108,7 +112,7 @@ describe('/voice status with text-to-speech connections', () => {
     await run(fake);
 
     expect(currentChannelLine(fake)).toBe(
-      t('record.autojoin.currentChannelNone', 'en')
+      t('record.autojoin.currentChannelNotKept', 'en')
     );
   });
 

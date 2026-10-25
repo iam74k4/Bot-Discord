@@ -191,13 +191,13 @@ person across servers.
 A server's reading dictionary for text-to-speech (`/tts dict`). At most 200
 entries per guild.
 
-| Column     | Type    | Constraints |
-| ---------- | ------- | ----------- |
-| guild_id   | TEXT    | NOT NULL    |
-| word       | TEXT    | NOT NULL    |
-| reading    | TEXT    | NOT NULL    |
-| created_by | TEXT    | NOT NULL    |
-| created_at | INTEGER | NOT NULL    |
+| Column     | Type    | Constraints              |
+| ---------- | ------- | ------------------------ |
+| guild_id   | TEXT    | NOT NULL                 |
+| word       | TEXT    | NOT NULL, COLLATE NOCASE |
+| reading    | TEXT    | NOT NULL                 |
+| created_by | TEXT    | NOT NULL                 |
+| created_at | INTEGER | NOT NULL                 |
 
 PRIMARY KEY (`guild_id`, `word`)
 
@@ -342,6 +342,21 @@ erDiagram
     voice_autojoin_exclusions {
         text guild_id PK
         text channel_id PK
+        integer created_at
+    }
+
+    tts_user_settings {
+        text user_id PK
+        integer speaker_id
+        real speed
+        integer updated_at
+    }
+
+    tts_dictionary {
+        text guild_id PK
+        text word PK
+        text reading
+        text created_by
         integer created_at
     }
 

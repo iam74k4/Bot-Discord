@@ -51,9 +51,11 @@ export const command: Command = {
         .addNumberOption((option) =>
           option
             .setName('speed')
-            .setDescription(`Speed (${MIN_SPEED}–${MAX_SPEED}, default 1.0)`)
+            .setDescription(
+              `Speed (${MIN_SPEED}–${MAX_SPEED.toFixed(1)}, default 1.0)`
+            )
             .setDescriptionLocalizations({
-              ja: `速さ（${MIN_SPEED}〜${MAX_SPEED}、標準は1.0）`,
+              ja: `速さ（${MIN_SPEED}〜${MAX_SPEED.toFixed(1)}、標準は1.0）`,
             })
             .setMinValue(MIN_SPEED)
             .setMaxValue(MAX_SPEED)
@@ -69,19 +71,24 @@ export const command: Command = {
             .setName('add')
             .setDescription('Add or update a reading')
             .setDescriptionLocalizations({ ja: '読み方を登録・更新' })
+            // The example must be safe to copy: words match inside other
+            // words, so a short one (the old example was "w") rewrites every
+            // word that contains it.
             .addStringOption((option) =>
               option
                 .setName('word')
-                .setDescription('Word as written (e.g. w)')
-                .setDescriptionLocalizations({ ja: '書き方（例: w）' })
+                .setDescription('Word as written (e.g. VOICEVOX)')
+                .setDescriptionLocalizations({ ja: '書き方（例: VOICEVOX）' })
                 .setMaxLength(MAX_WORD_LENGTH)
                 .setRequired(true)
             )
             .addStringOption((option) =>
               option
                 .setName('reading')
-                .setDescription('How to read it (e.g. わら)')
-                .setDescriptionLocalizations({ ja: '読み方（例: わら）' })
+                .setDescription('How to read it (e.g. ボイスボックス)')
+                .setDescriptionLocalizations({
+                  ja: '読み方（例: ボイスボックス）',
+                })
                 .setMaxLength(MAX_READING_LENGTH)
                 .setRequired(true)
             )

@@ -42,15 +42,28 @@ export interface TtsSessionInfo {
 export interface TtsPlaybackDeps {
   getPlayer(voiceChannelId: string): AudioPlayer | undefined;
   setSelfMute(voiceChannelId: string, muted: boolean): boolean;
-  synthesize(text: string, speakerId: number, speed: number): Promise<Buffer>;
+  /**
+   * Render a line. `signal` aborts when the line is dropped, skipped or the
+   * session stops, so the engine is not left working on audio nobody plays.
+   */
+  synthesize(
+    text: string,
+    speakerId: number,
+    speed: number,
+    signal: AbortSignal
+  ): Promise<Buffer>;
   /** Resolves when the clip has finished or was stopped. */
   play(player: AudioPlayer, pcm: Buffer): Promise<void>;
 }
 
-/** Lines waiting beyond this are dropped oldest-first. */
+/**
+ * Lines waiting beyond this are dropped, oldest first among those not yet
+ * being synthesized: the lines at the front are already rendering, and
+ * dropping one would waste that work and start rendering another.
+ */
 export const MAX_QUEUE_LENGTH = 10;
 /** Lines rendered ahead of playback. */
-const PREFETCH_COUNT = 2;
+export const PREFETCH_COUNT = 2;
 /** Re-announce a speaker who has been quiet this long. */
 const NAME_REANNOUNCE_MS = 60_000;
 
@@ -58,6 +71,8 @@ interface QueueItem {
   request: SpeechRequest;
   spoken: string;
   audio?: Promise<Buffer | null>;
+  /** Cancels the synthesis request; set together with `audio`. */
+  abort?: AbortController;
   /** Skipped while still being synthesized; never played. */
   skipped?: boolean;
 }
@@ -124,7 +139,8 @@ export class TtsSessionManager {
     };
     this.sessions.set(params.voiceChannelId, session);
 
-    // Muted while idle so the member list shows the bot cannot be heard.
+    // Unmuted for the session; stop() mutes again, so the member list shows
+    // the bot as muted whenever it cannot be heard.
     this.deps.setSelfMute(params.voiceChannelId, false);
     return session.info;
   }
@@ -138,6 +154,9 @@ export class TtsSessionManager {
     if (!session) return false;
 
     session.stopped = true;
+    // Nothing queued will be played; stop the engine working on it.
+    for (const item of session.queue) item.abort?.abort();
+    session.current?.abort?.abort();
     session.queue = [];
     this.sessions.delete(voiceChannelId);
 
@@ -208,7 +227,12 @@ export class TtsSessionManager {
       : request.text;
 
     if (session.queue.length >= MAX_QUEUE_LENGTH) {
-      session.queue.shift();
+      // The front lines are already rendering (MAX_QUEUE_LENGTH is larger
+      // than PREFETCH_COUNT, so a waiting line always exists); drop the oldest
+      // line that has not started instead of throwing that work away.
+      const waiting = session.queue.findIndex((item) => !item.audio);
+      const [dropped] = session.queue.splice(Math.max(waiting, 0), 1);
+      dropped.abort?.abort();
       logger.debug(`TTS queue full in ${voiceChannelId}; dropped oldest line`);
     }
     session.queue.push({ request, spoken });
@@ -224,6 +248,8 @@ export class TtsSessionManager {
     const session = this.sessions.get(voiceChannelId);
     if (!session?.current) return false;
     session.current.skipped = true;
+    // Still rendering: cancel it so the queue moves on without waiting.
+    session.current.abort?.abort();
     this.deps.getPlayer(voiceChannelId)?.stop(true);
     return true;
   }
@@ -232,10 +258,16 @@ export class TtsSessionManager {
     for (const item of session.queue.slice(0, PREFETCH_COUNT)) {
       if (item.audio) continue;
       const { speakerId, speed } = item.request;
+      const abort = new AbortController();
+      item.abort = abort;
       item.audio = this.deps
-        .synthesize(item.spoken, speakerId, speed)
+        .synthesize(item.spoken, speakerId, speed, abort.signal)
         .catch((error: unknown) => {
-          logger.warn(`TTS synthesis failed: ${getErrorMessage(error)}`);
+          if (abort.signal.aborted) {
+            logger.debug('TTS synthesis cancelled');
+          } else {
+            logger.warn(`TTS synthesis failed: ${getErrorMessage(error)}`);
+          }
           return null;
         });
     }
@@ -302,11 +334,23 @@ export function playPcm(player: AudioPlayer, pcm: Buffer): Promise<void> {
       logger.debug(`TTS playback error: ${getErrorMessage(error)}`);
       finish();
     };
-    const timeout = setTimeout(finish, playbackDurationMs(pcm) + 5_000);
+    const timeout = setTimeout(
+      () => {
+        // Stop it too, so a clip that was only stuck cannot resume later over
+        // the next one.
+        player.stop(true);
+        finish();
+      },
+      playbackDurationMs(pcm) + 5_000
+    );
 
     player.on(AudioPlayerStatus.Idle, finish);
     player.on('error', onError);
-    player.play(resource);
+    try {
+      player.play(resource);
+    } catch (error) {
+      onError(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }
 
@@ -314,12 +358,12 @@ export const ttsSessions = new TtsSessionManager({
   getPlayer: (voiceChannelId) => connectionManager.getPlayer(voiceChannelId),
   setSelfMute: (voiceChannelId, muted) =>
     connectionManager.setSelfMute(voiceChannelId, muted),
-  synthesize: (text, speakerId, speed) => {
+  synthesize: (text, speakerId, speed, signal) => {
     const client = getVoicevoxClient();
     if (!client) {
       return Promise.reject(new VoicevoxError('VOICEVOX_URL is not set'));
     }
-    return client.synthesize(text, speakerId, speed);
+    return client.synthesize(text, speakerId, speed, signal);
   },
   play: playPcm,
 });

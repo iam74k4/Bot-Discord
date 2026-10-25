@@ -94,11 +94,15 @@ See [.env.example](.env.example) for all configuration options and [docs/deploym
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
 2. Create a new application or select existing one
 3. Go to "Bot" section and copy the token
-4. **Enable Privileged Intents**: Go to "Bot" > Enable `SERVER MEMBERS INTENT`
+4. **Enable Privileged Intents**: Go to "Bot" > Enable `SERVER MEMBERS INTENT`.
+   If you set `VOICEVOX_URL` (text-to-speech), also enable
+   `MESSAGE CONTENT INTENT`: the bot then requests it, and Discord refuses the
+   login (so the whole bot fails to start) when it is not enabled
 5. Go to "OAuth2" > "General" and copy the Client ID
 6. Go to "OAuth2" > "URL Generator":
    - Select scopes: `bot`, `applications.commands`
-   - Select bot permissions: `Send Messages`, `Use Slash Commands`, `Embed Links`
+   - Select bot permissions: `Send Messages`, `Use Slash Commands`,
+     `Embed Links`, `Connect` (voice features), `Speak` (`/tts`)
    - Use the generated URL to invite the bot to your server
 
 ## Usage
@@ -206,14 +210,14 @@ are gone — use `/community poll end` to close a short poll when you are done.
 
 ### Voice (`/voice`)
 
-| Command                             | Description                                   |
-| ----------------------------------- | --------------------------------------------- |
-| `/voice record <duration>`          | Record past audio from your voice channel     |
-| `/voice status`                     | Show buffer window, auto-join state, capacity |
-| `/voice autojoin enable`            | Allow the bot to join occupied voice channels |
-| `/voice autojoin disable`           | Stop joining and buffering in this server     |
-| `/voice autojoin exclude <channel>` | Keep the bot out of one voice channel         |
-| `/voice autojoin include <channel>` | Remove a channel from the exclusion list      |
+| Command                             | Description                                    |
+| ----------------------------------- | ---------------------------------------------- |
+| `/voice record <duration>`          | Record past audio from your voice channel      |
+| `/voice status`                     | Show buffer window, auto-join state, capacity  |
+| `/voice autojoin enable`            | Allow the bot to join occupied voice channels  |
+| `/voice autojoin disable`           | Stop auto-joining and buffering in this server |
+| `/voice autojoin exclude <channel>` | Stop auto-joining and buffering one channel    |
+| `/voice autojoin include <channel>` | Remove a channel from the exclusion list       |
 
 **Options:**
 
@@ -230,7 +234,9 @@ are gone — use `/community poll end` to close a short poll when you are done.
   chat saying audio is being kept and how to turn it off
 - Opt-out: `/voice autojoin disable` (whole server) or
   `/voice autojoin exclude <channel>` (one channel). Both also drop any
-  connection already buffering
+  connection already buffering. `/tts start` can still bring the bot in, but
+  deafened and without keeping audio, and the opt-outs leave such a reading
+  join alone
 - In-memory ring buffer of `AUDIO_BUFFER_DURATION` seconds (default: 300 = 5
   minutes), about **82MB per voice channel**, allocated the first time someone
   actually speaks — a channel the bot sits in silently costs nothing. Multiply
@@ -272,14 +278,22 @@ Available when the bot operator sets `VOICEVOX_URL` (see
 - The speaker's name is announced when the speaker changes (or after a minute
   of quiet), so listeners know who is talking
 - URLs, code blocks, spoilers, and long messages are summarised (`URL省略`,
-  `コード省略`, `ネタバレ`, `以下略`); mentions are read as names, emoji are
-  dropped, and trailing `www` is read as laughter
+  `コード省略`, `ネタバレ`, `以下略`); mentions and custom emoji are read as
+  names, other emoji are dropped, and trailing `www` is read as laughter
 - Each member picks their own voice; it follows them across servers
 - Anyone can start reading or add dictionary words; only members in the
   channel being read (or with Manage Server) can stop or skip, and only the
-  member who added a word (or Manage Server) can remove it
+  member who added a word (or Manage Server) can change or remove it
 - If the server has turned auto-join off, the bot joins deafened and keeps no
-  audio; it is unmuted only while a reading session is running
+  audio; it is unmuted only while a reading session is running. If auto-join
+  is turned back on during the session, `/tts stop` hands the channel back to
+  auto-join (and posts the buffering notice) instead of leaving
+- Stage channels are not supported: the bot would join as a listener and could
+  not be heard. In a text channel the bot cannot view, only the voice
+  channel's own chat is read, and `/tts start` says so
+- Credits: the public `/tts start` message names the VOICEVOX voices in use
+  (for example `VOICEVOX:ずんだもん`, the default), and switching voice during a
+  session posts the new voice's credit; each character's own terms apply
 
 ### Memory
 

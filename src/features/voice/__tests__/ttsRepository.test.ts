@@ -173,25 +173,28 @@ describe('ttsRepository', () => {
       ).toEqual({ created_at: T0 });
     });
 
-    it('updates an existing word in place and reports it as not new', () => {
+    it('updates an existing word in place, keeping who added it and when', () => {
       ttsRepository.upsertDictionaryEntry('g1', 'w', 'わら', 'u1');
       vi.setSystemTime(T0 + 1_000);
 
+      // u2 stands for a server manager editing u1's word.
       expect(ttsRepository.upsertDictionaryEntry('g1', 'w', 'くさ', 'u2')).toBe(
         false
       );
 
+      // Ownership decides who may change or remove it, so an edit must not
+      // transfer it.
       expect(ttsRepository.getDictionaryEntry('g1', 'w')).toEqual({
         word: 'w',
         reading: 'くさ',
-        createdBy: 'u2',
+        createdBy: 'u1',
       });
       expect(ttsRepository.countDictionary('g1')).toBe(1);
       expect(
         db
           .prepare('SELECT created_at FROM tts_dictionary WHERE word = ?')
           .get('w')
-      ).toEqual({ created_at: T0 + 1_000 });
+      ).toEqual({ created_at: T0 });
     });
 
     it('lists a server’s words alphabetically, scoped to that server', () => {
@@ -222,8 +225,9 @@ describe('ttsRepository', () => {
         ttsRepository.upsertDictionaryEntry('g1', 'abc', 'あぶく', 'u2')
       ).toBe(false);
       expect(ttsRepository.countDictionary('g1')).toBe(1);
+      // The case variant is the same word: still u1's.
       expect(ttsRepository.listDictionary('g1')).toEqual([
-        { word: 'abc', reading: 'あぶく', createdBy: 'u2' },
+        { word: 'abc', reading: 'あぶく', createdBy: 'u1' },
       ]);
       expect(ttsRepository.removeDictionaryEntry('g1', 'Abc')).toBe(true);
       expect(ttsRepository.countDictionary('g1')).toBe(0);

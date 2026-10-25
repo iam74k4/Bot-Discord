@@ -77,26 +77,52 @@ runs as its own service next to the bot:
 
 1. In the same Railway project, add a service from the Docker image
    `voicevox/voicevox_engine:cpu-latest`. It listens on port `50021` and needs
-   no volume.
-2. Set `VOICEVOX_URL` on the bot to the engine's private address, e.g.
+   no volume. Name the service `voicevox`, or note the private domain shown
+   under the service's **Settings → Networking**: Railway derives it from the
+   service name, and a service created from an image is usually named after
+   the image instead.
+2. Set `VOICEVOX_URL` on the bot to the engine's private address,
+   `http://<private-domain>:50021` - for a service named `voicevox`,
    `http://voicevox.railway.internal:50021`. Keeping the engine on private
    networking means it is never exposed to the internet.
+
+   The image listens on IPv4 only (`VV_HOST=0.0.0.0`). Railway environments
+   created before October 16, 2025 have an IPv6-only private network, so there
+   the bot cannot connect until you set `VV_HOST=::` on the VOICEVOX service.
+   `::` works in newer environments too, so setting it is always safe. If
+   `/tts start` keeps answering that it cannot reach the speech engine, check
+   the domain and this variable first.
+
 3. In the Discord Developer Portal, open **Bot → Privileged Gateway Intents** and
    turn on **MESSAGE CONTENT INTENT**. The bot only requests that intent when
    `VOICEVOX_URL` is set, and Discord refuses the login (close code 4014) if it
-   is requested without being enabled. Apps with fewer than 10,000 users can
-   toggle it directly; larger apps must apply for it.
+   is requested without being enabled; the bot then logs which intents to
+   enable before exiting. Apps with fewer than 10,000 users can toggle it
+   directly; larger apps must apply for it.
 4. Give the bot the **Speak** permission in voice channels where people will use
    it.
 
 Playback needs no ffmpeg: the bot asks VOICEVOX for 48 kHz stereo audio and
-encodes it to Opus with the bundled encoder. VOICEVOX requires a credit for the
-voices used (for example `VOICEVOX:ずんだもん`); the bot shows it in `/tts`
-replies, and each character's own terms apply.
+encodes it to Opus with the bundled encoder.
+
+VOICEVOX and each character's terms require a credit (for example
+`VOICEVOX:ずんだもん`). The public `/tts start` message credits the default
+voice and the voices of everyone in the channel at that moment, and switching
+voice during a session posts the new voice's credit in the channel being read.
+A member who joins later with a voice of their own is not credited until they
+change it, so you may also want to list the characters your members use in the
+bot's **About Me** in the Developer Portal.
 
 Where a server has turned auto-join off (`/voice autojoin disable` or an
 excluded channel), `/tts start` still joins, but deafened and without buffering
-any audio, so reading never overrides that choice.
+any audio, so reading never overrides that choice; turning auto-join off or
+excluding the channel later leaves such a join alone. A connection that does
+buffer is still dropped by those commands, which ends any reading through it
+(the channel is told, and `/tts start` resumes reading deafened).
+
+With `VOICEVOX_URL` set the bot receives every guild message, but it keeps no
+message cache (discord.js would otherwise hold the last 200 per channel), so
+reading adds no memory to the sizing above.
 
 ### 4. Choose how production deploys run
 

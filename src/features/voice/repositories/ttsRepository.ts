@@ -99,7 +99,12 @@ function getDictionaryEntry(
     : null;
 }
 
-/** Insert or overwrite; returns true when the word was new. */
+/**
+ * Insert or overwrite; returns true when the word was new. An overwrite keeps
+ * the original author and date: who may change or remove a word is decided by
+ * who added it, so an edit (by them or a server manager) must not hand it to
+ * the editor.
+ */
 function upsertDictionaryEntry(
   guildId: string,
   word: string,
@@ -113,9 +118,7 @@ function upsertDictionaryEntry(
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(guild_id, word) DO UPDATE SET
          word = excluded.word,
-         reading = excluded.reading,
-         created_by = excluded.created_by,
-         created_at = excluded.created_at`
+         reading = excluded.reading`
     )
     .run(guildId, word, reading, createdBy, Date.now());
   return !existed;

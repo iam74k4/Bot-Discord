@@ -110,14 +110,22 @@ const voice = vi.hoisted(() => {
           return connection;
         }
       ),
-      waitUntilReady: vi.fn(async (channelId: string) =>
-        connections.has(channelId)
+      // The connection once ready, or null, like the real one.
+      waitUntilReady: vi.fn(
+        async (channelId: string) => connections.get(channelId) ?? null
       ),
+      enableReceive: vi.fn((channelId: string) => {
+        const connection = connections.get(channelId);
+        if (!connection || connection.receiving !== false) return false;
+        connection.receiving = true;
+        return true;
+      }),
       getPlayer: vi.fn((channelId: string) =>
         connections.has(channelId) ? player : undefined
       ),
       setSelfMute: vi.fn((channelId: string) => connections.has(channelId)),
-      disconnect: vi.fn(async (channelId: string) => {
+      disconnect: vi.fn(async (channelId: string, expected?: unknown) => {
+        if (expected && connections.get(channelId) !== expected) return;
         connections.delete(channelId);
       }),
     },
@@ -145,6 +153,7 @@ const voicevox = vi.hoisted(() => {
     client: {
       isAvailable: vi.fn(async () => true),
       listVoices: vi.fn(async () => [...voices]),
+      cachedVoices: vi.fn(() => null),
       findVoice: vi.fn(async (id: number) => voices.find((v) => v.id === id)),
       // 20 ms of 48 kHz stereo s16le silence.
       synthesize: vi.fn(async () => Buffer.alloc(3840)),
@@ -375,8 +384,10 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
     voice.connections.clear();
   },
   'tts stop': (world) => {
-    // The bot joined only to read (nothing is buffered), so stopping also
-    // leaves the channel.
+    // The server has auto-join off, so the bot joined only to read (nothing
+    // is buffered) and stopping also leaves the channel. (With auto-join on,
+    // stopping would hand the channel back to it instead.)
+    voiceSettingsRepository.setAutoJoinEnabled(world.guild.id, false);
     voice.connections.set(world.voiceChannel.id, {
       channelId: world.voiceChannel.id,
       guildId: world.guild.id,
