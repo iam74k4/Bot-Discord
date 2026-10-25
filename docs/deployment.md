@@ -64,8 +64,6 @@ In Railway dashboard, add the following variables:
 
 `ALLOWED_GUILD_IDS` is for a staging bot ([operations.md](operations.md)). When set, the bot leaves any server outside the list as soon as it is added there, and in servers outside the list that it was already in it serves nothing: commands, buttons and forms get a short private notice, and it neither auto-joins voice channels nor posts welcomes or VC notices there. It does not leave those servers by itself, so a wrong value costs a config fix rather than every server. Startup lists them in the logs. Direct messages are always served.
 
-`ALLOWED_GUILD_IDS` is for a staging bot ([operations.md](operations.md)). When set, the bot leaves any server outside the list as soon as it is added there, and refuses commands with a short notice in servers outside the list that it was already in - it does not leave those by itself, so a wrong value costs a config fix rather than every server. Startup lists them in the logs. Direct messages are always served.
-
 If you enable voice recording in production, remember that `/voice record` now requires `Manage Server`, and generated files are delivered ephemerally and cleaned up automatically according to `RECORDING_RETENTION_HOURS`.
 
 Size the instance from `AUDIO_BUFFER_DURATION × 0.27MB × MAX_CONCURRENT_VC_CONNECTIONS` — about 410MB at the defaults — plus the bot's baseline, and set `MEMORY_LIMIT_MB` to the memory the host actually grants. That is the worst case, not the steady state: a channel's buffer is allocated on its first decoded audio chunk, so idle connections cost nothing. Servers that do not want the bot buffering their voice channels can turn it off per guild or per channel with `/voice autojoin`.
