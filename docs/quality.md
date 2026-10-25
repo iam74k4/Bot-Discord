@@ -85,6 +85,9 @@ This document describes the quality standards and practices for this Discord bot
   testing (deliberately breaking conditions, calls and boundaries in the
   source and checking a test fails); prefer assertions that would catch such a
   change over call-count or call-order checks.
+- Test helpers: cross-feature fakes live in `src/__tests__/helpers/`; helpers
+  only one feature needs live next to its tests as
+  `<feature>/__tests__/<feature>.helpers.ts`. Both are excluded from coverage.
 - Database tests use an in-memory SQLite (`new Database(':memory:')`) with the
   real migrations, never `data/*.db`; time-based tests use fake timers.
 

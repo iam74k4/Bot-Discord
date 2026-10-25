@@ -301,10 +301,11 @@ describe('voice daily stats rollup', () => {
     });
 
     // KNOWN BUG (voiceSessionRepository.ts getUserChannelStats): it selects a
-    // bare `channel_name` under `GROUP BY channel_id`, and SQLite hands back
-    // the earliest day's row, so `/notification stats` keeps showing the old
-    // name for as long as that day is inside the period. Drop `.fails` once
-    // the query picks the name from the most recent day.
+    // bare `channel_name` under `GROUP BY channel_id`, so SQLite returns the
+    // name from an arbitrary row of the group - in practice the earliest day
+    // today - and `/notification stats` can keep showing an old name. Drop
+    // `.fails` only once the query explicitly picks the most recent day's
+    // name, not because SQLite happens to pick a different row.
     it.fails('shows the name the channel has now', () => {
       expect(
         voiceSessionRepository.getUserChannelStats(GUILD, USER)[0].channel_name
