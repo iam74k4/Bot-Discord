@@ -11,6 +11,13 @@ updates:
       prefix: 'build'
     labels:
       - 'dependencies'
+    groups:
+      # vitest and its coverage provider pin each other's exact version, so
+      # separate PRs can never be installed one at a time.
+      vitest:
+        patterns:
+          - 'vitest'
+          - '@vitest/*'
 
   - package-ecosystem: 'github-actions'
     directory: '/'
@@ -24,3 +31,9 @@ updates:
     labels:
       - 'dependencies'
       - 'github-actions'
+    groups:
+      # Every github/codeql-action step in a workflow must run the same
+      # version; one PR per step fails CodeQL on each of them.
+      codeql-action:
+        patterns:
+          - 'github/codeql-action*'
