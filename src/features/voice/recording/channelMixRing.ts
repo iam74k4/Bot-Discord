@@ -148,6 +148,11 @@ export class ChannelMixRingManager {
     this.rings.delete(channelId);
   }
 
+  /** Whether this channel holds a ring, i.e. has buffered any audio. */
+  has(channelId: string): boolean {
+    return this.rings.has(channelId);
+  }
+
   extractLastSeconds(
     channelId: string,
     seconds: number,

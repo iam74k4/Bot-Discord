@@ -15,6 +15,12 @@ export interface AppConfig {
   readonly DISCORD_TOKEN: string;
   readonly DISCORD_CLIENT_ID: string;
   readonly DISCORD_GUILD_ID: string | null;
+  /**
+   * Servers this deployment may serve. Empty means every server. A staging
+   * bot sets it to the developer's own server as a second lock behind a
+   * private Discord application; see docs/deployment.md.
+   */
+  readonly ALLOWED_GUILD_IDS: readonly string[];
   readonly BOT_OWNER_IDS: readonly string[];
   readonly NODE_ENV: NodeEnv;
   readonly isDevelopment: boolean;
@@ -41,6 +47,12 @@ export interface AppConfig {
   readonly TZ: string;
   readonly ALERT_WEBHOOK_URL: string;
   readonly LOG_LEVEL: string;
+
+  /**
+   * Base URL of a VOICEVOX engine (e.g. http://voicevox.railway.internal:50021).
+   * Empty disables text-to-speech, and with it the Message Content intent.
+   */
+  readonly VOICEVOX_URL: string;
 }
 
 export interface ConfigResult {
@@ -63,6 +75,28 @@ function parseOwnerIds(value: string | undefined): string[] {
     .split(',')
     .map((id) => id.trim())
     .filter(Boolean);
+}
+
+const SNOWFLAKE = /^\d{17,20}$/;
+
+/**
+ * A comma-separated list of server IDs. A typo here would lock the bot out of
+ * the server it was meant for, so anything that is not a snowflake is an
+ * error rather than a silently dropped entry.
+ */
+function parseGuildIds(
+  value: string | undefined,
+  envKey: string,
+  errors: string[]
+): string[] {
+  const ids = parseOwnerIds(value);
+  const invalid = ids.filter((id) => !SNOWFLAKE.test(id));
+  if (invalid.length > 0) {
+    errors.push(
+      `${envKey} must be comma-separated Discord server IDs; not an ID: ${invalid.join(', ')}`
+    );
+  }
+  return [...new Set(ids)];
 }
 
 function isWithinWorkspaceRoot(baseDir: string, targetPath: string): boolean {
@@ -155,6 +189,25 @@ function parseAlertWebhook(source: EnvSource): string {
   return url;
 }
 
+function parseVoicevoxUrl(source: EnvSource): string {
+  const raw = source.VOICEVOX_URL?.trim();
+  if (!raw) return '';
+
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('VOICEVOX_URL is not a valid URL');
+  }
+  // Plain http is allowed on purpose: the engine normally sits on a private
+  // network next to the bot (Railway internal networking, docker compose).
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('VOICEVOX_URL must use http or https');
+  }
+
+  return raw.replace(/\/+$/, '');
+}
+
 function parseNodeEnv(source: EnvSource, warnings: string[]): NodeEnv {
   const value = source.NODE_ENV;
   if (!value) return 'development';
@@ -175,6 +228,7 @@ export function parseConfig(source: EnvSource): ConfigResult {
 
   requireKeys(source);
   const alertWebhookUrl = parseAlertWebhook(source);
+  const voicevoxUrl = parseVoicevoxUrl(source);
   const nodeEnv = parseNodeEnv(source, warnings);
 
   const num = (key: keyof AppConfig & string, fallback: number) =>
@@ -231,6 +285,22 @@ export function parseConfig(source: EnvSource): ConfigResult {
     errors.push('SHUTDOWN_TIMEOUT_MS must be between 5000 and 120000');
   }
 
+  const guildId = source.DISCORD_GUILD_ID || null;
+  const allowedGuildIds = parseGuildIds(
+    source.ALLOWED_GUILD_IDS,
+    'ALLOWED_GUILD_IDS',
+    errors
+  );
+  if (
+    guildId &&
+    allowedGuildIds.length > 0 &&
+    !allowedGuildIds.includes(guildId)
+  ) {
+    warnings.push(
+      `DISCORD_GUILD_ID (${guildId}) is not in ALLOWED_GUILD_IDS; commands will be registered to a server the bot refuses to serve`
+    );
+  }
+
   const ownerIds = parseOwnerIds(source.BOT_OWNER_IDS);
   if (ownerIds.length === 0) {
     if (nodeEnv === 'production') {
@@ -253,7 +323,8 @@ export function parseConfig(source: EnvSource): ConfigResult {
     config: {
       DISCORD_TOKEN: source.DISCORD_TOKEN!,
       DISCORD_CLIENT_ID: source.DISCORD_CLIENT_ID!,
-      DISCORD_GUILD_ID: source.DISCORD_GUILD_ID || null,
+      DISCORD_GUILD_ID: guildId,
+      ALLOWED_GUILD_IDS: allowedGuildIds,
       BOT_OWNER_IDS: ownerIds,
       NODE_ENV: nodeEnv,
       isDevelopment: nodeEnv !== 'production',
@@ -294,6 +365,7 @@ export function parseConfig(source: EnvSource): ConfigResult {
       TZ: source.TZ || 'UTC',
       ALERT_WEBHOOK_URL: alertWebhookUrl,
       LOG_LEVEL: source.LOG_LEVEL || '',
+      VOICEVOX_URL: voicevoxUrl,
     },
   };
 }

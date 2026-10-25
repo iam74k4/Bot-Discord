@@ -1,0 +1,702 @@
+import { describe, expect, it } from 'vitest';
+import {
+  applyDictionary,
+  buildMessageSpeech,
+  dictionaryKey,
+  foldForSpeech,
+  isMarkedSilent,
+  MAX_INPUT_LENGTH,
+  MAX_NAME_LENGTH,
+  MAX_SPEECH_LENGTH,
+  normalizeForSpeech,
+  speakableName,
+  SPEECH_PATTERNS,
+  type DictionaryRule,
+  type SpeechContext,
+} from '../tts/textNormalizer.js';
+
+/**
+ * The normalizer is pure: everything Discord-specific arrives through the
+ * context, so each rule is checked on its own with a tiny fake guild.
+ */
+const USERS: Record<string, string> = { '111': 'たろう' };
+const ROLES: Record<string, string> = { '222': '管理者' };
+const CHANNELS: Record<string, string> = { '333': '雑談' };
+
+function context(dictionary: DictionaryRule[] = []): SpeechContext {
+  return {
+    resolveUser: (id) => USERS[id],
+    resolveRole: (id) => ROLES[id],
+    resolveChannel: (id) => CHANNELS[id],
+    dictionary,
+  };
+}
+
+const speak = (text: string, dictionary: DictionaryRule[] = []) =>
+  normalizeForSpeech(text, context(dictionary));
+
+describe('isMarkedSilent', () => {
+  it.each([
+    [';内緒', true],
+    ['；全角', true],
+    ['   ;leading spaces', true],
+    ['\t\n;tabs and newlines', true],
+    ['　；ideographic space', true],
+    ['not; silent', false],
+    ['普通の発言', false],
+    ['', false],
+    [':colon', false],
+  ])('%j -> %s', (content, expected) => {
+    expect(isMarkedSilent(content)).toBe(expected);
+  });
+});
+
+describe('applyDictionary', () => {
+  it('returns the text unchanged with an empty dictionary or text', () => {
+    expect(applyDictionary('abc', [])).toBe('abc');
+    expect(applyDictionary('', [{ word: 'a', reading: 'えー' }])).toBe('');
+  });
+
+  it('ignores rules with an empty word', () => {
+    expect(applyDictionary('abc', [{ word: '', reading: 'x' }])).toBe('abc');
+  });
+
+  it('matches case-insensitively and replaces every occurrence', () => {
+    expect(
+      applyDictionary('ABC abc Abc', [{ word: 'abc', reading: 'えーびーしー' }])
+    ).toBe('えーびーしー えーびーしー えーびーしー');
+  });
+
+  it('prefers the longest word regardless of rule order', () => {
+    const rules = [
+      { word: '東京', reading: 'とうきょう' },
+      { word: '東京タワー', reading: 'とうきょうたわー' },
+    ];
+    expect(applyDictionary('東京タワーと東京', rules)).toBe(
+      'とうきょうたわーととうきょう'
+    );
+    expect(applyDictionary('東京タワーと東京', [...rules].reverse())).toBe(
+      'とうきょうたわーととうきょう'
+    );
+  });
+
+  it('never rewrites a reading with a later rule (single pass)', () => {
+    // a -> b, then b -> c must not chain into "cc".
+    expect(
+      applyDictionary('ab', [
+        { word: 'a', reading: 'b' },
+        { word: 'b', reading: 'c' },
+      ])
+    ).toBe('bc');
+  });
+
+  it('treats regex metacharacters in words literally', () => {
+    expect(applyDictionary('a.b a+b', [{ word: '.', reading: 'ドット' }])).toBe(
+      'aドットb a+b'
+    );
+    expect(
+      applyDictionary('C++ と C', [{ word: 'C++', reading: 'しーぷら' }])
+    ).toBe('しーぷら と C');
+  });
+
+  it('leaves a case-insensitive match it cannot map back to a rule untouched', () => {
+    // /σ/i also matches final sigma ς, whose lower case is not σ.
+    expect(applyDictionary('ς σ', [{ word: 'σ', reading: 'しぐま' }])).toBe(
+      'ς しぐま'
+    );
+  });
+
+  it('uses the first rule among case-insensitive duplicates of equal length', () => {
+    expect(
+      applyDictionary('Bot', [
+        { word: 'BOT', reading: 'ぼっと' },
+        { word: 'bot', reading: 'ぼと' },
+      ])
+    ).toBe('ぼっと');
+  });
+});
+
+describe('normalizeForSpeech', () => {
+  describe('links and code', () => {
+    it('replaces bare URLs with URL省略', () => {
+      expect(speak('見て https://example.com/a?b=c これ')).toBe(
+        '見て URL省略 これ'
+      );
+      expect(speak('http://example.com')).toBe('URL省略');
+      expect(speak('<https://example.com/embedless>')).toBe('URL省略');
+    });
+
+    it('keeps the visible text of masked links', () => {
+      expect(speak('[公式サイト](https://example.com) を見て')).toBe(
+        '公式サイト を見て'
+      );
+      expect(speak('[docs](<https://example.com/x>)')).toBe('docs');
+    });
+
+    it('replaces fenced code blocks with コード省略', () => {
+      expect(speak('before ```ts\nconst a = 1;\nhttps://x.y\n``` after')).toBe(
+        'before コード省略 after'
+      );
+    });
+
+    it('strips inline code backticks and markdown emphasis', () => {
+      expect(speak('**bold** __under__ ~~strike~~ `code`')).toBe(
+        'bold under strike code'
+      );
+    });
+
+    it('replaces spoilers with ネタバレ', () => {
+      expect(speak('犯人は ||あの人|| だった')).toBe('犯人は ネタバレ だった');
+      expect(speak('||https://example.com||')).toBe('ネタバレ');
+    });
+
+    it('drops quote and heading markers', () => {
+      expect(speak('> 引用')).toBe('引用');
+      expect(speak('>>> 長い引用')).toBe('長い引用');
+      expect(speak('# 見出し')).toBe('見出し');
+      expect(speak('-# 小さい字')).toBe('小さい字');
+    });
+  });
+
+  describe('Discord markup', () => {
+    it('reads custom emoji by name with underscores as spaces', () => {
+      expect(speak('hi <:pepe_happy:123456789> there')).toBe(
+        'hi pepe happy there'
+      );
+      expect(speak('<a:dance:987654321>')).toBe('dance');
+    });
+
+    it('resolves user mentions, including the legacy nickname form', () => {
+      expect(speak('<@111> と <@!111>')).toBe('たろう と たろう');
+    });
+
+    it('falls back to だれか for unknown users', () => {
+      expect(speak('<@999>')).toBe('だれか');
+    });
+
+    it('resolves role mentions, falling back to ロール', () => {
+      expect(speak('<@&222> <@&999>')).toBe('管理者 ロール');
+    });
+
+    it('resolves channel mentions, falling back to チャンネル', () => {
+      expect(speak('<#333> <#999>')).toBe('雑談 チャンネル');
+    });
+
+    it('reads @everyone and @here as みなさん', () => {
+      expect(speak('@everyone 集合 @here')).toBe('みなさん 集合 みなさん');
+    });
+
+    it('reads slash command mentions and timestamps', () => {
+      expect(speak('</tts start:123>')).toBe('tts start');
+      expect(speak('<t:1700000000:R> に集合')).toBe('日時 に集合');
+      expect(speak('<t:1700000000>')).toBe('日時');
+    });
+  });
+
+  describe('unicode emoji', () => {
+    it.each([
+      ['plain', 'a👍b', 'a b'],
+      ['ZWJ family', '👨‍👩‍👧 家族', '家族'],
+      ['ZWJ with skin tone', '👩🏽‍💻 開発', '開発'],
+      ['flag', '🇯🇵 日本', '日本'],
+      ['rainbow flag (VS16 + ZWJ)', '🏳️‍🌈 虹', '虹'],
+      ['skin tone', '👍🏽 いいね', 'いいね'],
+      ['only emoji', '😀😀😀', ''],
+    ])('removes %s', (_label, input, expected) => {
+      expect(speak(input)).toBe(expected);
+    });
+
+    it('removes the keycap marks but keeps the base character', () => {
+      // Documenting current behaviour: 1️⃣ is read as its digit.
+      expect(speak('1️⃣ ばん')).toBe('1 ばん');
+      expect(speak('#️⃣')).toBe('#');
+      expect(speak('1️⃣')).not.toContain('⃣');
+      expect(speak('1️⃣')).not.toContain('️');
+    });
+  });
+
+  describe('whitespace and newlines', () => {
+    it('turns newlines into 、 and collapses runs', () => {
+      expect(speak('行1\n行2\r\n\n行3')).toBe('行1、行2、行3');
+    });
+
+    it('collapses spaces (including ideographic) and trims the ends', () => {
+      expect(speak('  あ \t　 い  ')).toBe('あ い');
+    });
+
+    it('trims leading and trailing 、', () => {
+      expect(speak('\nあ\n')).toBe('あ');
+    });
+
+    it('treats a lone carriage return and Unicode line breaks as newlines', () => {
+      expect(speak('a\rb\u2028c\u2029d')).toBe('a、b、c、d');
+    });
+
+    it('collapses any whitespace, not only spaces and tabs', () => {
+      expect(speak('あ\u00a0\u00a0い\u2003う')).toBe('あ い う');
+      expect(speak('あ \u00a0、\u00a0 、い')).toBe('あ、い');
+    });
+
+    it('keeps a quote marker on a later line from swallowing blank lines', () => {
+      expect(speak('a\n\n  > 引用')).toBe('a、引用');
+    });
+
+    it('returns an empty string when nothing readable remains', () => {
+      expect(speak('')).toBe('');
+      expect(speak('   \n  ')).toBe('');
+      expect(speak('👍')).toBe('');
+      expect(speak('**``**')).toBe('');
+    });
+  });
+
+  describe('laughter', () => {
+    it.each([
+      ['草www', '草わら'],
+      ['ｗｗｗ', 'わら'],
+      ['w', 'わら'],
+      ['そうだねw', 'そうだねわら'],
+      ['まじかww!', 'まじかわら!'],
+      ['ww\nうける', 'わら、うける'],
+      ['ww ww', 'わら わら'],
+    ])('%j -> %j', (input, expected) => {
+      expect(speak(input)).toBe(expected);
+    });
+
+    it.each(['new', 'wow', 'awww', 'www.example', 'show'])(
+      'leaves English words like %j alone',
+      (input) => {
+        expect(speak(input)).toBe(input);
+      }
+    );
+
+    it('leaves a fullwidth run after an English word alone (only folded)', () => {
+      expect(speak('lolｗｗｗ')).toBe('lolwww');
+    });
+
+    it.each([
+      ['草ｗｗ', '草わら'],
+      ['ｗwｗ', 'わら'],
+      ['あｗ。いｗ', 'あわら。いわら'],
+    ])('reads mixed and fullwidth runs %j -> %j', (input, expected) => {
+      expect(speak(input)).toBe(expected);
+    });
+
+    it('lets the dictionary win over the w rule', () => {
+      expect(speak('草w', [{ word: 'w', reading: 'ダブリュー' }])).toBe(
+        '草ダブリュー'
+      );
+      expect(speak('草ｗ', [{ word: 'ｗ', reading: 'だぶ' }])).toBe('草だぶ');
+    });
+  });
+
+  describe('compatibility forms', () => {
+    it('reads fullwidth, halfwidth and circled forms as their plain form', () => {
+      expect(speak('ＡＢＣ ｶﾀｶﾅ ① ｗ')).toBe('ABC カタカナ 1 わら');
+    });
+
+    it('still drops emoji that NFKC would turn into letters', () => {
+      expect(speak('™ ℹ️ Ⓜ️ ㊗️ ok')).toBe('ok');
+    });
+
+    it('folds resolved names too, so the dictionary matches them', () => {
+      const ctx = { ...context([{ word: 'taro', reading: 'たろー' }]) };
+      ctx.resolveUser = () => 'ＴＡＲＯ';
+      expect(normalizeForSpeech('<@1>', ctx)).toBe('たろー');
+    });
+  });
+
+  describe('dictionary', () => {
+    it.each([
+      ['fullwidth', 'ａｌｉｃｅ と ＡＬＩＣＥ と alice', 'ＡＬＩＣＥ'],
+      ['accented', 'café と CAFÉ', 'Café'],
+      ['Greek', 'αλίκη と ΑΛΊΚΗ', 'Αλίκη'],
+    ])(
+      'matches %s case variants of a word as one word',
+      (_label, text, word) => {
+        const read = speak(text, [{ word, reading: 'よみ' }]);
+        expect(read).toBe(
+          text
+            .split(' と ')
+            .map(() => 'よみ')
+            .join(' と ')
+        );
+      }
+    );
+
+    it('applies the dictionary case-insensitively to normalized text', () => {
+      expect(
+        speak('VOICEVOX と voicevox', [
+          { word: 'voicevox', reading: 'ボイスボックス' },
+        ])
+      ).toBe('ボイスボックス と ボイスボックス');
+    });
+
+    it('applies the dictionary to resolved mention names', () => {
+      expect(speak('<@111>', [{ word: 'たろう', reading: 'タロー' }])).toBe(
+        'タロー'
+      );
+    });
+  });
+
+  describe('length limits', () => {
+    it(`keeps exactly ${MAX_SPEECH_LENGTH} characters`, () => {
+      const text = 'あ'.repeat(MAX_SPEECH_LENGTH);
+      expect(speak(text)).toBe(text);
+    });
+
+    it(`cuts longer text at ${MAX_SPEECH_LENGTH} with 、以下略`, () => {
+      expect(speak('あ'.repeat(MAX_SPEECH_LENGTH + 1))).toBe(
+        `${'あ'.repeat(MAX_SPEECH_LENGTH)}、以下略`
+      );
+    });
+
+    it('counts code points, not UTF-16 units', () => {
+      // 𠮷 is a surrogate pair; 100 of them must not be cut.
+      const text = '𠮷'.repeat(MAX_SPEECH_LENGTH);
+      expect(speak(text)).toBe(text);
+      expect(speak(`${text}𠮷`)).toBe(`${text}、以下略`);
+    });
+
+    it(`ignores raw text past ${MAX_INPUT_LENGTH} UTF-16 units`, () => {
+      // Discord never sends this much; the cap only bounds the work.
+      expect(speak(`${' '.repeat(MAX_INPUT_LENGTH)}こんにちは`)).toBe('');
+      expect(speak(`${'あ'.repeat(MAX_INPUT_LENGTH - 1)}い`)).toBe(
+        `${'あ'.repeat(MAX_SPEECH_LENGTH)}、以下略`
+      );
+    });
+
+    it('cuts raw text before any rule shortens it', () => {
+      // Without the first cut, the URL rule would shrink this under the
+      // later ones and the greeting would be read.
+      expect(speak(`http://${'a'.repeat(MAX_INPUT_LENGTH)} こんにちは`)).toBe(
+        'URL省略'
+      );
+    });
+
+    it('drops text that mention expansion pushes past the input cap', () => {
+      // 80 mentions of a 98-letter role fill the cap exactly; the dictionary
+      // then shrinks each to a pause, so only that cut keeps the greeting out.
+      const ctx = {
+        ...context([{ word: 'r'.repeat(98), reading: '、' }]),
+        resolveRole: () => 'r'.repeat(98),
+      };
+      const mentions = '<@&1>'.repeat(MAX_INPUT_LENGTH / 100);
+      expect(normalizeForSpeech(`${mentions}こんにちは`, ctx)).toBe('');
+      expect(normalizeForSpeech(`${mentions.slice(5)}こんにちは`, ctx)).toBe(
+        'こんにちは'
+      );
+    });
+
+    it('drops text that the dictionary pushes past the input cap', () => {
+      // Each "a" becomes 100 characters that collapse to one pause, so
+      // without a cut after the dictionary the greeting would still be read.
+      const reading = `、${' '.repeat(98)}、`;
+      expect(
+        speak(`${'a'.repeat(100)}こんにちは`, [{ word: 'a', reading }])
+      ).toBe('');
+      expect(
+        speak(`${'a'.repeat(70)}こんにちは`, [{ word: 'a', reading }])
+      ).toBe('こんにちは');
+    });
+
+    it('keeps a surrogate pair whole at the cut after the dictionary', () => {
+      const read = speak('a'.repeat(81), [
+        { word: 'a', reading: '𠮷'.repeat(50) },
+      ]);
+      expect(read).toBe(`${'𠮷'.repeat(MAX_SPEECH_LENGTH)}、以下略`);
+    });
+
+    it('keeps a w run that reaches the end of the dictionary output', () => {
+      expect(
+        speak('a'.repeat(100), [{ word: 'a', reading: 'ｗ'.repeat(100) }])
+      ).toBe('わら');
+    });
+
+    it('never cuts the dictionary output inside a w run', () => {
+      // Cut mid-run, the run would look like trailing laughter; whole, it is
+      // followed by a letter and read as written.
+      expect(
+        speak(`${'a'.repeat(200)}b`, [{ word: 'a', reading: 'ｗ'.repeat(100) }])
+      ).toBe(`${'ｗ'.repeat(MAX_SPEECH_LENGTH)}、以下略`);
+    });
+
+    it('never leaves half a surrogate pair at the input cap', () => {
+      // The pair straddles the cap, so it is dropped whole.
+      expect(speak(`${' '.repeat(MAX_INPUT_LENGTH - 1)}𠮷`)).toBe('');
+      expect(speak(`${' '.repeat(MAX_INPUT_LENGTH - 2)}𠮷`)).toBe('𠮷');
+    });
+
+    it('honours a custom limit and truncate mode', () => {
+      expect(normalizeForSpeech('abcdef', context(), 3, 'truncate')).toBe(
+        'abc'
+      );
+      expect(normalizeForSpeech('abcdef', context(), 3)).toBe('abc、以下略');
+    });
+  });
+});
+
+describe('speakableName', () => {
+  it(`truncates names to ${MAX_NAME_LENGTH} characters without 以下略`, () => {
+    expect(speakableName('あ'.repeat(MAX_NAME_LENGTH + 5), context())).toBe(
+      'あ'.repeat(MAX_NAME_LENGTH)
+    );
+  });
+
+  it('normalizes names like any other text', () => {
+    expect(speakableName('🌸さくら🌸', context())).toBe('さくら');
+    expect(
+      speakableName('Taro', context([{ word: 'taro', reading: 'たろ' }]))
+    ).toBe('たろ');
+  });
+
+  it("returns '' for a name with nothing readable", () => {
+    expect(speakableName('✨✨', context())).toBe('');
+  });
+});
+
+describe('buildMessageSpeech', () => {
+  const message = (
+    content: string,
+    attachments: { isImage: boolean }[] = [],
+    stickerNames: string[] = []
+  ) => ({ content, attachments, stickerNames });
+
+  it('returns null when there is nothing to say', () => {
+    expect(buildMessageSpeech(message(''), context())).toBeNull();
+    expect(buildMessageSpeech(message('👍'), context())).toBeNull();
+    expect(buildMessageSpeech(message('', [], ['🎉']), context())).toBeNull();
+  });
+
+  it('returns the normalized text alone', () => {
+    expect(buildMessageSpeech(message('こんにちは'), context())).toBe(
+      'こんにちは'
+    );
+  });
+
+  it('says 画像 when any attachment is an image', () => {
+    expect(
+      buildMessageSpeech(
+        message('見て', [{ isImage: false }, { isImage: true }]),
+        context()
+      )
+    ).toBe('見て、画像');
+  });
+
+  it('says ファイル when no attachment is an image', () => {
+    expect(
+      buildMessageSpeech(message('', [{ isImage: false }]), context())
+    ).toBe('ファイル');
+  });
+
+  it('appends each sticker by name, truncated and skipping empty ones', () => {
+    expect(
+      buildMessageSpeech(
+        message('hi', [], ['ねこ', '👍', 'い'.repeat(MAX_NAME_LENGTH + 3)]),
+        context()
+      )
+    ).toBe(`hi、スタンプ ねこ、スタンプ ${'い'.repeat(MAX_NAME_LENGTH)}`);
+  });
+
+  it('orders text, attachments, then stickers', () => {
+    expect(
+      buildMessageSpeech(
+        message('やあ', [{ isImage: true }], ['うさぎ']),
+        context()
+      )
+    ).toBe('やあ、画像、スタンプ うさぎ');
+  });
+});
+
+/**
+ * Chat is attacker-controlled and the dictionary multiplies its length, so a
+ * regex that backtracks quadratically freezes the whole process: one
+ * dictionary entry plus one message once blocked the event loop for ~65 s.
+ */
+describe('regex cost (ReDoS)', () => {
+  /** Best of two runs, so one GC pause cannot fail a linear pattern. */
+  function fastestMs(run: () => unknown): number {
+    let best = Infinity;
+    for (let i = 0; i < 2; i++) {
+      const started = performance.now();
+      run();
+      best = Math.min(best, performance.now() - started);
+      if (best < BUDGET_MS) break;
+    }
+    return best;
+  }
+
+  // A linear pattern handles these inputs in a few milliseconds; each of the
+  // patterns this replaced took several seconds on at least one of them. The
+  // budget is generous so a slow, instrumented CI runner cannot fail a
+  // linear pattern.
+  const BUDGET_MS = 250;
+  const LENGTH = 100_000;
+
+  it('reads the reported worst case quickly and still cuts it off', () => {
+    const dictionary = [{ word: 'a', reading: 'ｗ'.repeat(100) }];
+    const content = `${'a'.repeat(1999)}b`;
+
+    let result: string | null = null;
+    const elapsed = fastestMs(() => {
+      result = buildMessageSpeech(
+        { content, attachments: [], stickerNames: [] },
+        context(dictionary)
+      );
+    });
+
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+    // The run is followed by a letter, so it is not laughter: it is read
+    // (and cut) like any other text.
+    expect(result).toBe(`${'ｗ'.repeat(MAX_SPEECH_LENGTH)}、以下略`);
+  });
+
+  it.each([
+    [
+      'a Nitro-length message',
+      'a'.repeat(3999),
+      [{ word: 'a', reading: 'ｗ'.repeat(100) }],
+    ],
+    [
+      'whitespace inside readings',
+      'a'.repeat(4000),
+      [{ word: 'a', reading: `x${'\u00a0'.repeat(98)}x` }],
+    ],
+    [
+      'pauses inside readings',
+      'a'.repeat(4000),
+      [{ word: 'a', reading: `x${' 、'.repeat(49)}x` }],
+    ],
+    [
+      'laughter runs inside readings',
+      'a '.repeat(2000),
+      [{ word: 'a', reading: 'ｗ'.repeat(100) }],
+    ],
+    [
+      'pause-heavy readings across the whole input',
+      'a'.repeat(MAX_INPUT_LENGTH),
+      [{ word: 'a', reading: '、ｗ'.repeat(50) }],
+    ],
+    [
+      'input that folds to 18 times its length',
+      '\uFDFA'.repeat(MAX_INPUT_LENGTH),
+      [{ word: 'a', reading: 'ｗ'.repeat(100) }],
+    ],
+  ])('handles %s within budget', (_label, content, dictionary) => {
+    const elapsed = fastestMs(() =>
+      normalizeForSpeech(
+        content as string,
+        context(dictionary as DictionaryRule[])
+      )
+    );
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+  });
+
+  it('handles a Nitro message of self-mentions expanded by the dictionary', () => {
+    const ctx = {
+      ...context([{ word: 'a', reading: '、ｗ'.repeat(50) }]),
+      resolveUser: () => 'a'.repeat(32),
+    };
+    const content = '<@123456789012345678>'.repeat(190);
+    let result = '';
+    const elapsed = fastestMs(() => {
+      result = normalizeForSpeech(content, ctx);
+    });
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+    expect(Array.from(result).length).toBeLessThanOrEqual(
+      MAX_SPEECH_LENGTH + '、以下略'.length
+    );
+  });
+
+  it('applies a full dictionary of near-identical long words within budget', () => {
+    const dictionary = Array.from({ length: 200 }, (_, i) => ({
+      word: `${'a'.repeat(49)}${String.fromCharCode(0x3042 + i)}`,
+      reading: 'x',
+    }));
+    const elapsed = fastestMs(() =>
+      applyDictionary('a'.repeat(LENGTH), dictionary)
+    );
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+  });
+
+  // Building blocks for the inputs that make backtracking patterns blow up:
+  // openers without closers, runs a quantifier can restart inside, and line
+  // starts. Each is repeated to LENGTH and tried with three endings, since a
+  // pattern can fail late on a letter, on punctuation, or at the very end.
+  const UNITS = [
+    '[',
+    '[a',
+    '](',
+    '](http://',
+    '[a](http://',
+    '<:',
+    '<:a:',
+    '</',
+    '</a',
+    '<@',
+    '<#',
+    '<t:',
+    '\n',
+    ' \n',
+    '\u2028',
+    '\u00a0',
+    ' ',
+    '、',
+    ' 、',
+    'w',
+    'ｗ',
+    'aw',
+    '`',
+    '``',
+    '|',
+    'http://',
+    '>',
+    '# ',
+    '*',
+    '1',
+    '👍',
+  ];
+  const ENDINGS = ['', 'b', '!'];
+
+  it.each(Object.entries(SPEECH_PATTERNS))(
+    '%s stays linear on long adversarial input',
+    (_name, pattern) => {
+      const slow: string[] = [];
+      for (const unit of UNITS) {
+        const body = unit.repeat(Math.ceil(LENGTH / unit.length));
+        for (const ending of ENDINGS) {
+          const input = body + ending;
+          const elapsed = fastestMs(() => input.replace(pattern, ''));
+          if (elapsed >= BUDGET_MS) {
+            slow.push(
+              `${JSON.stringify(unit)}+${JSON.stringify(ending)}: ${elapsed.toFixed(0)}ms`
+            );
+          }
+        }
+      }
+      expect(slow).toEqual([]);
+    }
+  );
+});
+
+describe('dictionaryKey', () => {
+  it.each([
+    ['ＡＬＩＣＥ', 'alice'],
+    ['ａｌｉｃｅ', 'Alice'],
+    ['CAFÉ', 'café'],
+    ['ΑΛΊΚΗ', 'αλίκη'],
+    ['ｶﾀｶﾅ', 'カタカナ'],
+  ])('gives %j and %j the same key', (a, b) => {
+    expect(dictionaryKey(a)).toBe(dictionaryKey(b));
+  });
+
+  it('keeps different words apart', () => {
+    expect(dictionaryKey('alice')).not.toBe(dictionaryKey('alicia'));
+    expect(dictionaryKey('™')).not.toBe(dictionaryKey('tm'));
+  });
+});
+
+describe('foldForSpeech', () => {
+  it('folds compatibility forms but leaves pictographs as they are', () => {
+    expect(foldForSpeech('ＡＢＣ™ｗ㊗️')).toBe('ABC™w㊗️');
+  });
+});

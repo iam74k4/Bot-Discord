@@ -18,8 +18,18 @@ describe('retry utility', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.clearAllMocks();
   });
+
+  /**
+   * retry.ts adds up to ±25% random jitter to each delay. Math.random() = 0.5
+   * makes the jitter exactly zero, so retry instants can be asserted to the
+   * millisecond.
+   */
+  function withoutJitter(): void {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  }
 
   describe('withRetry', () => {
     it('should return result on first successful attempt', async () => {
@@ -55,20 +65,19 @@ describe('retry utility', () => {
       const error = new Error('network error');
       const fn = vi.fn().mockRejectedValue(error);
 
-      let caughtError: Error | null = null;
       const resultPromise = withRetry(fn, {
         maxRetries: 2,
         baseDelayMs: 100,
         shouldRetry: () => true,
-      }).catch((e) => {
-        caughtError = e;
       });
+      // Attach the expectation before advancing time so the rejection is
+      // never unhandled.
+      const rejection = expect(resultPromise).rejects.toBe(error);
 
       await vi.advanceTimersByTimeAsync(1000);
-      await resultPromise;
+      await rejection;
 
-      expect(caughtError).not.toBeNull();
-      expect(caughtError?.message).toBe('network error');
+      await expect(resultPromise).rejects.toThrow('network error');
       expect(fn).toHaveBeenCalledTimes(3);
     });
 
@@ -103,6 +112,7 @@ describe('retry utility', () => {
     });
 
     it('should apply exponential backoff', async () => {
+      withoutJitter();
       const fn = vi
         .fn()
         .mockRejectedValueOnce(new Error('500'))
@@ -115,17 +125,40 @@ describe('retry utility', () => {
         maxDelayMs: 10000,
       });
 
-      await vi.advanceTimersByTimeAsync(1500);
+      // First retry after 1000 ms (base * 2^0).
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fn).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
       expect(fn).toHaveBeenCalledTimes(2);
 
-      await vi.advanceTimersByTimeAsync(3000);
+      // Second retry 2000 ms later (base * 2^1), at t = 3000 ms.
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(fn).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
       expect(fn).toHaveBeenCalledTimes(3);
 
       const result = await resultPromise;
       expect(result).toBe('success');
     });
 
+    it('keeps the jittered delay within ±25% of the backoff step', async () => {
+      const fn = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('500'))
+        .mockResolvedValue('success');
+
+      // Lowest possible jitter: 1000 ms - 25% = 750 ms.
+      vi.spyOn(Math, 'random').mockReturnValue(0);
+      const early = withRetry(fn, { baseDelayMs: 1000 });
+      await vi.advanceTimersByTimeAsync(749);
+      expect(fn).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fn).toHaveBeenCalledTimes(2);
+      await expect(early).resolves.toBe('success');
+    });
+
     it('should cap delay at maxDelayMs', async () => {
+      withoutJitter();
       const fn = vi
         .fn()
         .mockRejectedValueOnce(new Error('500'))
@@ -139,7 +172,14 @@ describe('retry utility', () => {
         maxDelayMs: 3000,
       });
 
-      await vi.advanceTimersByTimeAsync(15000);
+      // Delays 1000, 2000, then min(4000, 3000) = 3000: retries land at
+      // t = 1000, 3000 and 6000 ms (uncapped, the last would be at 7000).
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(fn).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(2999);
+      expect(fn).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fn).toHaveBeenCalledTimes(4);
 
       const result = await resultPromise;
       expect(result).toBe('success');
