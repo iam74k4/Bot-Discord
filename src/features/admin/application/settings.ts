@@ -34,8 +34,7 @@ async function handleView(
 interface ChannelSetting {
   nameKey: 'settings.audit.name' | 'settings.announcements.name';
   configuredKey:
-    | 'settings.audit.configured'
-    | 'settings.announcements.configured';
+    'settings.audit.configured' | 'settings.announcements.configured';
   disabledKey: 'settings.audit.disabled' | 'settings.announcements.disabled';
   /** Command to suggest next, by state. */
   nextStep: { set: string; cleared: string };
