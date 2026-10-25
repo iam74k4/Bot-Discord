@@ -351,7 +351,7 @@ Every migration re-runs on each boot; there is no ledger of applied migrations. 
 Migrations do not define `down()` functions. To roll back schema changes:
 
 1. Create a new migration that reverses the change (e.g. `DROP TABLE` or `DROP COLUMN`).
-2. Or restore from a backup taken before the migration.
+2. Or restore from a backup taken before the migration: set `RESTORE_BACKUP` and redeploy (see [operations.md](operations.md#restoring-a-backup)).
 3. For development, deleting the database file and re-running the bot will re-apply all migrations from scratch.
 
 ---

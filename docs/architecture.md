@@ -22,7 +22,7 @@ flowchart LR
   end
 
   subgraph railway["Railway project (one environment)"]
-    bot["Bot service (Node.js 22)"]
+    bot["Bot service (Docker, Node.js 22.22)"]
     volume[("Volume /app/data: SQLite, backups, recordings")]
     voicevox["VOICEVOX engine (optional, private network only)"]
     whisper["Whisper engine (optional, private network only)"]
@@ -418,8 +418,9 @@ The design trades horizontal scale for simplicity, on purpose:
 │   └── dependabot.yml
 ├── docs/                         # architecture, operations, deployment, database, development, quality
 ├── scripts/                      # validate.sh (CI parity), pre-push.sh (git hook), audit-all.sh
-├── railway.toml                  # Start command, draining, restart policy
-├── nixpacks.toml                 # Native build deps (libopus, python for node-gyp)
+├── Dockerfile                    # Production image; pins the exact Node release
+├── .nvmrc                        # The same Node version for CI and local development
+├── railway.toml                  # Dockerfile build, start command, draining, restart policy
 ├── tsconfig.json                 # Build (excludes tests)
 ├── tsconfig.test.json            # Type-checks tests too
 ├── vitest.config.ts              # Tests + coverage floors

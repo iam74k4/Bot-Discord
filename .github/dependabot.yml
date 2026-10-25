@@ -18,6 +18,12 @@ updates:
         patterns:
           - 'vitest'
           - '@vitest/*'
+    ignore:
+      # TypeScript 7 (the native compiler) cannot be installed next to
+      # typescript-eslint yet: its peer range stops before 7, so npm ci fails
+      # (#172). Remove this once typescript-eslint accepts typescript 7.
+      - dependency-name: 'typescript'
+        update-types: ['version-update:semver-major']
 
   - package-ecosystem: 'github-actions'
     directory: '/'

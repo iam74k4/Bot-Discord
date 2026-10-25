@@ -3,7 +3,7 @@
 ![Build Status](https://img.shields.io/github/actions/workflow/status/iam74k4/Bot-Discord/.github/workflows/ci.yml?style=flat-square)
 ![Version](https://img.shields.io/github/v/release/iam74k4/Bot-Discord?style=flat-square)
 ![License](https://img.shields.io/github/license/iam74k4/Bot-Discord?style=flat-square)
-![Node.js Version](https://img.shields.io/badge/node-22.12%2B-339933?style=flat-square&logo=node.js&logoColor=white)
+![Node.js Version](https://img.shields.io/badge/node-22.22%2B-339933?style=flat-square&logo=node.js&logoColor=white)
 
 A modular Discord bot built with TypeScript and discord.js v14.
 
@@ -56,7 +56,7 @@ A modular Discord bot built with TypeScript and discord.js v14.
 
 ## Requirements
 
-- Node.js 22.12.0 or higher
+- Node.js 22.22.0 or higher (`.nvmrc`; `nvm use` picks it up)
 - Discord Bot Token
 - Discord Application Client ID
 
