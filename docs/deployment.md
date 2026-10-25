@@ -4,6 +4,8 @@
 
 Production should **not** auto-deploy from `develop`. Use **`main` only** for Railway production deploys, and create **version tags** (`v*`) after the `main` commit is ready so GitHub Releases match what was shipped.
 
+This page sets up one environment. To run `develop` on a staging bot in your own test server next to production, follow [operations.md](operations.md) after it - that page also covers releases, hotfixes and rollbacks.
+
 ### 1. Create Railway Project
 
 1. Go to [Railway](https://railway.app/) and sign up/login
@@ -31,7 +33,8 @@ In Railway dashboard, add the following variables:
 | `DISCORD_TOKEN`                 | Discord bot token                                                                         | Yes               |
 | `DISCORD_CLIENT_ID`             | Discord application client ID                                                             | Yes               |
 | `BOT_OWNER_IDS`                 | Bot owner Discord IDs (comma-separated); **required when `NODE_ENV=production`**          | Yes in production |
-| `DISCORD_GUILD_ID`              | Development guild for faster slash command updates                                        | No                |
+| `DISCORD_GUILD_ID`              | Register commands to this one server only (instant updates); unset in production          | No                |
+| `ALLOWED_GUILD_IDS`             | Server IDs this bot may serve (comma-separated); unset serves every server (see below)    | No                |
 | `NODE_ENV`                      | Set to `production`                                                                       | No                |
 | `TZ`                            | Timezone used by cron jobs and timestamps                                                 | No                |
 | `MAX_RECORDING_DURATION`        | Max recording time in seconds (default: 300)                                              | No                |
@@ -52,6 +55,8 @@ In Railway dashboard, add the following variables:
 | `RECORDINGS_DIR`                | Generated recording files directory (must stay relative to repo root)                     | No                |
 | `BACKUP_DIR`                    | Backup output directory (must stay relative to repo root)                                 | No                |
 | `VOICEVOX_URL`                  | VOICEVOX engine URL; enables `/tts` and the Message Content intent (see below)            | No                |
+
+`ALLOWED_GUILD_IDS` is for a staging bot ([operations.md](operations.md)). When set, the bot leaves any server outside the list as soon as it is added there, and refuses commands with a short notice in servers outside the list that it was already in - it does not leave those by itself, so a wrong value costs a config fix rather than every server. Startup lists them in the logs. Direct messages are always served.
 
 If you enable voice recording in production, remember that `/voice record` now requires `Manage Server`, and generated files are delivered ephemerally and cleaned up automatically according to `RECORDING_RETENTION_HOURS`.
 
@@ -158,7 +163,7 @@ Railway’s “Wait for CI” expects a workflow that runs on `push` to `main` (
 - **GitHub Actions**: Lint, format-check, type-check (source and tests), tests with coverage floors, production dependency audit, and build on every pull request (any base branch) and on push to `main` and `develop`
 - **CodeQL**: JavaScript/TypeScript analysis on `main` / `develop` (plus weekly schedule); review alerts under **Security → Code scanning**
 - **Release**: Push tag `v*` to create a GitHub Release with build artifacts; Railway deployment is intentionally handled outside the release workflow
-- **Branch strategy**: `feature/*` or `fix/*` → `main` (or merge via `develop` if your team uses it; either way CI runs on every PR and on pushes to both integration branches). **Production Railway** should track **`main`** only, not `develop`.
+- **Branch strategy**: `feature/*` and `fix/*` → `develop` (squash) → `main` through a release PR (merge commit); `hotfix/*` → `main`, then back into `develop`. Railway **staging** tracks `develop` and **production** tracks `main` only - see [operations.md](operations.md).
 - **Runtime**: CI and release workflows run on Node.js `22.12.0`
 - **Local parity**: Run `./scripts/validate.sh` before push — it mirrors CI checks including `npm audit --omit=dev --audit-level=high`
 

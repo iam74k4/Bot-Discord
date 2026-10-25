@@ -8,6 +8,7 @@ export const en: TranslationKeys = {
     error: 'Error',
     warning: 'Warning',
     guildOnly: 'This command can only be used in a server.',
+    guildNotAllowed: 'This bot is not set up to be used in this server.',
     noPermission: 'You do not have permission to use this command.',
     noData: 'No data',
     unexpectedError:

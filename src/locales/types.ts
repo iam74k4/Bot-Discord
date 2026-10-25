@@ -61,6 +61,7 @@ export interface TranslationKeys {
     error: string;
     warning: string;
     guildOnly: string;
+    guildNotAllowed: string;
     noPermission: string;
     noData: string;
     unexpectedError: string;
