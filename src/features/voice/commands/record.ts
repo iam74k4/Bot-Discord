@@ -90,7 +90,7 @@ export const command: Command = {
         .addSubcommand((sub) =>
           sub
             .setName('disable')
-            .setDescription('Stop the bot joining and buffering entirely')
+            .setDescription('Stop auto-joining and audio buffering')
             .setDescriptionLocalizations({
               ja: '自動参加と音声保持を停止',
             })
@@ -98,7 +98,9 @@ export const command: Command = {
         .addSubcommand((sub) =>
           sub
             .setName('exclude')
-            .setDescription('Keep the bot out of one voice channel')
+            .setDescription(
+              'Exclude one voice channel from auto-join and buffering'
+            )
             .setDescriptionLocalizations({
               ja: '特定のVCを対象外にする',
             })
