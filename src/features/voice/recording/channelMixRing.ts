@@ -355,11 +355,15 @@ export class ChannelMixRingManager {
    * Allocation is the expensive step (~0.18 MB per buffered second), so
    * callers are expected to reach here only when there is audio to store —
    * an idle voice channel then holds no buffer at all.
+   *
+   * `epochMs` starts a new ring's timeline; an existing ring keeps its own.
+   * Pass the start of the audio about to be written, not its end: audio
+   * before the epoch is dropped.
    */
-  getOrCreate(channelId: string): ChannelMixRing {
+  getOrCreate(channelId: string, epochMs: number = Date.now()): ChannelMixRing {
     let ring = this.rings.get(channelId);
     if (!ring) {
-      ring = new ChannelMixRing(env.AUDIO_BUFFER_DURATION);
+      ring = new ChannelMixRing(env.AUDIO_BUFFER_DURATION, epochMs);
       this.rings.set(channelId, ring);
     }
     return ring;

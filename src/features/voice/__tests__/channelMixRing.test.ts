@@ -310,6 +310,29 @@ describe('ChannelMixRingManager', () => {
     expect(mgr.getTotalMixBufferSizeMB()).toBeCloseTo(2 * perRingMB, 6);
   });
 
+  it('starts a new ring at the given epoch, so a first frame placed there survives', () => {
+    const end = 5_000_020;
+    const frame = constantPcm(960, 8000);
+
+    // The ring's own default epoch is "now", which for the first chunk is
+    // its end: every sample of it falls before the timeline and is dropped.
+    const late = new ChannelMixRingManager();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(end);
+      late.getOrCreate('a').addMonoPcmInt16(frame, end);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(maxAbsInt16(late.extractLastSeconds('a', 0.02, end))).toBe(0);
+
+    const mgr = new ChannelMixRingManager();
+    mgr.getOrCreate('a', end - 20).addMonoPcmInt16(frame, end);
+    expect(maxAbsInt16(mgr.extractLastSeconds('a', 0.02, end))).toBeGreaterThan(
+      4000
+    );
+  });
+
   it('reads a channel ring at the requested time', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {

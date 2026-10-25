@@ -420,7 +420,11 @@ describe('VoiceConnectionManager', () => {
 
       fake.opusStreams[0].pcm.emit('data', pcm);
 
-      expect(channelMixRingManager.getOrCreate).toHaveBeenCalledWith('ch-1');
+      // A new ring's timeline starts where this chunk starts (5 samples back).
+      expect(channelMixRingManager.getOrCreate).toHaveBeenCalledWith(
+        'ch-1',
+        NOW + 1_234 - 5 / 48
+      );
       expect(mockRing.addMonoPcmInt16At).toHaveBeenCalledTimes(1);
       const [chunk, start] = mockRing.addMonoPcmInt16At.mock.calls[0] as [
         Buffer,
@@ -605,10 +609,11 @@ describe('VoiceConnectionManager', () => {
       a.opusStreams[0].pcm.emit('data', mono([10]));
       b.opusStreams[0].pcm.emit('data', mono([20]));
 
-      expect(vi.mocked(channelMixRingManager.getOrCreate).mock.calls).toEqual([
-        ['ch-a'],
-        ['ch-b'],
-      ]);
+      expect(
+        vi
+          .mocked(channelMixRingManager.getOrCreate)
+          .mock.calls.map(([channelId]) => channelId)
+      ).toEqual(['ch-a', 'ch-b']);
     });
   });
 

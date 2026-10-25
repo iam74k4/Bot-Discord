@@ -402,10 +402,16 @@ export class VoiceConnectionManager {
           // Allocated here rather than on connect: the ring costs ~55MB at the
           // default buffer length, and a channel where nobody ever speaks
           // should not pay it. The first chunk also sets the ring's epoch, so
-          // the timeline starts at real audio instead of at join time.
-          const ring = channelMixRingManager.getOrCreate(channelId);
+          // the timeline starts at real audio instead of at join time - at
+          // the chunk's start, since it ends now: an epoch of now would put
+          // the whole first frame before the timeline, where it is dropped.
+          const now = Date.now();
           const samples = chunk.length >> 1;
-          const start = placer.place(ring.globalIndexAt(Date.now()), samples);
+          const ring = channelMixRingManager.getOrCreate(
+            channelId,
+            now - (samples * 1000) / AUDIO.SAMPLE_RATE
+          );
+          const start = placer.place(ring.globalIndexAt(now), samples);
           if (start === null) return; // catching up after running ahead
           ring.addMonoPcmInt16At(chunk, start);
         });
