@@ -60,11 +60,17 @@ This document describes the quality standards and practices for this Discord bot
 - Shared and infrastructure code may also colocate tests under their own `__tests__/` directories.
 - Use `getErrorMessage` pattern in mocks.
 - Integration tests for backup, admin commands.
-- **Every command is covered automatically.** `src/__tests__/integration/commands/commandPayload.test.ts`
+- **Every command is smoke-tested once declared.** `src/__tests__/integration/commands/commandPayload.test.ts`
   checks every slash command against Discord's registration limits, and
   `allCommands.smoke.test.ts` executes every command and subcommand path and
-  asserts it is acknowledged exactly once. A new command is picked up with no
-  extra test code; give it a dedicated test for its behaviour.
+  asserts it is acknowledged exactly once. The lists are deliberately
+  exhaustive, so a new command or subcommand fails CI until you declare it:
+  add an entry to `COMMAND_POLICY` in `command-smoke.helpers.ts`
+  (`defaultMemberPermissions`, `contexts`, `cooldownMs`, `autocomplete`, and
+  one access level per `/general help` entry), then add each new path to
+  `REACHES` (with a `SCENARIOS` entry if it needs prior state) or `READ_ONLY`
+  in `allCommands.smoke.test.ts`. Still give the command a dedicated test for
+  its behaviour.
 - **Coverage is enforced in CI.** CI runs `npm run test:coverage`, which fails
   below the floors in `vitest.config.ts`. Raise the floors when coverage grows;
   do not lower them to make a change pass.

@@ -99,10 +99,10 @@ Railway’s “Wait for CI” expects a workflow that runs on `push` to `main` (
 
 ## CI/CD
 
-- **GitHub Actions**: Lint, format-check, type-check, test, production dependency audit, and build on PR/push to `main` and `develop`
+- **GitHub Actions**: Lint, format-check, type-check (source and tests), tests with coverage floors, production dependency audit, and build on every pull request (any base branch) and on push to `main` and `develop`
 - **CodeQL**: JavaScript/TypeScript analysis on `main` / `develop` (plus weekly schedule); review alerts under **Security → Code scanning**
 - **Release**: Push tag `v*` to create a GitHub Release with build artifacts; Railway deployment is intentionally handled outside the release workflow
-- **Branch strategy**: `feature/*` or `fix/*` → `main` (or merge via `develop` if your team uses it; either way CI runs on both default integration branches above). **Production Railway** should track **`main`** only, not `develop`.
+- **Branch strategy**: `feature/*` or `fix/*` → `main` (or merge via `develop` if your team uses it; either way CI runs on every PR and on pushes to both integration branches). **Production Railway** should track **`main`** only, not `develop`.
 - **Runtime**: CI and release workflows run on Node.js `22.12.0`
 - **Local parity**: Run `./scripts/validate.sh` before push — it mirrors CI checks including `npm audit --omit=dev --audit-level=high`
 

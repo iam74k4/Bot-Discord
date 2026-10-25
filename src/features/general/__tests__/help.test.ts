@@ -827,11 +827,12 @@ describe('/general help autocomplete', () => {
     ]);
   });
 
-  // BUG (reported, help.ts:145): only the description is capped, so with the
-  // longest names Discord allows (32 + 32 characters) a choice name reaches
-  // 130 characters, past Discord's 100-character limit, and respond() would
-  // be rejected. Characterized until fixed; the value is never shortened.
-  it('currently caps only the description part of a suggestion label', async () => {
+  // KNOWN BUG (reported, help.ts:145): only the description is capped, so with
+  // the longest names Discord allows (32 + 32 characters) a choice name
+  // reaches 130 characters, past Discord's 100-character limit, and respond()
+  // would be rejected. `it.fails` until the label is capped as a whole; then
+  // change it to `it`.
+  it.fails('keeps every suggestion label within 100 characters', async () => {
     const commandName = 'c'.repeat(32);
     const subcommandName = 's'.repeat(32);
     const longest = helpCommand(
@@ -846,11 +847,9 @@ describe('/general help autocomplete', () => {
 
     const choices = await suggest({ commands: [longest], focused: 'c' });
 
-    const entryName = `${commandName} ${subcommandName}`;
-    expect(choices).toEqual([
-      { name: `${entryName} - ${'D'.repeat(59)}...`, value: entryName },
-    ]);
-    expect(choices[0].name).toHaveLength(130);
+    // The value is the command path and is never shortened.
+    expect(choices[0].value).toBe(`${commandName} ${subcommandName}`);
+    expect(choices[0].name.length).toBeLessThanOrEqual(100);
   });
 
   it('shortens descriptions longer than 60 characters', async () => {
