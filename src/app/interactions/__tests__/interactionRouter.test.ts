@@ -72,6 +72,20 @@ vi.mock('../../../shared/utils/logger.js', () => ({
 const resolveLocale = vi.hoisted(() => vi.fn());
 vi.mock('../../../locales/guildLocale.js', () => ({ resolveLocale }));
 
+// The real allowlist check, against a list each test sets (empty: every
+// server, which is production and every other test here).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+
 vi.mock('../../../middleware/index.js', async (importOriginal) => {
   const actual =
     await importOriginal<typeof import('../../../middleware/index.js')>();
@@ -116,6 +130,7 @@ function chatInput(
     permissions?: bigint[];
     reply?: Mock;
     editReply?: Mock;
+    guildId?: string | null;
   } = {}
 ): ChatInputStub {
   const reply = options.reply ?? vi.fn().mockResolvedValue(undefined);
@@ -133,7 +148,7 @@ function chatInput(
         getSubcommand: () => options.subcommand ?? null,
       },
       user: { id: USER_ID, tag: 'tester#0001' },
-      guildId: 'guild-1',
+      guildId: options.guildId === undefined ? 'guild-1' : options.guildId,
       guild: { id: 'guild-1' },
       member: { permissions: new PermissionsBitField(options.permissions) },
       locale: 'en-US',
@@ -213,6 +228,7 @@ function errorIdIn(description: string | undefined): string {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  allowlist.ids = [];
   resolveLocale.mockReturnValue('en');
   metrics.reset();
   cooldownStore.clearAll();
@@ -1410,6 +1426,136 @@ describe('routeInteraction: time-to-acknowledge labels', () => {
 
     expect(metrics.getAcknowledgementStats().slowest[0].label).toBe(
       'component:settings-panel'
+    );
+  });
+});
+
+describe('routeInteraction: ALLOWED_GUILD_IDS', () => {
+  it('refuses a slash command from a server outside the list', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const ping = command();
+    const stub = chatInput();
+    resolveLocale.mockReturnValue('ja');
+
+    await routeInteraction(clientWith(ping), stub.interaction);
+
+    expect(ping.execute).not.toHaveBeenCalled();
+    expect(runMiddleware).not.toHaveBeenCalled();
+    expect(stub.reply).toHaveBeenCalledWith({
+      content: t('common.guildNotAllowed', 'ja'),
+      flags: MessageFlags.Ephemeral,
+    });
+    expect(metrics.getSnapshot().commands.executed).toBe(0);
+  });
+
+  it('runs commands in a listed server', async () => {
+    allowlist.ids = ['guild-1'];
+    const ping = command();
+    const stub = chatInput();
+
+    await routeInteraction(clientWith(ping), stub.interaction);
+
+    expect(ping.execute).toHaveBeenCalledTimes(1);
+    expect(responsesSent(stub)).toBe(0);
+  });
+
+  it('still serves direct messages when the list is set', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const ping = command();
+    const stub = chatInput({ guildId: null });
+
+    await routeInteraction(clientWith(ping), stub.interaction);
+
+    expect(ping.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers autocomplete outside the list with no choices', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const handler = vi.fn();
+    const search = command({ name: 'search', autocomplete: handler });
+    const { interaction, respond } = autocomplete('search');
+
+    await routeInteraction(clientWith(search), interaction);
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith([]);
+  });
+
+  it('refuses a click from a server outside the list without running its handler', async () => {
+    allowlist.ids = ['guild-allowed'];
+    setComponentRoutingReady(true);
+    const handle = vi.fn();
+    registerComponentHandler('voice-optout:', handle);
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const update = vi.fn().mockResolvedValue(undefined);
+    const interaction = onPrototype<ButtonInteraction>(
+      ButtonInteraction.prototype,
+      {
+        id: '1300000000000000006',
+        type: InteractionType.MessageComponent,
+        componentType: ComponentType.Button,
+        customId: 'voice-optout:123',
+        user: { id: USER_ID },
+        guildId: 'guild-1',
+        locale: 'en-US',
+        replied: false,
+        deferred: false,
+        message: { id: 'message-9', createdTimestamp: Date.now() },
+        reply,
+        update,
+      }
+    );
+    resolveLocale.mockReturnValue('ja');
+
+    // No fake timers: the refusal comes before any grace period.
+    await routeInteraction(clientWith(), interaction);
+
+    expect(handle).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(reply).toHaveBeenCalledWith({
+      content: t('common.guildNotAllowed', 'ja'),
+      flags: MessageFlags.Ephemeral,
+    });
+  });
+
+  it('refuses a submitted form from a server outside the list', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const interaction = onPrototype<ModalSubmitInteraction>(
+      ModalSubmitInteraction.prototype,
+      {
+        id: '1300000000000000007',
+        type: InteractionType.ModalSubmit,
+        customId: 'poll-create:1300000000000000004',
+        user: { id: USER_ID },
+        guildId: 'guild-1',
+        locale: 'en-US',
+        replied: false,
+        deferred: false,
+        reply,
+      }
+    );
+
+    await routeInteraction(clientWith(), interaction);
+
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledWith({
+      content: t('common.guildNotAllowed', 'en'),
+      flags: MessageFlags.Ephemeral,
+    });
+  });
+
+  it('settles even when the refusal cannot be delivered', async () => {
+    allowlist.ids = ['guild-allowed'];
+    const stub = chatInput({
+      reply: vi.fn().mockRejectedValue(new Error('Unknown interaction')),
+    });
+
+    await expect(
+      routeInteraction(clientWith(command()), stub.interaction)
+    ).resolves.toBeUndefined();
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Failed to refuse a disallowed server: Unknown interaction'
     );
   });
 });

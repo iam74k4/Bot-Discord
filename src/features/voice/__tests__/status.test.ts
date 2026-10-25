@@ -595,7 +595,11 @@ describe('/voice status', () => {
       const { payload } = await panel.click('voice-panel:autojoin-off-confirm');
 
       expect(voiceSettingsRepository.isAutoJoinEnabled(GUILD)).toBe(false);
-      expect(connectionManager.disconnect).toHaveBeenCalledWith('voice-1');
+      // Second argument: the connection to drop, which this fake leaves out.
+      expect(connectionManager.disconnect).toHaveBeenCalledWith(
+        'voice-1',
+        undefined
+      );
       expect(connectionManager.disconnect).not.toHaveBeenCalledWith('other');
       expect(embedOf(payload!).description).toContain(
         t('record.autojoin.disabledDropped', 'en')
@@ -631,7 +635,10 @@ describe('/voice status', () => {
       expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([
         'voice-1',
       ]);
-      expect(connectionManager.disconnect).toHaveBeenCalledWith('voice-1');
+      expect(connectionManager.disconnect).toHaveBeenCalledWith(
+        'voice-1',
+        undefined
+      );
       expect(reconcileGuild).toHaveBeenCalled();
       expect(embedOf(payload!).description).toContain(
         t('record.panel.exclusionsUpdated', 'en', {
@@ -690,7 +697,10 @@ describe('/voice status', () => {
         'voice-3',
       ]);
 
-      expect(connectionManager.disconnect).toHaveBeenCalledWith('voice-1');
+      expect(connectionManager.disconnect).toHaveBeenCalledWith(
+        'voice-1',
+        undefined
+      );
       expect(reconcileGuild).toHaveBeenCalledTimes(1);
       expect([...(excludedWhenReconciling ?? [])].sort()).toEqual([
         'voice-1',

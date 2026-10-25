@@ -219,12 +219,18 @@ entries per guild.
 | Column     | Type    | Constraints |
 | ---------- | ------- | ----------- |
 | guild_id   | TEXT    | NOT NULL    |
+| word_key   | TEXT    | NOT NULL    |
 | word       | TEXT    | NOT NULL    |
 | reading    | TEXT    | NOT NULL    |
 | created_by | TEXT    | NOT NULL    |
 | created_at | INTEGER | NOT NULL    |
 
-PRIMARY KEY (`guild_id`, `word`)
+PRIMARY KEY (`guild_id`, `word_key`)
+
+`word_key` is the word folded the way it is matched against chat (NFKC, then
+lower case), so case and width variants ("ALICE", "ａｌｉｃｅ", "CAFÉ"/"café")
+are one entry with one owner. `word` keeps the latest spelling for display.
+`created_by`/`created_at` record who first added the word; updates keep them.
 
 ---
 
@@ -379,6 +385,22 @@ erDiagram
     voice_autojoin_exclusions {
         text guild_id PK
         text channel_id PK
+        integer created_at
+    }
+
+    tts_user_settings {
+        text user_id PK
+        integer speaker_id
+        real speed
+        integer updated_at
+    }
+
+    tts_dictionary {
+        text guild_id PK
+        text word_key PK
+        text word
+        text reading
+        text created_by
         integer created_at
     }
 

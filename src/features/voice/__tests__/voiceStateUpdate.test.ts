@@ -13,6 +13,23 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 const db = new Database(':memory:');
 
+// The real allowlist check against a list each test sets (empty: every
+// server, as in production).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+beforeEach(() => {
+  allowlist.ids = [];
+});
+
 vi.mock('../../../infrastructure/database/connection.js', () => ({
   database: db,
 }));
@@ -201,6 +218,16 @@ describe('voiceStateUpdate', () => {
 
     it('stays out of every channel in a guild that disabled auto-join', async () => {
       voiceSettingsRepository.setAutoJoinEnabled(guild.id, false);
+      const general = voiceChannel('general', [human('alice')]);
+
+      await fire(voiceState(null), voiceState(general));
+
+      expect(cm.connect).not.toHaveBeenCalled();
+      expect(announceBuffering).not.toHaveBeenCalled();
+    });
+
+    it('stays out of every channel in a server outside ALLOWED_GUILD_IDS', async () => {
+      allowlist.ids = ['some-other-guild'];
       const general = voiceChannel('general', [human('alice')]);
 
       await fire(voiceState(null), voiceState(general));

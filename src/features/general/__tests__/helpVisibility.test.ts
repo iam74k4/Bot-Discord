@@ -29,7 +29,7 @@ function restoreEnv(): void {
 
 async function loadHelpModule(
   overrides: Record<string, string | undefined> = {}
-): Promise<typeof import('./help.js')> {
+): Promise<typeof import('../application/help.js')> {
   restoreEnv();
   Object.assign(process.env, {
     DISCORD_TOKEN: 'test-token',
@@ -47,7 +47,7 @@ async function loadHelpModule(
   }
 
   vi.resetModules();
-  return import('./help.js');
+  return import('../application/help.js');
 }
 
 afterEach(() => {

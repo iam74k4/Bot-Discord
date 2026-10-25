@@ -114,7 +114,8 @@ describe('auto-join policy', () => {
         []
       );
 
-      expect(connectionManager.disconnect).toHaveBeenCalledWith('A');
+      // Second argument: the connection to drop, which this fake leaves out.
+      expect(connectionManager.disconnect).toHaveBeenCalledWith('A', undefined);
       // Not B: it is excluded in this very change. C is the one left.
       expect(connect).toHaveBeenCalledTimes(1);
       expect(connect.mock.calls[0][1]).toMatchObject({ id: 'C' });
@@ -188,7 +189,11 @@ describe('auto-join policy', () => {
 
       const result = await excludeChannel(guild() as never, 'A');
 
-      expect(result).toEqual({ added: true, left: true });
+      expect(result).toEqual({
+        added: true,
+        left: true,
+        readingStopped: false,
+      });
       expect(connect.mock.calls[0][1]).toMatchObject({ id: 'B' });
     });
 
@@ -198,6 +203,7 @@ describe('auto-join policy', () => {
       await expect(excludeChannel(guild() as never, 'C')).resolves.toEqual({
         added: false,
         left: false,
+        readingStopped: false,
       });
       expect(connect).not.toHaveBeenCalled();
     });

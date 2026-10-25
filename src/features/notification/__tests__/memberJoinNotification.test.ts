@@ -30,6 +30,23 @@ import {
  */
 const db = new Database(':memory:');
 
+// The real allowlist check against a list each test sets (empty: every
+// server, as in production).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+beforeEach(() => {
+  allowlist.ids = [];
+});
+
 vi.mock('../../../infrastructure/database/connection.js', () => ({
   database: db,
 }));
@@ -103,6 +120,19 @@ describe('memberJoinNotification event', () => {
         'member_join',
         WELCOME_CHANNEL
       );
+    });
+
+    it('posts nothing in a server outside ALLOWED_GUILD_IDS', async () => {
+      allowlist.ids = ['some-other-guild'];
+      const channel = createTextChannel(WELCOME_CHANNEL);
+      const { member } = createMember(
+        { cached: [channel], memberCount: 1234 },
+        { displayName: 'Alice' }
+      );
+
+      await event.execute(readyClient(), member);
+
+      expect(channel.send).not.toHaveBeenCalled();
     });
 
     it('welcomes the member by mention with their member number and avatar', async () => {

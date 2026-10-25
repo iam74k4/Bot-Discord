@@ -4,6 +4,8 @@
 
 Production should **not** auto-deploy from `develop`. Use **`main` only** for Railway production deploys, and create **version tags** (`v*`) after the `main` commit is ready so GitHub Releases match what was shipped.
 
+This page sets up one environment. To run `develop` on a staging bot in your own test server next to production, follow [operations.md](operations.md) after it - that page also covers releases, hotfixes and rollbacks.
+
 ### 1. Create Railway Project
 
 1. Go to [Railway](https://railway.app/) and sign up/login
@@ -31,7 +33,8 @@ In Railway dashboard, add the following variables:
 | `DISCORD_TOKEN`                 | Discord bot token                                                                         | Yes               |
 | `DISCORD_CLIENT_ID`             | Discord application client ID                                                             | Yes               |
 | `BOT_OWNER_IDS`                 | Bot owner Discord IDs (comma-separated); **required when `NODE_ENV=production`**          | Yes in production |
-| `DISCORD_GUILD_ID`              | Development guild for faster slash command updates                                        | No                |
+| `DISCORD_GUILD_ID`              | Register commands to this one server only (instant updates); unset in production          | No                |
+| `ALLOWED_GUILD_IDS`             | Server IDs this bot may serve (comma-separated); unset serves every server (see below)    | No                |
 | `NODE_ENV`                      | Set to `production`                                                                       | No                |
 | `TZ`                            | Timezone for the backup cron and log timestamps; VC stats follow `STATS_TIMEZONE`         | No                |
 | `STATS_TIMEZONE`                | IANA zone whose midnight starts a VC stats day (default: `TZ` if set, else `Asia/Tokyo`)  | No                |
@@ -55,6 +58,8 @@ In Railway dashboard, add the following variables:
 | `VOICEVOX_URL`                  | VOICEVOX engine URL; enables `/tts` and the Message Content intent (see below)            | No                |
 | `FORCE_COMMAND_SYNC`            | `true` re-uploads the slash commands at startup even when they look unchanged (see below) | No                |
 | `NODE_COMPILE_CACHE`            | Node's compile cache directory, e.g. `/app/data/.node-compile-cache` (see below)          | No                |
+
+`ALLOWED_GUILD_IDS` is for a staging bot ([operations.md](operations.md)). When set, the bot leaves any server outside the list as soon as it is added there, and in servers outside the list that it was already in it serves nothing: commands, buttons and forms get a short private notice, and it neither auto-joins voice channels nor posts welcomes or VC notices there. It does not leave those servers by itself, so a wrong value costs a config fix rather than every server. Startup lists them in the logs. Direct messages are always served.
 
 If you enable voice recording in production, remember that `/voice record` now requires `Manage Server`, and generated files are delivered ephemerally and cleaned up automatically according to `RECORDING_RETENTION_HOURS`.
 
@@ -106,28 +111,50 @@ runs as its own service next to the bot:
 
 1. In the same Railway project, add a service from the Docker image
    `voicevox/voicevox_engine:cpu-latest`. It listens on port `50021` and needs
-   no volume. Set `VV_CPU_NUM_THREADS` on the engine service to the number of
-   vCPUs it is allowed (usually `1` or `2`), never more: left unset, the engine
-   starts one thread per core it can _see_, which inside a container can be
-   far more than its CPU limit. Measured on a 2-vCPU limit, 4 threads made
-   every line 1.4× slower and 8 threads 2.4× slower; on 1 vCPU the automatic
-   choice was 12–16% slower than `1`. Run `nproc` in the engine service's
-   shell to see what it sees.
-2. Set `VOICEVOX_URL` on the bot to the engine's private address, e.g.
+   no volume. Name the service `voicevox`, or note the private domain shown
+   under the service's **Settings → Networking**: Railway derives it from the
+   service name, and a service created from an image is usually named after
+   the image instead.
+
+   Set `VV_CPU_NUM_THREADS` on the engine service to the number of vCPUs it
+   is allowed (usually `1` or `2`), never more: left unset, the engine starts
+   one thread per core it can _see_, which inside a container can be far more
+   than its CPU limit. Measured on a 2-vCPU limit, 4 threads made every line
+   1.4× slower and 8 threads 2.4× slower; on 1 vCPU the automatic choice was
+   12–16% slower than `1`. Run `nproc` in the engine service's shell to see
+   what it sees.
+
+2. Set `VOICEVOX_URL` on the bot to the engine's private address,
+   `http://<private-domain>:50021` - for a service named `voicevox`,
    `http://voicevox.railway.internal:50021`. Keeping the engine on private
    networking means it is never exposed to the internet.
+
+   The image listens on IPv4 only (`VV_HOST=0.0.0.0`). Railway environments
+   created before October 16, 2025 have an IPv6-only private network, so there
+   the bot cannot connect until you set `VV_HOST=::` on the VOICEVOX service.
+   `::` works in newer environments too, so setting it is always safe. If
+   `/tts start` keeps answering that it cannot reach the speech engine, check
+   the domain and this variable first.
+
 3. In the Discord Developer Portal, open **Bot → Privileged Gateway Intents** and
    turn on **MESSAGE CONTENT INTENT**. The bot only requests that intent when
    `VOICEVOX_URL` is set, and Discord refuses the login (close code 4014) if it
-   is requested without being enabled. Apps with fewer than 10,000 users can
-   toggle it directly; larger apps must apply for it.
+   is requested without being enabled; the bot then logs which intents to
+   enable before exiting. Apps with fewer than 10,000 users can toggle it
+   directly; larger apps must apply for it.
 4. Give the bot the **Speak** permission in voice channels where people will use
    it.
 
 Playback needs no ffmpeg: the bot asks VOICEVOX for 48 kHz stereo audio and
-encodes it to Opus with the bundled encoder. VOICEVOX requires a credit for the
-voices used (for example `VOICEVOX:ずんだもん`); the bot shows it in `/tts`
-replies, and each character's own terms apply.
+encodes it to Opus with the bundled encoder.
+
+VOICEVOX and each character's terms require a credit (for example
+`VOICEVOX:ずんだもん`). The public `/tts start` message credits the default
+voice and the voices of everyone in the channel at that moment. Every other
+character is credited in the voice channel's chat the first time a line in it
+is read during the session: a member who joins later, or who switches voice
+(even from another server), so every voice listeners hear has been credited
+where they can see it. Each character is credited once per session.
 
 One engine serves every server, so the bot sends it one request at a time and
 servers take turns line by line; a burst of chat in one server cannot make
@@ -142,7 +169,15 @@ first line waits for its model.
 
 Where a server has turned auto-join off (`/voice autojoin disable` or an
 excluded channel), `/tts start` still joins, but deafened and without buffering
-any audio, so reading never overrides that choice.
+any audio, so reading never overrides that choice; turning auto-join off or
+excluding the channel later leaves such a join alone. A connection that does
+buffer is still dropped by those commands, which ends any reading through it
+(the channel is told, and `/tts start` resumes reading deafened).
+
+With `VOICEVOX_URL` set the bot receives every guild message, but it keeps no
+message cache (discord.js would otherwise hold the last 200 per channel).
+Members who post are still cached, as other events would cache them, so
+reading adds little memory beyond the sizing above.
 
 ### 4. Choose how production deploys run
 
@@ -174,10 +209,10 @@ Railway’s “Wait for CI” expects a workflow that runs on `push` to `main` (
 
 ## CI/CD
 
-- **GitHub Actions**: Lint, format-check, type-check, test, production dependency audit, and build on PR/push to `main` and `develop`
+- **GitHub Actions**: Lint, format-check, type-check (source and tests), tests with coverage floors, production dependency audit, and build on every pull request (any base branch) and on push to `main` and `develop`
 - **CodeQL**: JavaScript/TypeScript analysis on `main` / `develop` (plus weekly schedule); review alerts under **Security → Code scanning**
 - **Release**: Push tag `v*` to create a GitHub Release with build artifacts; Railway deployment is intentionally handled outside the release workflow
-- **Branch strategy**: `feature/*` or `fix/*` → `main` (or merge via `develop` if your team uses it; either way CI runs on both default integration branches above). **Production Railway** should track **`main`** only, not `develop`.
+- **Branch strategy**: `feature/*` and `fix/*` → `develop` (squash) → `main` through a release PR (merge commit); `hotfix/*` → `main`, then back into `develop`. Railway **staging** tracks `develop` and **production** tracks `main` only - see [operations.md](operations.md).
 - **Runtime**: CI and release workflows run on Node.js `22.12.0`
 - **Local parity**: Run `./scripts/validate.sh` before push — it mirrors CI checks including `npm audit --omit=dev --audit-level=high`
 

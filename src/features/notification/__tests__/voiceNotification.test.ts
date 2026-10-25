@@ -14,6 +14,23 @@ const getSendableTextChannel = vi.fn();
 const send = vi.fn();
 const resolveBackgroundLocale = vi.fn((_guild: unknown) => 'en');
 
+// The real allowlist check against a list each test sets (empty: every
+// server, as in production).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+beforeEach(() => {
+  allowlist.ids = [];
+});
+
 vi.mock('../tracking/voiceTracker.js', () => ({
   voiceTracker: {
     startSession,
@@ -236,6 +253,19 @@ describe('voiceNotification event', () => {
     );
 
     expect(order).toEqual(['startSession', 'send']);
+  });
+
+  it('neither tracks nor announces in a server outside ALLOWED_GUILD_IDS', async () => {
+    allowlist.ids = ['some-other-guild'];
+
+    await event.execute(
+      readyClient() as never,
+      createVoiceState({ channelId: null }),
+      createVoiceState({ channelId: 'vc-a', channelName: 'A' })
+    );
+
+    expect(startSession).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('posts in the language resolved for the guild', async () => {

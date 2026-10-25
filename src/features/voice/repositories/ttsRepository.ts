@@ -2,6 +2,7 @@ import { database } from '../../../infrastructure/database/connection.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
 import {
   compileDictionary,
+  dictionaryKey,
   type CompiledDictionary,
 } from '../tts/textNormalizer.js';
 
@@ -105,7 +106,7 @@ function loadDictionary(guildId: string): CachedDictionary | null {
   try {
     const rows = database
       .prepare(
-        'SELECT word, reading, created_by FROM tts_dictionary WHERE guild_id = ? ORDER BY word ASC'
+        'SELECT word, reading, created_by FROM tts_dictionary WHERE guild_id = ? ORDER BY word_key ASC'
       )
       .all(guildId) as Array<{
       word: string;
@@ -154,9 +155,9 @@ function getDictionaryEntry(
 ): TtsDictionaryEntry | null {
   const row = database
     .prepare(
-      'SELECT word, reading, created_by FROM tts_dictionary WHERE guild_id = ? AND word = ?'
+      'SELECT word, reading, created_by FROM tts_dictionary WHERE guild_id = ? AND word_key = ?'
     )
-    .get(guildId, word) as
+    .get(guildId, dictionaryKey(word)) as
     | { word: string; reading: string; created_by: string }
     | undefined;
   return row
@@ -164,7 +165,14 @@ function getDictionaryEntry(
     : null;
 }
 
-/** Insert or overwrite; returns true when the word was new. */
+/**
+ * Insert or overwrite; returns true when the word was new. Words are one
+ * entry per dictionaryKey, so a case or width variant ("ＡＬＩＣＥ" for
+ * "alice") overwrites rather than adds; the latest spelling is shown. An
+ * overwrite keeps the original author and date: who may change or remove a
+ * word is decided by who added it, so an edit (by them or a server manager)
+ * must not hand it to the editor.
+ */
 function upsertDictionaryEntry(
   guildId: string,
   word: string,
@@ -174,23 +182,22 @@ function upsertDictionaryEntry(
   const existed = getDictionaryEntry(guildId, word) !== null;
   database
     .prepare(
-      `INSERT INTO tts_dictionary (guild_id, word, reading, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(guild_id, word) DO UPDATE SET
+      `INSERT INTO tts_dictionary
+         (guild_id, word_key, word, reading, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(guild_id, word_key) DO UPDATE SET
          word = excluded.word,
-         reading = excluded.reading,
-         created_by = excluded.created_by,
-         created_at = excluded.created_at`
+         reading = excluded.reading`
     )
-    .run(guildId, word, reading, createdBy, Date.now());
+    .run(guildId, dictionaryKey(word), word, reading, createdBy, Date.now());
   dictionaryCache.delete(guildId);
   return !existed;
 }
 
 function removeDictionaryEntry(guildId: string, word: string): boolean {
   const result = database
-    .prepare('DELETE FROM tts_dictionary WHERE guild_id = ? AND word = ?')
-    .run(guildId, word);
+    .prepare('DELETE FROM tts_dictionary WHERE guild_id = ? AND word_key = ?')
+    .run(guildId, dictionaryKey(word));
   dictionaryCache.delete(guildId);
   return result.changes > 0;
 }

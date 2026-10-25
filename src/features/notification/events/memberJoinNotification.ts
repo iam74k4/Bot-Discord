@@ -4,6 +4,7 @@ import { ExtendedClient } from '../../../client.js';
 import { createEmbed } from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
+import { isGuildAllowed } from '../../../shared/utils/guildAllowlist.js';
 import { t, type Locale } from '../../../locales/index.js';
 import { formatNumber } from '../../../locales/format.js';
 import { resolveBackgroundLocale } from '../../../locales/guildLocale.js';
@@ -40,6 +41,7 @@ export const event: Event<typeof Events.GuildMemberAdd> = {
   async execute(client: ExtendedClient, member: GuildMember) {
     if (!client.isFullyReady) return;
     if (member.user.bot) return;
+    if (!isGuildAllowed(member.guild.id)) return;
 
     const guildId = member.guild.id;
     const notifyChannelId = notificationChannelRepository.getEnabled(

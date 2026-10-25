@@ -9,6 +9,7 @@ import {
 } from '../application/announce.js';
 import { reconcileGuild } from '../application/reconcile.js';
 import { logger } from '../../../shared/utils/logger.js';
+import { isGuildAllowed } from '../../../shared/utils/guildAllowlist.js';
 
 function humanMemberCount(
   channel: VoiceChannel | StageChannel | null | undefined
@@ -133,8 +134,12 @@ async function handleUserJoined(
     return;
   }
 
-  // Buffering everyone's audio is opt-out per guild and per channel.
-  if (!voiceSettingsRepository.mayAutoJoin(guild.id, channel.id)) {
+  // Buffering everyone's audio is opt-out per guild and per channel, and
+  // never happens in a server outside ALLOWED_GUILD_IDS.
+  if (
+    !isGuildAllowed(guild.id) ||
+    !voiceSettingsRepository.mayAutoJoin(guild.id, channel.id)
+  ) {
     logger.debug(
       `Auto-join disabled for ${channel.name} (${channel.id}) in guild ${guild.id}`
     );

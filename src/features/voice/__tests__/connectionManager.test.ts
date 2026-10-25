@@ -63,6 +63,7 @@ vi.mock('../recording/channelMixRing.js', () => ({
   channelMixRingManager: {
     getOrCreate: vi.fn(() => mockRing),
     remove: vi.fn(),
+    has: vi.fn(() => false),
   },
 }));
 

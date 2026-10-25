@@ -17,6 +17,23 @@ const logger = {
   debug: vi.fn(),
 };
 
+// The real allowlist check against a list each test sets (empty: every
+// server, as in production).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+beforeEach(() => {
+  allowlist.ids = [];
+});
+
 vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: {
     connect,
@@ -263,6 +280,20 @@ describe('reconcileOccupiedVoiceChannels', () => {
 
     expect(connect).toHaveBeenCalledTimes(1);
     expect(connect).toHaveBeenCalledWith(optedIn, lounge);
+  });
+
+  it('never auto-joins in a server outside ALLOWED_GUILD_IDS', async () => {
+    allowlist.ids = ['guild-on'];
+    const outside = makeGuild('guild-off', [
+      makeVoiceChannel('ch-off', 'Off', [makeMember('u1')]),
+    ]);
+    const lounge = makeVoiceChannel('ch-on', 'On', [makeMember('u2')]);
+    const served = makeGuild('guild-on', [lounge]);
+
+    await reconcile(makeClient([outside, served]));
+
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(connect).toHaveBeenCalledWith(served, lounge);
   });
 
   it('never picks an excluded channel, even when it is the busiest', async () => {

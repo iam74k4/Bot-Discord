@@ -8,6 +8,7 @@ export const en: TranslationKeys = {
     error: 'Error',
     warning: 'Warning',
     guildOnly: 'This command can only be used in a server.',
+    guildNotAllowed: 'This bot is not set up to be used in this server.',
     noPermission: 'You do not have permission to use this command.',
     noData: 'No data',
     unexpectedError:
@@ -557,7 +558,7 @@ export const en: TranslationKeys = {
       waitingForMembers:
         'No voice channel is occupied right now; the bot joins when someone does.',
       disabled:
-        'Auto-join is off for this server. The bot will not join voice channels or keep any audio. Use {command} to turn it back on.',
+        'Auto-join is off for this server. The bot will no longer join voice channels on its own or keep any audio. Use {command} to turn it back on.',
       disabledDropped:
         'The bot left its voice channel and discarded the audio it was keeping.',
       excluded:
@@ -584,6 +585,10 @@ export const en: TranslationKeys = {
       currentChannelNotBuffered:
         '⚠️ Audio in <#{channel}> is not being kept. {reason}',
       currentChannelNone: 'You are not in a voice channel.',
+      readingStopped:
+        'Reading in <#{channel}> stopped too, because that connection was keeping audio. `/tts start` resumes reading without keeping any.',
+      ttsStillReads:
+        '`/tts start` can still bring the bot in, deafened, to read chat.',
     },
     notice: {
       title: '🎙️ Audio in this channel is briefly kept',
@@ -758,18 +763,27 @@ export const en: TranslationKeys = {
       notInSameVoice: 'Not allowed',
       notInSameVoiceDesc:
         'Only members in the voice channel being read (<#{channel}>) or members with {permission} can do this.',
+      stageUnsupported: 'Text-to-speech does not work in Stage channels',
+      stageUnsupportedDesc:
+        'On a Stage the bot joins as a listener, so nobody would hear it. Run `/tts start` in a regular voice channel.',
     },
     started: 'Text-to-speech started',
     startedDesc:
       'Messages in this channel and in the voice chat of <#{voice}> will be read aloud.',
+    startedDescVoiceOnly:
+      'Messages in the voice chat of <#{voice}> will be read aloud.',
     howToTitle: 'How it works',
     howTo:
       '• Only messages from people in <#{voice}> are read\n• Start a message with `;` to keep it silent\n• Change your voice and speed with {voiceCommand}\n• Teach readings with {dictCommand}\n• {skipCommand} skips the current message, {stopCommand} ends reading',
     noSpeakPermission:
-      '⚠️ The bot lacks the Speak permission in this channel, so it may not be heard.',
-    credit: 'Voice: VOICEVOX',
+      '⚠️ The bot lacks the Speak permission in <#{voice}>, so it may not be heard.',
+    noViewPermission:
+      '⚠️ The bot cannot view this channel, so messages here will not be read; only the voice chat is.',
+    credit: 'Voices: {credits}',
     stopped: 'Text-to-speech stopped',
     stoppedDesc: 'Run {command} whenever you want it again.',
+    stoppedByOptOut:
+      'An admin stopped audio buffering here, so the bot left. Run `/tts start` to resume reading without keeping any audio.',
     skipped: 'Skipped the current message.',
     nothingToSkip: 'Nothing is being read right now.',
     voice: {
@@ -782,18 +796,19 @@ export const en: TranslationKeys = {
       unknownDesc: 'Pick one of the suggestions shown while typing.',
       credit: 'Credit: VOICEVOX:{character}',
       preview: 'この声で読み上げます',
+      changed: "<@{user}>'s reading voice is now **{voice}**.",
     },
     dict: {
       addedTitle: 'Added to the dictionary',
-      added: '"{word}" will be read as "{reading}".',
-      updated: 'Updated the reading of "{word}" to "{reading}".',
+      added: '{word} will be read as {reading}.',
+      updated: 'Updated the reading of {word} to {reading}.',
       removedTitle: 'Removed from the dictionary',
-      removed: 'Removed "{word}" from the dictionary.',
+      removed: 'Removed {word} from the dictionary.',
       notFoundTitle: 'Word not in the dictionary',
-      notFound: '"{word}" is not in the dictionary.',
-      notOwnerTitle: 'You cannot remove this word',
+      notFound: '{word} is not in the dictionary.',
+      notOwnerTitle: 'You cannot change this word',
       notOwner:
-        'Only the member who added a word, or members with {permission}, can remove it.',
+        'Only the member who added a word, or members with {permission}, can change or remove it.',
       fullTitle: 'The dictionary is full',
       full: 'The dictionary is full ({max} words). Remove unused words with {command}.',
       listTitle: 'Reading dictionary for this server',

@@ -12,6 +12,7 @@ vi.mock('../../../config/index.js', () => ({
 
 const {
   clampSpeed,
+  DEFAULT_CHARACTER,
   DEFAULT_SPEAKER_ID,
   EDGE_SILENCE_SECONDS,
   estimateAudioSeconds,
@@ -280,6 +281,56 @@ describe('VoicevoxClient', () => {
         new VoicevoxClient(BASE, fetchMock).synthesize('a', 3, 1)
       ).rejects.toThrow('VOICEVOX request failed: socket hang up');
     });
+
+    it("passes the caller's abort signal to both requests", async () => {
+      const fetchMock = fakeFetch({
+        '/audio_query': () => json(QUERY),
+        '/synthesis': () => binary(wav(PCM)),
+      });
+      const caller = new AbortController();
+
+      await new VoicevoxClient(BASE, fetchMock).synthesize('a', 3, 1, {
+        signal: caller.signal,
+      });
+
+      const signals = callsOf(fetchMock).map(({ init }) => init.signal);
+      expect(signals).toHaveLength(2);
+      for (const signal of signals) {
+        expect(signal).toBeInstanceOf(AbortSignal);
+        expect(signal?.aborted).toBe(false);
+      }
+      // Each request's signal follows the caller's.
+      caller.abort();
+      for (const signal of signals) expect(signal?.aborted).toBe(true);
+    });
+
+    it('cancels the request in flight and never synthesizes once aborted', async () => {
+      const caller = new AbortController();
+      const fetchMock = fakeFetch({
+        // Like fetch: settles only when its signal aborts.
+        '/audio_query': (_url, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener('abort', () =>
+              reject(
+                new DOMException('This operation was aborted', 'AbortError')
+              )
+            );
+          }),
+        '/synthesis': () => binary(wav(PCM)),
+      });
+      const promise = new VoicevoxClient(BASE, fetchMock).synthesize(
+        'a',
+        3,
+        1,
+        { signal: caller.signal }
+      );
+
+      caller.abort();
+
+      await expect(promise).rejects.toBeInstanceOf(VoicevoxError);
+      await expect(promise).rejects.toThrow('aborted');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('listVoices', () => {
@@ -412,6 +463,59 @@ describe('VoicevoxClient', () => {
       await expect(
         new VoicevoxClient(BASE, fetchMock, clock).listVoices()
       ).rejects.toThrow('VOICEVOX /speakers returned no list');
+    });
+
+    it('shares one request between callers while it is in flight', async () => {
+      let answer!: (response: Response) => void;
+      const fetchMock = fakeFetch({
+        '/speakers': () =>
+          new Promise<Response>((resolve) => {
+            answer = resolve;
+          }),
+      });
+      const client = new VoicevoxClient(BASE, fetchMock, clock);
+
+      const first = client.listVoices();
+      const second = client.listVoices();
+      answer(json(SPEAKERS));
+
+      expect(await first).toBe(await second);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('asks again after a shared request fails', async () => {
+      let healthy = false;
+      const fetchMock = fakeFetch({
+        '/speakers': () => (healthy ? json(SPEAKERS) : json({}, 503)),
+      });
+      const client = new VoicevoxClient(BASE, fetchMock, clock);
+
+      await expect(
+        Promise.all([client.listVoices(), client.listVoices()])
+      ).rejects.toThrow('503');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      healthy = true;
+      await expect(client.listVoices()).resolves.toHaveLength(3);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the last list readable after it expires or a refetch fails', async () => {
+      let healthy = true;
+      const fetchMock = fakeFetch({
+        '/speakers': () => (healthy ? json(SPEAKERS) : json({}, 503)),
+      });
+      const client = new VoicevoxClient(BASE, fetchMock, clock);
+      expect(client.peekVoices()).toBeNull();
+
+      const voices = await client.listVoices();
+      now += 60 * 60 * 1000;
+      healthy = false;
+      // Expired: answered from the old list while the refresh fails behind it.
+      await expect(client.listVoices()).resolves.toBe(voices);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+      expect(client.peekVoices()).toBe(voices);
     });
 
     it('finds a voice by style id', async () => {
@@ -789,6 +893,17 @@ describe('clampSpeed', () => {
     expect(MIN_SPEED).toBe(0.5);
     expect(MAX_SPEED).toBe(2);
     expect(DEFAULT_SPEAKER_ID).toBe(3);
+  });
+});
+
+describe('DEFAULT_CHARACTER', () => {
+  it('names the character of the default voice', () => {
+    // Used for the credit when the engine's list is unavailable, so it must
+    // match DEFAULT_SPEAKER_ID's character in SPEAKERS.
+    const style = SPEAKERS.find((speaker) =>
+      speaker.styles.some((s) => s.id === DEFAULT_SPEAKER_ID)
+    );
+    expect(DEFAULT_CHARACTER).toBe(style?.name);
   });
 });
 

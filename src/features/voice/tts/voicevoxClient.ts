@@ -72,6 +72,11 @@ export class VoicevoxError extends Error {
 
 /** ずんだもん (ノーマル): the voice most Japanese reading bots default to. */
 export const DEFAULT_SPEAKER_ID = 3;
+/**
+ * The character behind DEFAULT_SPEAKER_ID, for the credit line when the
+ * engine's voice list cannot be fetched.
+ */
+export const DEFAULT_CHARACTER = 'ずんだもん';
 export const MIN_SPEED = 0.5;
 export const MAX_SPEED = 2.0;
 
@@ -207,6 +212,7 @@ function describe(error: unknown): string {
 export class VoicevoxClient {
   private voices: VoicevoxVoice[] | null = null;
   private voicesFetchedAt = 0;
+  /** The /speakers request in flight, shared by everyone waiting on it. */
   private voicesRefresh: Promise<VoicevoxVoice[]> | null = null;
 
   constructor(
@@ -234,7 +240,9 @@ export class VoicevoxClient {
    * Every talk style the engine offers. The list is cached for ten minutes;
    * after that the cached list is still returned at once while a single
    * refresh runs in the background, so autocomplete never waits on the
-   * engine once it has answered. Only a call with nothing cached waits.
+   * engine once it has answered. Only a call with nothing cached waits, and
+   * concurrent callers share one request. Throws when the engine cannot be
+   * reached and nothing is cached.
    */
   async listVoices(): Promise<VoicevoxVoice[]> {
     if (this.voices) {
@@ -246,7 +254,10 @@ export class VoicevoxClient {
     return this.refreshVoices();
   }
 
-  /** The cached voice list, however old, or null before the first fetch. */
+  /**
+   * The last list fetched, even when it is older than the cache allows, or
+   * null if none ever was. For answers that cannot wait on the engine.
+   */
   peekVoices(): VoicevoxVoice[] | null {
     return this.voices;
   }
@@ -309,12 +320,17 @@ export class VoicevoxClient {
   }
 
   /** How the engine would say a text: accents, timing and pauses. */
-  async audioQuery(text: string, speakerId: number): Promise<AudioQuery> {
+  async audioQuery(
+    text: string,
+    speakerId: number,
+    signal?: AbortSignal
+  ): Promise<AudioQuery> {
     const query = await this.request(
       `/audio_query?text=${encodeURIComponent(text)}&speaker=${speakerId}`,
       { method: 'POST' },
       REQUEST_TIMEOUT_MS,
-      async (response) => (await response.json()) as unknown
+      async (response) => (await response.json()) as unknown,
+      signal
     );
     if (!query || typeof query !== 'object' || Array.isArray(query)) {
       throw new VoicevoxError('VOICEVOX /audio_query returned no query');
@@ -324,12 +340,14 @@ export class VoicevoxClient {
 
   /**
    * Render a query, or a slice of one, to 48 kHz stereo 16-bit PCM. The
-   * silence before and after is whatever the query says.
+   * silence before and after is whatever the query says. Aborting `signal`
+   * cancels the request in flight.
    */
   async renderQuery(
     query: AudioQuery,
     speakerId: number,
-    speed: number
+    speed: number,
+    signal?: AbortSignal
   ): Promise<Buffer> {
     const body: AudioQuery = {
       ...query,
@@ -346,7 +364,8 @@ export class VoicevoxClient {
         body: JSON.stringify(body),
       },
       synthesisTimeoutMs(estimateAudioSeconds(body)),
-      async (response) => Buffer.from(await response.arrayBuffer())
+      async (response) => Buffer.from(await response.arrayBuffer()),
+      signal
     );
 
     let audio;
@@ -373,31 +392,39 @@ export class VoicevoxClient {
 
   /**
    * Render text as one utterance, with `EDGE_SILENCE_SECONDS` of silence on
-   * each side unless told otherwise.
+   * each side unless told otherwise. Aborting `signal` cancels the request in
+   * flight and skips the step after it.
    */
   async synthesize(
     text: string,
     speakerId: number,
     speed: number,
-    edges: UtteranceEdges = {}
+    { signal, ...edges }: UtteranceEdges & { signal?: AbortSignal } = {}
   ): Promise<Buffer> {
-    const query = await this.audioQuery(text, speakerId);
+    const query = await this.audioQuery(text, speakerId, signal);
     query.prePhonemeLength = edges.prePhonemeLength ?? EDGE_SILENCE_SECONDS;
     query.postPhonemeLength = edges.postPhonemeLength ?? EDGE_SILENCE_SECONDS;
-    return this.renderQuery(query, speakerId, speed);
+    return this.renderQuery(query, speakerId, speed, signal);
   }
 
   /**
    * One request with its own deadline, which also covers reading the body.
-   * Every failure - network, status, body, timeout - is a VoicevoxError.
+   * Every failure - network, status, body, timeout, an aborted `signal` - is
+   * a VoicevoxError.
    */
   private async request<T>(
     path: string,
     init: RequestInit,
     timeoutMs: number,
-    read: (response: Response) => Promise<T>
+    read: (response: Response) => Promise<T>,
+    signal?: AbortSignal
   ): Promise<T> {
     const endpoint = path.split('?')[0];
+    if (signal?.aborted) {
+      throw new VoicevoxError(
+        `VOICEVOX request failed: ${describe(signal.reason)}`
+      );
+    }
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(new Error(`timed out after ${timeoutMs} ms`)),
@@ -408,7 +435,9 @@ export class VoicevoxClient {
       try {
         response = await this.fetchImpl(`${this.baseUrl}${path}`, {
           ...init,
-          signal: controller.signal,
+          signal: signal
+            ? AbortSignal.any([signal, controller.signal])
+            : controller.signal,
         });
       } catch (error) {
         throw new VoicevoxError(`VOICEVOX request failed: ${describe(error)}`);

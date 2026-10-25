@@ -22,6 +22,8 @@ export const ja: TranslationKeys = {
     error: 'エラー',
     warning: '警告',
     guildOnly: 'このコマンドはサーバー内でのみ使用できます。',
+    guildNotAllowed:
+      'このBotはこのサーバーでは利用できない設定になっています。',
     noPermission: 'このコマンドを使用する権限がありません。',
     noData: 'データなし',
     unexpectedError:
@@ -565,7 +567,7 @@ export const ja: TranslationKeys = {
       waitingForMembers:
         '今は人がいるVCがないため、誰かがVCに入ったときに参加します。',
       disabled:
-        'このサーバーでVC自動参加をオフにしました。BotはこれからVCに参加せず、音声も保持しません。再開するには {command} を使ってください。',
+        'このサーバーでVC自動参加をオフにしました。Botが自分からVCに参加することはなくなり、音声も保持しません。再開するには {command} を使ってください。',
       disabledDropped:
         '参加していたVCから退出し、保持していた音声を破棄しました。',
       excluded:
@@ -592,6 +594,10 @@ export const ja: TranslationKeys = {
       currentChannelNotBuffered:
         '⚠️ <#{channel}> の音声は保持されていません。{reason}',
       currentChannelNone: 'あなたはVCに参加していません。',
+      readingStopped:
+        '<#{channel}> では音声を保持していたため、読み上げも終了しました。`/tts start` を実行すると、音声を保持せずに読み上げを再開できます。',
+      ttsStillReads:
+        '`/tts start` で読み上げるときだけ、Botはスピーカーミュートの状態で参加します。',
     },
     notice: {
       title: '🎙️ このVCの音声を一時的に保持しています',
@@ -746,7 +752,7 @@ export const ja: TranslationKeys = {
 
   tts: {
     errors: {
-      notConfigured: '読み上げは準備中です',
+      notConfigured: '読み上げは設定されていません',
       notConfiguredDesc:
         'このBotには読み上げエンジン（VOICEVOX）が設定されていません。Bot運営者に `VOICEVOX_URL` の設定を依頼してください。',
       engineDown: '読み上げエンジンに接続できません',
@@ -766,18 +772,27 @@ export const ja: TranslationKeys = {
       notInSameVoice: '操作できません',
       notInSameVoiceDesc:
         '読み上げ中のVC（<#{channel}>）に参加している人か、{permission}の権限を持つ人だけが操作できます。',
+      stageUnsupported: 'ステージチャンネルでは読み上げできません',
+      stageUnsupportedDesc:
+        'ステージではBotが聞き手として参加するため、読み上げても声が届きません。通常のボイスチャンネルで `/tts start` を実行してください。',
     },
     started: '読み上げを開始しました',
     startedDesc:
       '<#{voice}> で、このチャンネルとVCのチャットに書かれた発言を読み上げます。',
+    startedDescVoiceOnly:
+      '<#{voice}> で、VCのチャットに書かれた発言を読み上げます。',
     howToTitle: '使い方',
     howTo:
       '・読み上げるのは <#{voice}> にいる人の発言だけです\n・先頭に `;` を付けると読み上げません\n・{voiceCommand} で自分の声と速さを変えられます\n・{dictCommand} で読み方を登録できます\n・{skipCommand} で今の発言を飛ばし、{stopCommand} で終了します',
     noSpeakPermission:
-      '⚠️ Botにこのチャンネルの「発言」権限がないため、声が届かない可能性があります。',
-    credit: '音声: VOICEVOX',
+      '⚠️ Botに <#{voice}> の「発言」権限がないため、声が届かない可能性があります。',
+    noViewPermission:
+      '⚠️ Botはこのチャンネルを閲覧できないため、ここでの発言は読み上げられません。読み上げるのはVCのチャットだけです。',
+    credit: '音声: {credits}',
     stopped: '読み上げを終了しました',
     stoppedDesc: 'また使うときは {command} を実行してください。',
+    stoppedByOptOut:
+      '管理者が音声の保持を止めたため、Botは退出しました。`/tts start` を実行すると、音声を保持せずに読み上げを再開できます。',
     skipped: '今の発言を飛ばしました。',
     nothingToSkip: '今は何も読み上げていません。',
     voice: {
@@ -790,18 +805,19 @@ export const ja: TranslationKeys = {
       unknownDesc: '入力欄に表示される候補から選んでください。',
       credit: 'クレジット: VOICEVOX:{character}',
       preview: 'この声で読み上げます',
+      changed: '<@{user}> さんの読み上げの声が **{voice}** になりました。',
     },
     dict: {
       addedTitle: '辞書に登録しました',
-      added: '「{word}」を「{reading}」と読みます。',
-      updated: '「{word}」の読み方を「{reading}」に更新しました。',
+      added: '{word} を {reading} と読みます。',
+      updated: '{word} の読み方を {reading} に更新しました。',
       removedTitle: '辞書から削除しました',
-      removed: '「{word}」を辞書から削除しました。',
+      removed: '{word} を辞書から削除しました。',
       notFoundTitle: '辞書に登録されていない単語です',
-      notFound: '「{word}」は辞書に登録されていません。',
-      notOwnerTitle: 'この単語は削除できません',
+      notFound: '{word} は辞書に登録されていません。',
+      notOwnerTitle: 'この単語は変更・削除できません',
       notOwner:
-        '他の人が登録した単語は、登録した本人か{permission}の権限を持つ人だけが削除できます。',
+        '他の人が登録した単語は、登録した本人か{permission}の権限を持つ人だけが変更・削除できます。',
       fullTitle: '辞書がいっぱいです',
       full: '辞書の登録数が上限（{max}件）に達しています。不要な単語を {command} で削除してください。',
       listTitle: 'このサーバーの読み上げ辞書',

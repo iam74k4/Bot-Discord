@@ -647,6 +647,30 @@ describe('executeRoleCommand', () => {
       ]);
     });
 
+    // Regression: the confirmation used to share a `try` with the role change,
+    // so a lost confirmation reported a granted role as failed.
+    it('does not report a granted role as failed when only the confirmation is lost', async () => {
+      const reply = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('Unknown interaction'))
+        .mockResolvedValue({});
+      const { interaction, editReply, rolesAdd } = setup({
+        subcommand: 'add',
+        reply,
+      });
+
+      await executeRoleCommand(interaction).catch(() => undefined);
+
+      expect(rolesAdd).toHaveBeenCalledWith(ROLE.id);
+      const failed = t('admin.role.errors.failed', 'en');
+      const described = [...reply.mock.calls, ...editReply.mock.calls].map(
+        ([payload]) =>
+          (payload as { embeds?: Array<{ data?: { description?: string } }> })
+            .embeds?.[0]?.data?.description
+      );
+      expect(described).not.toContain(failed);
+    });
+
     it('warns instead of calling Discord when the member already has it', async () => {
       const { interaction, reply, rolesAdd } = setup({
         subcommand: 'add',

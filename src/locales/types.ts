@@ -61,6 +61,7 @@ export interface TranslationKeys {
     error: string;
     warning: string;
     guildOnly: string;
+    guildNotAllowed: string;
     noPermission: string;
     noData: string;
     /** {id}: short error reference that is also written to the log. */
@@ -626,6 +627,8 @@ export interface TranslationKeys {
       currentChannelExcluded: string;
       currentChannelNotBuffered: string;
       currentChannelNone: string;
+      readingStopped: string;
+      ttsStillReads: string;
     };
     notice: {
       title: string;
@@ -761,15 +764,20 @@ export interface TranslationKeys {
       notRunningDesc: string;
       notInSameVoice: string;
       notInSameVoiceDesc: string;
+      stageUnsupported: string;
+      stageUnsupportedDesc: string;
     };
     started: string;
     startedDesc: string;
+    startedDescVoiceOnly: string;
     howToTitle: string;
     howTo: string;
     noSpeakPermission: string;
+    noViewPermission: string;
     credit: string;
     stopped: string;
     stoppedDesc: string;
+    stoppedByOptOut: string;
     skipped: string;
     nothingToSkip: string;
     voice: {
@@ -781,6 +789,7 @@ export interface TranslationKeys {
       unknownDesc: string;
       credit: string;
       preview: string;
+      changed: string;
     };
     dict: {
       addedTitle: string;

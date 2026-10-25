@@ -19,15 +19,18 @@ vi.mock('../recording/connectionManager.js', () => ({
   },
 }));
 
+const isChannelExcluded = vi.hoisted(() => vi.fn(() => false));
+
 vi.mock('../repositories/voiceSettingsRepository.js', () => ({
   voiceSettingsRepository: {
     isAutoJoinEnabled: vi.fn(() => true),
-    isChannelExcluded: vi.fn(() => false),
+    isChannelExcluded,
   },
 }));
 
-const { isBuffering, diagnoseBufferingGap } =
+const { isBuffering, diagnoseBufferingGap, describeBufferingGap } =
   await import('../application/diagnose.js');
+const { t } = await import('../../../locales/index.js');
 
 const GUILD = 'guild-1';
 const VC = 'vc-1';
@@ -35,7 +38,11 @@ const VC = 'vc-1';
 describe('/voice status with text-to-speech connections', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    isChannelExcluded.mockReturnValue(false);
   });
+
+  const guild = { id: GUILD, members: { me: null } };
+  const channel = { id: VC, permissionsFor: vi.fn(() => null) };
 
   it('does not count a text-to-speech-only connection as buffering', () => {
     getConnection.mockReturnValue({ channelId: VC, receiving: false });
@@ -61,11 +68,37 @@ describe('/voice status with text-to-speech connections', () => {
 
   it('explains a text-to-speech-only connection as reading aloud, not as missing', () => {
     getConnectedChannelInGuild.mockReturnValue(VC);
-    const guild = { id: GUILD, members: { me: null } };
-    const channel = { id: VC, permissionsFor: vi.fn(() => null) };
 
     expect(
       diagnoseBufferingGap(guild as never, channel as never)
     ).toStrictEqual({ reason: 'readOnly' });
+  });
+
+  it.each<'en' | 'ja'>(['en', 'ja'])(
+    'says a text-to-speech-only connection is only reading (%s)',
+    (locale) => {
+      getConnection.mockReturnValue({ channelId: VC, receiving: false });
+      getConnectedChannelInGuild.mockReturnValue(VC);
+
+      expect(isBuffering(VC)).toBe(false);
+      // Not "buffered", and not "the bot has not joined" either.
+      expect(
+        describeBufferingGap(
+          diagnoseBufferingGap(guild as never, channel as never),
+          VC,
+          locale
+        )
+      ).toBe(t('record.notBuffered.readOnly', locale, { channel: VC }));
+    }
+  );
+
+  it('still reports an excluded channel as excluded', () => {
+    isChannelExcluded.mockReturnValue(true);
+    getConnection.mockReturnValue({ channelId: VC, receiving: false });
+    getConnectedChannelInGuild.mockReturnValue(VC);
+
+    expect(
+      diagnoseBufferingGap(guild as never, channel as never)
+    ).toStrictEqual({ reason: 'excluded' });
   });
 });

@@ -11,8 +11,9 @@ import {
 /**
  * Runs every slash command path the registry discovers against the real
  * application code, so a command added under `src/features/<f>/commands/`
- * is smoke-tested with no change to this file (beyond declaring who may use
- * it in `COMMAND_POLICY`, which one test insists on).
+ * is smoke-tested once it is declared: who may use it in `COMMAND_POLICY`
+ * (command-smoke.helpers.ts), and each path in `REACHES` or `READ_ONLY`
+ * below. Tests insist on both, so nothing new slips through undeclared.
  *
  * Only true externals are replaced: the database is in-memory SQLite brought
  * up by the real migration runner, voice connections and the recorder are
@@ -67,6 +68,8 @@ const voice = vi.hoisted(() => {
       connectedAt: number;
       /** False for a join made only to read aloud (nothing is buffered). */
       receiving?: boolean;
+      /** Stands in for the VoiceConnection; compared by identity. */
+      connection: object;
     }
   >();
   // Enough of an @discordjs/voice AudioPlayer for playback to start and be
@@ -110,24 +113,36 @@ const voice = vi.hoisted(() => {
           channel: { id: string },
           options: { receive?: boolean } = {}
         ) => {
-          const connection = {
+          const info = {
             channelId: channel.id,
             guildId: guild.id,
             connectedAt: Date.now(),
             receiving: options.receive !== false,
+            connection: {},
           };
-          connections.set(channel.id, connection);
-          return connection;
+          connections.set(channel.id, info);
+          return info.connection;
         }
       ),
-      waitUntilReady: vi.fn(async (channelId: string) =>
-        connections.has(channelId)
+      // The connection once ready, or null, like the real one.
+      waitUntilReady: vi.fn(
+        async (channelId: string) =>
+          connections.get(channelId)?.connection ?? null
       ),
+      enableReceive: vi.fn((channelId: string) => {
+        const connection = connections.get(channelId);
+        if (!connection || connection.receiving !== false) return false;
+        connection.receiving = true;
+        return true;
+      }),
       getPlayer: vi.fn((channelId: string) =>
         connections.has(channelId) ? player : undefined
       ),
       setSelfMute: vi.fn((channelId: string) => connections.has(channelId)),
-      disconnect: vi.fn(async (channelId: string) => {
+      disconnect: vi.fn(async (channelId: string, expected?: object) => {
+        if (expected && connections.get(channelId)?.connection !== expected) {
+          return;
+        }
         connections.delete(channelId);
       }),
       // Hooks run before the bot leaves (clearing its voice channel status);
@@ -393,13 +408,16 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
     voice.connections.clear();
   },
   'tts stop': (world) => {
-    // The bot joined only to read (nothing is buffered), so stopping also
-    // leaves the channel.
+    // The server has auto-join off, so the bot joined only to read (nothing
+    // is buffered) and stopping also leaves the channel. (With auto-join on,
+    // stopping would hand the channel back to it instead.)
+    voiceSettingsRepository.setAutoJoinEnabled(world.guild.id, false);
     voice.connections.set(world.voiceChannel.id, {
       channelId: world.voiceChannel.id,
       guildId: world.guild.id,
       connectedAt: Date.now(),
       receiving: false,
+      connection: {},
     });
     startReading(world);
   },
@@ -461,6 +479,7 @@ beforeEach(() => {
     channelId: world.voiceChannel.id,
     guildId: world.guild.id,
     connectedAt: Date.now(),
+    connection: {},
   });
 });
 
@@ -1397,7 +1416,11 @@ const REACHES: Array<{
     label: 'voice autojoin disable',
     reached: (w) => {
       expect(voiceSettingsRepository.isAutoJoinEnabled(w.guild.id)).toBe(false);
-      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(
+        w.voiceChannel.id,
+        expect.any(Object)
+      );
+      expect(voice.connections.has(w.voiceChannel.id)).toBe(false);
     },
   },
   {
@@ -1406,7 +1429,11 @@ const REACHES: Array<{
       expect(voiceSettingsRepository.listExclusions(w.guild.id)).toEqual([
         w.voiceChannel.id,
       ]);
-      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(
+        w.voiceChannel.id,
+        expect.any(Object)
+      );
+      expect(voice.connections.has(w.voiceChannel.id)).toBe(false);
       expect(voiceSettingsRepository.isAutoJoinEnabled(w.guild.id)).toBe(true);
     },
   },

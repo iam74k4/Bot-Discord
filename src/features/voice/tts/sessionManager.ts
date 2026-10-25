@@ -61,6 +61,11 @@ export interface TtsSessionInfo {
   voiceChannelId: string;
   /** Text channels being read; always includes the voice channel's own chat. */
   textChannelIds: ReadonlySet<string>;
+  /**
+   * VOICEVOX characters whose credit listeners have already been shown in
+   * this session (see creditCharacter).
+   */
+  creditedCharacters: ReadonlySet<string>;
   startedBy: string;
   startedAt: number;
 }
@@ -145,7 +150,10 @@ interface QueueItem {
 interface Session {
   /** Scheduler key; never reused, so a restarted session gets nothing old. */
   key: string;
-  info: TtsSessionInfo & { textChannelIds: Set<string> };
+  info: TtsSessionInfo & {
+    textChannelIds: Set<string>;
+    creditedCharacters: Set<string>;
+  };
   queue: QueueItem[];
   playing: boolean;
   current: QueueItem | null;
@@ -217,6 +225,8 @@ export class TtsSessionManager {
     voiceChannelId: string;
     textChannelId: string;
     startedBy: string;
+    /** Characters the start message credits. */
+    creditedCharacters?: Iterable<string>;
   }): TtsSessionInfo {
     for (const session of [...this.sessions.values()]) {
       if (
@@ -230,6 +240,9 @@ export class TtsSessionManager {
     const existing = this.sessions.get(params.voiceChannelId);
     if (existing) {
       existing.info.textChannelIds.add(params.textChannelId);
+      for (const character of params.creditedCharacters ?? []) {
+        existing.info.creditedCharacters.add(character);
+      }
       return existing.info;
     }
 
@@ -239,6 +252,7 @@ export class TtsSessionManager {
         guildId: params.guildId,
         voiceChannelId: params.voiceChannelId,
         textChannelIds: new Set([params.voiceChannelId, params.textChannelId]),
+        creditedCharacters: new Set(params.creditedCharacters),
         startedBy: params.startedBy,
         startedAt: this.now(),
       },
@@ -251,7 +265,8 @@ export class TtsSessionManager {
     };
     this.sessions.set(params.voiceChannelId, session);
 
-    // Muted while idle so the member list shows the bot cannot be heard.
+    // Unmuted for the session; stop() mutes again, so the member list shows
+    // the bot as muted whenever it cannot be heard.
     this.deps.setSelfMute(params.voiceChannelId, false);
     return session.info;
   }
@@ -308,6 +323,18 @@ export class TtsSessionManager {
   ): TtsSessionInfo | undefined {
     const session = this.getForGuild(guildId);
     return session?.textChannelIds.has(textChannelId) ? session : undefined;
+  }
+
+  /**
+   * Record that a character's credit is being shown in this session. True
+   * the first time for each character - the caller then posts the credit -
+   * and false once it has been, or when there is no session any more.
+   */
+  creditCharacter(voiceChannelId: string, character: string): boolean {
+    const credited = this.sessions.get(voiceChannelId)?.info.creditedCharacters;
+    if (!credited || credited.has(character)) return false;
+    credited.add(character);
+    return true;
   }
 
   /** Lines waiting to be spoken, not counting the one playing. */
@@ -801,6 +828,9 @@ export function playPcm(
       if (remaining > 0) {
         timer = setTimeout(watch, remaining);
       } else {
+        // Stop it too, so a clip that was only stuck cannot resume later over
+        // the next one.
+        player.stop(true);
         finish();
       }
     };
@@ -808,7 +838,11 @@ export function playPcm(
 
     player.on(AudioPlayerStatus.Idle, finish);
     player.on('error', onError);
-    player.play(resource);
+    try {
+      player.play(resource);
+    } catch (error) {
+      onError(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }
 

@@ -100,7 +100,7 @@ export const command: Command = {
         .addSubcommand((sub) =>
           sub
             .setName('disable')
-            .setDescription('Stop the bot joining and keeping audio entirely')
+            .setDescription('Stop auto-joining and keeping audio')
             .setDescriptionLocalizations({
               ja: '自動参加と音声の保持をすべて止める',
             })
@@ -108,7 +108,9 @@ export const command: Command = {
         .addSubcommand((sub) =>
           sub
             .setName('exclude')
-            .setDescription('Keep the bot out of one voice channel')
+            .setDescription(
+              'Exclude one voice channel from auto-join and keeping audio'
+            )
             .setDescriptionLocalizations({
               ja: '特定のVCを自動参加の対象外にする',
             })

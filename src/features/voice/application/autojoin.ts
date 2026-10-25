@@ -67,6 +67,21 @@ function answer(
 }
 
 /**
+ * The opt-outs stop auto-join and buffering, not reading: a deafened
+ * text-to-speech join keeps nothing and stays. Only mention reading where
+ * the bot can read at all.
+ */
+function withTtsNote(description: string, locale: Locale): string {
+  return env.VOICEVOX_URL
+    ? `${description} ${t('record.autojoin.ttsStillReads', locale)}`
+    : description;
+}
+
+function readingStoppedLine(channelId: string, locale: Locale): string {
+  return t('record.autojoin.readingStopped', locale, { channel: channelId });
+}
+
+/**
  * `/voice autojoin` - control whether the bot joins voice channels and keeps
  * their audio. Gated by the command's ManageGuild middleware.
  */
@@ -118,16 +133,22 @@ export async function executeAutoJoinCommand(
   if (subcommand === 'disable') {
     // Turning it off stops the buffering already in progress, not just the
     // next join, and the reply waits until the bot has actually left.
-    const dropped = await disableAutoJoin(guild.id);
+    const { dropped, readingStoppedIn } = await disableAutoJoin(guild);
     audit({ kind: 'autoJoinDisabled' });
     await answer(
       interaction,
       locale,
       [
-        t('record.autojoin.disabled', locale, {
-          command: commandMention('voice autojoin enable'),
-        }),
+        withTtsNote(
+          t('record.autojoin.disabled', locale, {
+            command: commandMention('voice autojoin enable'),
+          }),
+          locale
+        ),
         dropped > 0 ? t('record.autojoin.disabledDropped', locale) : null,
+        ...readingStoppedIn.map((channelId) =>
+          readingStoppedLine(channelId, locale)
+        ),
       ],
       COLORS.SUCCESS
     );
@@ -153,20 +174,27 @@ export async function executeAutoJoinCommand(
   }
 
   if (subcommand === 'exclude') {
-    const { added, left } = await excludeChannel(guild, channel.id);
+    const { added, left, readingStopped } = await excludeChannel(
+      guild,
+      channel.id
+    );
     if (added) audit({ kind: 'channelExcluded', channelId: channel.id });
     await answer(
       interaction,
       locale,
       [
-        added
-          ? t('record.autojoin.excluded', locale, { channel: channel.id })
-          : t('record.autojoin.alreadyExcluded', locale, {
-              channel: channel.id,
-            }),
+        withTtsNote(
+          added
+            ? t('record.autojoin.excluded', locale, { channel: channel.id })
+            : t('record.autojoin.alreadyExcluded', locale, {
+                channel: channel.id,
+              }),
+          locale
+        ),
         left
           ? t('record.autojoin.excludedLeft', locale, { channel: channel.id })
           : null,
+        readingStopped ? readingStoppedLine(channel.id, locale) : null,
       ],
       added ? COLORS.SUCCESS : COLORS.INFO
     );

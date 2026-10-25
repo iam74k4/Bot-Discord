@@ -217,11 +217,60 @@ describe('TtsSessionManager', () => {
         guildId: GUILD,
         voiceChannelId: VC,
         textChannelIds: new Set([VC, TEXT]),
+        creditedCharacters: new Set(),
         startedBy: 'starter',
         startedAt: 1234,
       });
       expect(h.manager.get(VC)).toBe(info);
       expect(h.manager.getForGuild(GUILD)).toBe(info);
+    });
+
+    it('credits each character once per session', () => {
+      const h = harness();
+      h.manager.start({
+        guildId: GUILD,
+        voiceChannelId: VC,
+        textChannelId: TEXT,
+        startedBy: 'starter',
+        creditedCharacters: ['ずんだもん'],
+      });
+
+      // Already named by the start message.
+      expect(h.manager.creditCharacter(VC, 'ずんだもん')).toBe(false);
+      // New: the caller posts the credit, once.
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(true);
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(false);
+      expect([...h.manager.get(VC)!.creditedCharacters]).toEqual([
+        'ずんだもん',
+        '四国めたん',
+      ]);
+      // No session, nothing to credit.
+      expect(h.manager.creditCharacter('nope', '春日部つむぎ')).toBe(false);
+    });
+
+    it('adds the characters a second start credits to the running session', () => {
+      const h = harness();
+      h.start();
+
+      h.manager.start({
+        guildId: GUILD,
+        voiceChannelId: VC,
+        textChannelId: 'text-2',
+        startedBy: 'other',
+        creditedCharacters: ['四国めたん'],
+      });
+
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(false);
+    });
+
+    it('forgets what was credited when the session ends', () => {
+      const h = harness();
+      h.start();
+      h.manager.creditCharacter(VC, '四国めたん');
+      h.manager.stop(VC);
+
+      h.start();
+      expect(h.manager.creditCharacter(VC, '四国めたん')).toBe(true);
     });
 
     it('unmutes when a session starts', () => {
@@ -804,6 +853,54 @@ describe('TtsSessionManager', () => {
         expect(h.prepared()).not.toContain('L4');
       });
 
+      it('sends no extra engine requests when a flood overflows the queue', async () => {
+        const h = harness();
+        h.start();
+        h.manager.enqueue(VC, solo('L1'));
+        await flush();
+        h.finish('L1');
+        await flush();
+        expect(h.played()).toEqual(['L1']); // and still playing
+
+        for (let i = 2; i <= 51; i++) h.manager.enqueue(VC, solo(`L${i}`));
+        await flush();
+
+        // Only the playing line and the lookahead were handed to the engine.
+        expect(h.manager.queueLength(VC)).toBe(MAX_QUEUE_LENGTH);
+        expect(h.prepared()).toEqual(['L1', 'L2']);
+
+        // The lines already handed over play first, then the newest lines
+        // that survived; nothing dropped ever reached the engine.
+        h.state.auto = true;
+        h.finish('L2');
+        for (let i = 0; i < 12; i++) {
+          await flush();
+          for (const p of h.plays) p.job.resolve();
+        }
+        await flush();
+        const survivors = [];
+        for (
+          let i = 51 - (MAX_QUEUE_LENGTH - PREFETCH_COUNT) + 1;
+          i <= 51;
+          i++
+        ) {
+          survivors.push(`L${i}`);
+        }
+        expect(h.played()).toEqual(['L1', 'L2', 'L3', ...survivors]);
+        expect(h.prepared()).toEqual(['L1', 'L2', 'L3', ...survivors]);
+      });
+
+      it('never cancels the requests of a line that is still wanted', async () => {
+        const h = harness({ auto: true });
+        h.start();
+
+        h.manager.enqueue(VC, line('one|two'));
+        await flush();
+
+        expect(h.rendered()).toEqual(['one', 'two']);
+        expect(h.played()).toEqual(['onetwo']);
+      });
+
       it('sends a flood to the engine no faster than it can render', async () => {
         const h = harness();
         h.start();
@@ -1187,6 +1284,25 @@ describe('TtsSessionManager', () => {
 
       expect(h.prepared()).toEqual(['A1']);
     });
+
+    it('moves on from a skipped line still rendering without waiting on it or warning', async () => {
+      const h = harness();
+      h.start();
+      h.manager.enqueue(VC, solo('skipped'));
+      h.manager.enqueue(VC, solo('kept'));
+      await flush();
+
+      h.manager.skip(VC);
+      // The engine finishes the abandoned request, which keeps its slot until
+      // then; its audio is thrown away and the next line goes straight on.
+      h.finish('skipped');
+      await flush();
+      h.finish('kept');
+      await flush();
+
+      expect(h.played()).toEqual(['kept']);
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
   });
 
   describe('stopping mid-queue', () => {
@@ -1209,6 +1325,23 @@ describe('TtsSessionManager', () => {
 
       expect(h.played()).toEqual(['L1']);
       expect(h.manager.enqueue(VC, line('late'))).toBe(false);
+    });
+
+    it('cancels every line still waiting or rendering when the session stops', async () => {
+      const h = harness();
+      h.start();
+      for (const text of ['L1', 'L2', 'L3']) h.manager.enqueue(VC, solo(text));
+      await flush();
+      expect(h.prepared()).toEqual(['L1']);
+
+      h.manager.stop(VC);
+      // The request already with the engine settles; nothing else is sent.
+      h.finish('L1');
+      await flush();
+
+      expect(h.prepared()).toEqual(['L1']);
+      expect(h.deps.play).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
     });
 
     it('sends the engine nothing more for a stopped session', async () => {
@@ -1418,6 +1551,27 @@ describe('playPcm', () => {
     expect(done).toBe(true);
     expect(player.listenerCount('idle')).toBe(0);
     expect(lastResource().stream.destroyed).toBe(true);
+    // Stopped too, so the stuck clip cannot resume over the next one.
+    expect(player.stop).toHaveBeenCalledWith(true);
+  });
+
+  it.each([
+    ['an Error', new Error('player destroyed')],
+    ['anything else', 'player destroyed'],
+  ])('resolves and cleans up when the player throws %s', async (_l, thrown) => {
+    const player = new FakePlayer();
+    player.play.mockImplementation(() => {
+      throw thrown;
+    });
+
+    await playPcm(player as unknown as AudioPlayer, Buffer.alloc(4));
+
+    expect(logger.debug).toHaveBeenCalledWith(
+      'TTS playback error: player destroyed'
+    );
+    expect(player.listenerCount('idle')).toBe(0);
+    expect(player.listenerCount('error')).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   describe('speech encoding', () => {
@@ -1627,6 +1781,7 @@ describe('playPcm', () => {
       expect(done).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(done).toBe(true);
+      expect(player.stop).toHaveBeenCalledWith(true);
     });
 
     it('stops pulling parts once playback has ended', async () => {

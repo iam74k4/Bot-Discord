@@ -31,6 +31,7 @@ import {
 import { metrics } from '../../infrastructure/metrics/index.js';
 import { t } from '../../locales/index.js';
 import { resolveLocale } from '../../locales/guildLocale.js';
+import { isGuildAllowed } from '../../shared/utils/guildAllowlist.js';
 
 /**
  * How long a click on an unclaimed message waits for something else to
@@ -247,6 +248,37 @@ async function answerExpiredComponent(
 }
 
 /**
+ * A server outside ALLOWED_GUILD_IDS gets a short refusal rather than
+ * silence, so whoever typed the command - or clicked a button left from
+ * before the list was set - knows it is the bot's configuration and not
+ * their permissions. See guildAllowlist.ts.
+ */
+async function refuseDisallowedGuild(
+  interaction:
+    | ChatInputCommandInteraction
+    | MessageComponentInteraction
+    | ModalSubmitInteraction
+): Promise<void> {
+  const what = interaction.isChatInputCommand()
+    ? `/${interaction.commandName}`
+    : interaction.customId;
+  logger.debug(
+    `Refused ${what} in ${interaction.guildId}: not in ALLOWED_GUILD_IDS`
+  );
+  const locale = resolveLocale(interaction);
+  await interaction
+    .reply({
+      content: t('common.guildNotAllowed', locale),
+      flags: MessageFlags.Ephemeral,
+    })
+    .catch((error: unknown) => {
+      logger.debug(
+        `Failed to refuse a disallowed server: ${getErrorMessage(error)}`
+      );
+    });
+}
+
+/**
  * A click the router cannot place while features are starting or stopping:
  * it may belong to a persistent button whose handler is not registered yet
  * (or any more), so the message is left exactly as it is and only the
@@ -403,6 +435,27 @@ export async function routeInteraction(
   client: ExtendedClient,
   interaction: Interaction
 ): Promise<void> {
+  // Before any handler, live component or grace period: nothing of this
+  // deployment runs in a server it is not meant for.
+  if (!isGuildAllowed(interaction.guildId)) {
+    if (interaction.isAutocomplete()) {
+      await interaction.respond([]).catch((error: unknown) => {
+        logger.debug(
+          `Failed to respond to autocomplete: ${getErrorMessage(error)}`
+        );
+      });
+    } else if (
+      interaction.isChatInputCommand() ||
+      (typeof interaction.isMessageComponent === 'function' &&
+        interaction.isMessageComponent()) ||
+      (typeof interaction.isModalSubmit === 'function' &&
+        interaction.isModalSubmit())
+    ) {
+      await refuseDisallowedGuild(interaction);
+    }
+    return;
+  }
+
   if (interaction.isAutocomplete()) {
     await handleAutocompleteInteraction(client, interaction);
     return;

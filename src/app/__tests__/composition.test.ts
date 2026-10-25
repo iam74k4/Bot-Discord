@@ -12,8 +12,10 @@ import {
   createApp,
   defaultDependencies,
   liveComponentShutdownBudget,
+  disallowedIntentsHint,
   type AppDependencies,
 } from '../composition.js';
+import { createClient } from '../../client.js';
 import { loadCommands } from '../../handlers/commandHandler.js';
 import { loadEvents } from '../../handlers/eventHandler.js';
 import {
@@ -469,6 +471,49 @@ describe('defaultDependencies', () => {
     await expect(defaultDependencies().login(client, 'bad')).rejects.toThrow(
       'TokenInvalid'
     );
+  });
+
+  it.each([
+    ['with', true, /MESSAGE CONTENT INTENT.*VOICEVOX_URL/],
+    ['without', false, /SERVER MEMBERS INTENT\.$/],
+  ])(
+    'explains a refused intent %s text-to-speech, then still fails',
+    async (_label, messageContent, hint) => {
+      const client = createClient({ messageContent });
+      const refused = new Error('Used disallowed intents');
+      vi.spyOn(client, 'login').mockRejectedValue(refused);
+
+      await expect(defaultDependencies().login(client, 'token')).rejects.toBe(
+        refused
+      );
+
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(hint));
+      await client.destroy();
+    }
+  );
+
+  it('adds no hint to other login failures', async () => {
+    const client = emitterClient(false);
+    vi.mocked(client.login).mockRejectedValue(new Error('TokenInvalid'));
+
+    await expect(defaultDependencies().login(client, 'bad')).rejects.toThrow();
+
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(disallowedIntentsHint('Used disallowed intents', client)).toBeNull();
+  });
+
+  it('only mentions Message Content when it was requested', () => {
+    const error = new Error('Used disallowed intents');
+    const plain = createClient();
+    const tts = createClient({ messageContent: true });
+
+    expect(disallowedIntentsHint(error, plain)).not.toContain(
+      'MESSAGE CONTENT'
+    );
+    expect(disallowedIntentsHint(error, tts)).toContain('MESSAGE CONTENT');
+    void plain.destroy();
+    void tts.destroy();
   });
 
   it('does not wait when the client is already ready', async () => {

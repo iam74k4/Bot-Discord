@@ -153,9 +153,6 @@ describe('/general ping', () => {
     expect(fields).toHaveLength(2);
     expect(fields[0].value).toBe('10ms');
     expect(fields[1].name).toBe(t('ping.apiLatency', 'en'));
-    // Whatever placeholder a fix picks, it must not read like a real figure
-    // such as "1ms" or "0ms".
-    expect(fields[1].value).not.toMatch(/^\d+ms$/);
   });
 
   // Regression: the raw -1 used to be shown as "-1ms", which reads like a
@@ -175,6 +172,15 @@ describe('/general ping', () => {
       );
     }
   );
+
+  it('does not show the raw -1 before the first heartbeat', async () => {
+    const { editReply } = await ping({
+      deferReply: deferredAt(NOW),
+      wsPing: -1,
+    });
+
+    expect(embedAt(editReply).fields?.[1].value).not.toMatch(/^-?\d+ms$/);
+  });
 
   it('propagates a failed defer without editing the reply', async () => {
     const deferReply = vi

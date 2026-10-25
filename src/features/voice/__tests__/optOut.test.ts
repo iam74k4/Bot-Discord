@@ -106,7 +106,11 @@ describe('the opt-out button on the buffering notice', () => {
     expect(
       voiceSettingsRepository.isChannelExcluded('guild-1', 'voice-1')
     ).toBe(true);
-    expect(connectionManager.disconnect).toHaveBeenCalledWith('voice-1');
+    // Second argument: the connection to drop, which this fake leaves out.
+    expect(connectionManager.disconnect).toHaveBeenCalledWith(
+      'voice-1',
+      undefined
+    );
     const [payload] = interaction.update.mock.calls[0] as unknown as [
       {
         embeds: Array<{ toJSON(): { description?: string } }>;

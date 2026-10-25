@@ -12,7 +12,9 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       exclude: [
         'src/**/*.test.ts',
-        'src/__tests__/**',
+        // Test support code anywhere (src/__tests__/helpers, feature
+        // *.helpers.ts): scaffolding is not what the floors measure.
+        'src/**/__tests__/**',
         'src/shared/types/**',
         'src/index.ts',
         'src/client.ts',
@@ -26,7 +28,7 @@ export default defineConfig({
       thresholds: {
         lines: 97,
         functions: 96,
-        branches: 92,
+        branches: 93,
         statements: 96,
       },
     },

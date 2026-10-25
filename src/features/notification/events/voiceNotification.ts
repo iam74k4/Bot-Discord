@@ -4,6 +4,7 @@ import { ExtendedClient } from '../../../client.js';
 import { createEmbed } from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
+import { isGuildAllowed } from '../../../shared/utils/guildAllowlist.js';
 import { t, type Locale } from '../../../locales/index.js';
 import { resolveBackgroundLocale } from '../../../locales/guildLocale.js';
 import { notificationChannelRepository } from '../repositories/notificationChannelRepository.js';
@@ -49,6 +50,9 @@ export const event: Event<typeof Events.VoiceStateUpdate> = {
   ) {
     if (!client.isFullyReady) return;
     if (newState.member?.user.bot) return;
+    // Neither notices nor VC time tracking for a server outside
+    // ALLOWED_GUILD_IDS.
+    if (!isGuildAllowed(newState.guild.id)) return;
 
     const guildId = newState.guild.id;
 

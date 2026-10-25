@@ -389,11 +389,16 @@ async function handlePanelComponent(
       return 'update';
     case IDS.confirmDisable: {
       state.confirmingDisable = false;
-      const dropped = await disableAutoJoin(guild.id);
-      state.lastAction =
-        dropped > 0
-          ? `${t('record.panel.disabled', locale)}\n${t('record.autojoin.disabledDropped', locale)}`
-          : t('record.panel.disabled', locale);
+      const { dropped, readingStoppedIn } = await disableAutoJoin(guild);
+      state.lastAction = [
+        t('record.panel.disabled', locale),
+        dropped > 0 ? t('record.autojoin.disabledDropped', locale) : '',
+        ...readingStoppedIn.map((channel) =>
+          t('record.autojoin.readingStopped', locale, { channel })
+        ),
+      ]
+        .filter(Boolean)
+        .join('\n');
       audit(component, guild, { kind: 'autoJoinDisabled' });
       return 'update';
     }
@@ -422,6 +427,9 @@ async function handlePanelComponent(
           removed: channelMentions(changes.removed, locale),
         }),
         describeReconcile(changes.outcome, locale),
+        ...(changes.readingStoppedIn ?? []).map((channel) =>
+          t('record.autojoin.readingStopped', locale, { channel })
+        ),
       ]
         .filter(Boolean)
         .join('\n');

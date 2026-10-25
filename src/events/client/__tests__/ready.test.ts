@@ -1,12 +1,13 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest';
-import type { Client } from 'discord.js';
+import { type Client, Collection } from 'discord.js';
 import type { ExtendedClient } from '../../../client.js';
 import { event } from '../ready.js';
 
 // Hoisted so the vi.mock factories (which run before any import) can see
 // them; the logger mock has every level so a new log call cannot crash a test.
-const { registerCommands, logger } = vi.hoisted(() => ({
+const { registerCommands, logger, allowlist } = vi.hoisted(() => ({
   registerCommands: vi.fn(),
+  allowlist: { ids: [] as string[] },
   logger: {
     debug: vi.fn(),
     info: vi.fn(),
@@ -19,6 +20,17 @@ vi.mock('../../../handlers/commandHandler.js', () => ({
   registerCommands,
 }));
 
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+
 vi.mock('../../../shared/utils/logger.js', () => ({
   getErrorMessage: (error: unknown) =>
     error instanceof Error ? error.message : String(error),
@@ -26,16 +38,19 @@ vi.mock('../../../shared/utils/logger.js', () => ({
 }));
 
 function createReadyClient(): ExtendedClient {
+  const leave = vi.fn();
+  const cache = new Collection(
+    ['111111111111111111', '222222222222222222'].map((id) => [
+      id,
+      { id, name: `Server ${id}`, leave },
+    ])
+  );
   return {
     user: {
       tag: 'TestBot#0000',
       setPresence: vi.fn(),
     },
-    guilds: {
-      cache: {
-        size: 2,
-      },
-    },
+    guilds: { cache },
     isFullyReady: false,
   } as unknown as ExtendedClient;
 }
@@ -48,6 +63,7 @@ function asReadyClient(client: ExtendedClient): Client<true> {
 describe('ready event', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    allowlist.ids = [];
   });
 
   it('marks the client ready before registering commands', async () => {
@@ -101,5 +117,34 @@ describe('ready event', () => {
     expect(client.isFullyReady).toBe(false);
     expect(registerCommands).not.toHaveBeenCalled();
     expect(logger.info).not.toHaveBeenCalled();
+  });
+
+  describe('ALLOWED_GUILD_IDS', () => {
+    it('warns about nothing when every server is allowed', async () => {
+      const client = createReadyClient();
+
+      await event.execute(client, asReadyClient(client));
+
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it('names the servers outside the list but does not leave them', async () => {
+      allowlist.ids = ['111111111111111111'];
+      const client = createReadyClient();
+
+      await event.execute(client, asReadyClient(client));
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'In 1 server(s) outside ALLOWED_GUILD_IDS; commands are refused there. ' +
+          'Remove the bot from them or add their IDs: Server 222222222222222222 (222222222222222222)'
+      );
+      // Leaving is irreversible: a mistyped or copied list must cost a
+      // config fix, not every server the bot was in.
+      for (const guild of client.guilds.cache.values()) {
+        expect(guild.leave).not.toHaveBeenCalled();
+      }
+      expect(client.isFullyReady).toBe(true);
+      expect(registerCommands).toHaveBeenCalledWith(client);
+    });
   });
 });

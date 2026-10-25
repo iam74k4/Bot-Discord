@@ -429,6 +429,17 @@ describe('catalog permissions', () => {
     expect(entriesOf(ownerOnly)[0].requiredPermission).toBe('owner');
   });
 
+  it('does not list default permission 0 (administrators only) to everyone', () => {
+    const adminOnly = helpCommand(base().setDefaultMemberPermissions(0), {
+      category: DEMO,
+    });
+
+    expect(
+      (adminOnly.data.toJSON() as CommandJSON).default_member_permissions
+    ).toBe('0');
+    expect(entriesOf(adminOnly)[0].requiredPermission).not.toBe('everyone');
+  });
+
   it('lets an explicit permission override the derived one', () => {
     const relaxed = helpCommand(
       base().setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),

@@ -9,6 +9,7 @@ import { connectionManager } from '../recording/connectionManager.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 import { announceBuffering } from './announce.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
+import { isGuildAllowed } from '../../../shared/utils/guildAllowlist.js';
 
 function humanMemberCount(channel: VoiceChannel | StageChannel): number {
   return channel.members.filter((member) => !member.user.bot).size;
@@ -81,7 +82,12 @@ export async function reconcileGuild(guild: Guild): Promise<ReconcileOutcome> {
     return { status: 'limit' };
   }
 
-  if (!voiceSettingsRepository.isAutoJoinEnabled(guild.id)) {
+  // A server outside ALLOWED_GUILD_IDS is not served, so never auto-joined
+  // (the bot may still be in it; see the ready event).
+  if (
+    !isGuildAllowed(guild.id) ||
+    !voiceSettingsRepository.isAutoJoinEnabled(guild.id)
+  ) {
     return { status: 'disabled' };
   }
 

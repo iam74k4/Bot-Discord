@@ -95,7 +95,10 @@ See [.env.example](.env.example) for all configuration options and [docs/deploym
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
 2. Create a new application or select existing one
 3. Go to "Bot" section and copy the token
-4. **Enable Privileged Intents**: Go to "Bot" > Enable `SERVER MEMBERS INTENT`
+4. **Enable Privileged Intents**: Go to "Bot" > Enable `SERVER MEMBERS INTENT`.
+   If you set `VOICEVOX_URL` (text-to-speech), also enable
+   `MESSAGE CONTENT INTENT`: the bot then requests it, and Discord refuses the
+   login (so the whole bot fails to start) when it is not enabled
 5. Go to "OAuth2" > "General" and copy the Client ID
 6. Go to "OAuth2" > "URL Generator":
    - Select scopes: `bot`, `applications.commands`
@@ -283,8 +286,8 @@ Available in servers only, and hidden from members without **Manage Server**.
 | `/voice record <duration>`          | Save past audio from your voice channel                                       |
 | `/voice status`                     | Whether your VC is kept and why not; panel to toggle auto-join and exclusions |
 | `/voice autojoin enable`            | Allow the bot to join occupied voice channels                                 |
-| `/voice autojoin disable`           | Stop joining and buffering in this server                                     |
-| `/voice autojoin exclude <channel>` | Keep the bot out of one voice channel                                         |
+| `/voice autojoin disable`           | Stop auto-joining and buffering in this server                                |
+| `/voice autojoin exclude <channel>` | Stop auto-joining and buffering one channel                                   |
 | `/voice autojoin include <channel>` | Remove a channel from the exclusion list                                      |
 
 Every auto-join change (command, status panel or the notice's button) is
@@ -307,7 +310,9 @@ written to the audit log in the server language.
   previous one
 - Opt-out: `/voice autojoin disable` (whole server) or
   `/voice autojoin exclude <channel>` (one channel). Both also drop any
-  connection already buffering
+  connection already buffering. `/tts start` can still bring the bot in, but
+  deafened and without keeping audio, and the opt-outs leave such a reading
+  join alone
 - In-memory ring buffer of `AUDIO_BUFFER_DURATION` seconds (default: 300 = 5
   minutes), about **82MB per voice channel**, allocated the first time someone
   actually speaks — a channel the bot sits in silently costs nothing. Multiply
@@ -321,8 +326,9 @@ written to the audit log in the server language.
   why (auto-join off, channel excluded, bot busy in another VC, reading-only)
   and what to do
 - Automatic file cleanup after `RECORDING_RETENTION_HOURS` (default: 24 hours)
-- Memory monitoring against `MEMORY_LIMIT_MB` (RSS), disconnecting the oldest
-  connections when usage passes 85% of the budget
+- Memory monitoring against `MEMORY_LIMIT_MB` (RSS): when usage passes 85% of
+  the budget, connections holding audio buffers are disconnected first (oldest
+  first), and text-to-speech-only joins last
 
 **Notes:**
 
@@ -360,14 +366,28 @@ Available when the bot operator sets `VOICEVOX_URL` (see
 - A message still waiting 25 seconds after it was posted is skipped, so
   reading never falls far behind the chat
 - URLs, code blocks, spoilers, and long messages are summarised (`URL省略`,
-  `コード省略`, `ネタバレ`, `以下略`); mentions are read as names, emoji are
-  dropped, and trailing `www` is read as laughter
+  `コード省略`, `ネタバレ`, `以下略`); mentions and custom emoji are read as
+  names, other emoji are dropped, and trailing `www` is read as laughter.
+  Fullwidth and halfwidth forms are read as their plain form (`ＡＢＣ` as ABC,
+  `ｶﾀｶﾅ` as カタカナ)
+- Dictionary words match however they are typed: `alice`, `ALICE` and
+  `ａｌｉｃｅ` are one word, with one owner
 - Each member picks their own voice; it follows them across servers
 - Anyone can start reading or add dictionary words; only members in the
   channel being read (or with Manage Server) can stop or skip, and only the
-  member who added a word (or Manage Server) can remove it
+  member who added a word (or Manage Server) can change or remove it
 - If the server has turned auto-join off, the bot joins deafened and keeps no
-  audio; it is unmuted only while a reading session is running
+  audio; it is unmuted only while a reading session is running. If auto-join
+  is turned back on during the session, `/tts stop` hands the channel back to
+  auto-join (and posts the buffering notice) instead of leaving
+- Stage channels are not supported: the bot would join as a listener and could
+  not be heard. In a text channel the bot cannot view, only the voice
+  channel's own chat is read, and `/tts start` says so
+- Credits: the public `/tts start` message names the VOICEVOX voices of the
+  people in the channel (for example `VOICEVOX:ずんだもん`, the default). Any
+  other character - someone who joins later, or switches voice, even from
+  another server - is credited in the voice channel's chat the first time it
+  is read in that session. Each character's own terms apply
 
 ### Memory
 
@@ -422,12 +442,14 @@ Feature-based architecture: each feature lives under `src/features/` and exports
 - `src/infrastructure/` contains shared runtime infrastructure such as database bootstrap, backup, health, and metrics.
 - `src/shared/` contains cross-feature utilities, shared types, and the shared help catalog.
 - `src/app-scripts/` contains TypeScript maintenance scripts, while root `scripts/` contains repo workflow shell scripts.
+- Dependency direction (features never import each other; lower layers never import features) is enforced by `src/__tests__/architecture.test.ts`.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full structure and lifecycle rules.
+See [`docs/architecture.md`](docs/architecture.md) for diagrams, the full directory tree and lifecycle rules.
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md): project structure and lifecycle
+- [`docs/architecture.md`](docs/architecture.md): system, runtime and dependency diagrams, directory structure, lifecycle
+- [`docs/operations.md`](docs/operations.md): staging (`develop`) and production (`main`) environments, releases, hotfixes, rollbacks
 - [`docs/development.md`](docs/development.md): command development, middleware, and local workflow scripts
 - [`docs/database.md`](docs/database.md): SQLite tables and persistence notes
 - [`docs/deployment.md`](docs/deployment.md): Railway deployment and CI/CD flow

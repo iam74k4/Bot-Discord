@@ -1,6 +1,23 @@
 import { Events, PermissionFlagsBits, PermissionsBitField } from 'discord.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The real allowlist check against a list each test sets (empty: every
+// server, as in production).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+beforeEach(() => {
+  allowlist.ids = [];
+});
+
 vi.mock('../../../shared/utils/logger.js', () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
   getErrorMessage: (e: unknown) => String(e),
@@ -187,6 +204,16 @@ describe('guildCreate event', () => {
     expect(systemSend.mock.invocationCallOrder[0]).toBeLessThan(
       reconcileGuild.mock.invocationCallOrder[0]
     );
+  });
+
+  it('neither welcomes nor joins a server outside ALLOWED_GUILD_IDS', async () => {
+    allowlist.ids = ['some-other-guild'];
+    const { guild, systemSend } = guildStub();
+
+    await event.execute({ isFullyReady: true } as never, guild as never);
+
+    expect(systemSend).not.toHaveBeenCalled();
+    expect(reconcileGuild).not.toHaveBeenCalled();
   });
 
   it('does nothing before the bot is fully ready', async () => {
