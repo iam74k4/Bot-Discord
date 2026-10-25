@@ -27,7 +27,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22.12.0'
+          node-version-file: '.nvmrc'
           cache: 'npm'
 
       - name: Cache build artifacts
@@ -67,3 +67,34 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  docker-image:
+    name: Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the production image
+        run: docker build -t bot-discord:ci .
+
+      # Railway deploys this image. Native modules are the part a Node or
+      # base-image change breaks without failing the build (better-sqlite3 13
+      # segfaults on Node 22.12), so load each one on the real runtime.
+      - name: Smoke-test the runtime
+        run: |
+          expected="v$(cat .nvmrc)"
+          actual="$(docker run --rm bot-discord:ci node --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::The image runs Node $actual but .nvmrc says $expected; update the Dockerfile's NODE_IMAGE."
+            exit 1
+          fi
+          docker run --rm bot-discord:ci node -e "
+            const Database = require('better-sqlite3');
+            new Database(':memory:').prepare('select 1').get();
+            require('sodium-native');
+            require('@snazzah/davey');
+            require('opusscript');
+            console.log('native modules load on', process.version);
+          "

@@ -135,6 +135,15 @@ describe('defaults', () => {
     );
   });
 
+  it('requests no restore unless RESTORE_BACKUP names one, trimmed', () => {
+    expect(parseConfig(source()).config.RESTORE_BACKUP).toBe('');
+    expect(
+      parseConfig(
+        source({ RESTORE_BACKUP: ' backup-2026-10-25T04-00-00-abcdef.db ' })
+      ).config.RESTORE_BACKUP
+    ).toBe('backup-2026-10-25T04-00-00-abcdef.db');
+  });
+
   it('splits and trims the owner list', () => {
     const { config } = parseConfig(source({ BOT_OWNER_IDS: ' a , b ,, c ' }));
     expect(config.BOT_OWNER_IDS).toEqual(['a', 'b', 'c']);
