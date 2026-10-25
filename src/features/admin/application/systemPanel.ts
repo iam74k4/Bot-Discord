@@ -17,12 +17,7 @@ import { metrics } from '../../../infrastructure/metrics/index.js';
 import { runComponentPanel } from '../../../shared/utils/panel.js';
 
 type AdminPanelView =
-  | 'stats'
-  | 'db'
-  | 'guilds'
-  | 'health'
-  | 'metrics'
-  | 'backups';
+  'stats' | 'db' | 'guilds' | 'health' | 'metrics' | 'backups';
 
 const PANEL_TIMEOUT = 120_000;
 const DB_STATS_TABLES = [

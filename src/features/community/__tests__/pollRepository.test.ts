@@ -1,5 +1,13 @@
 import Database from 'better-sqlite3';
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 
 /**
  * The pointer table is all that survives the move to native polls, and its one
@@ -20,6 +28,7 @@ vi.mock('../../../shared/utils/logger.js', () => ({
 const { pollRepository } = await import('../poll/pollRepository.js');
 const { up: nativePolls } =
   await import('../../../infrastructure/database/migrations/010_native_polls.js');
+const { logger } = await import('../../../shared/utils/logger.js');
 
 const HOUR = 60 * 60 * 1000;
 
@@ -63,18 +72,6 @@ describe('pollRepository', () => {
     expect(pollRepository.findActiveByCreator('user-1', 'chan-1')).toBeNull();
   });
 
-  it('returns the most recent poll when a user has several open', () => {
-    vi.useFakeTimers();
-    pollRepository.create(record({ message_id: 'older' }));
-    vi.advanceTimersByTime(1_000);
-    pollRepository.create(record({ message_id: 'newer' }));
-    vi.useRealTimers();
-
-    expect(
-      pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
-    ).toBe('newer');
-  });
-
   it('prunes only expired rows', () => {
     pollRepository.create(record({ message_id: 'live' }));
     pollRepository.create(
@@ -85,6 +82,101 @@ describe('pollRepository', () => {
     expect(
       pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
     ).toBe('live');
+  });
+
+  it('removes only the named poll', () => {
+    pollRepository.create(record({ message_id: 'keep', channel_id: 'chan-2' }));
+    pollRepository.create(record({ message_id: 'drop' }));
+
+    pollRepository.remove('drop');
+
+    expect(pollRepository.findActiveByCreator('user-1', 'chan-1')).toBeNull();
+    expect(
+      pollRepository.findActiveByCreator('user-1', 'chan-2')?.message_id
+    ).toBe('keep');
+  });
+
+  it('treats removing an unknown poll as a no-op', () => {
+    pollRepository.create(record({}));
+
+    expect(() => pollRepository.remove('missing')).not.toThrow();
+    expect(
+      pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
+    ).toBe('msg-1');
+  });
+
+  it('overwrites the pointer when the same message is recorded again', () => {
+    pollRepository.create(record({ expires_at: Date.now() - 1 }));
+    pollRepository.create(record({ expires_at: Date.now() + HOUR }));
+
+    expect(db.prepare('SELECT COUNT(*) AS n FROM polls').get()).toEqual({
+      n: 1,
+    });
+    expect(
+      pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
+    ).toBe('msg-1');
+  });
+
+  describe('on a frozen clock', () => {
+    const NOW = new Date('2026-05-01T12:00:00Z').getTime();
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(NOW);
+    });
+
+    // Restores the real clock even when a test throws midway.
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('stamps created_at with the current time', () => {
+      pollRepository.create(record({ expires_at: NOW + HOUR }));
+
+      expect(
+        pollRepository.findActiveByCreator('user-1', 'chan-1')
+      ).toMatchObject({ created_at: NOW, expires_at: NOW + HOUR });
+    });
+
+    it('returns the most recent poll when a user has several open', () => {
+      pollRepository.create(record({ message_id: 'older' }));
+      vi.advanceTimersByTime(1_000);
+      pollRepository.create(record({ message_id: 'newer' }));
+
+      expect(
+        pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
+      ).toBe('newer');
+    });
+
+    describe('at the exact expiry instant', () => {
+      it('no longer offers the poll and prunes it', () => {
+        pollRepository.create(record({ expires_at: NOW }));
+
+        expect(
+          pollRepository.findActiveByCreator('user-1', 'chan-1')
+        ).toBeNull();
+        expect(pollRepository.removeExpired()).toBe(1);
+      });
+
+      it('still offers a poll one millisecond before expiry', () => {
+        pollRepository.create(record({ expires_at: NOW + 1 }));
+
+        expect(
+          pollRepository.findActiveByCreator('user-1', 'chan-1')
+        ).not.toBeNull();
+        expect(pollRepository.removeExpired()).toBe(0);
+      });
+    });
+  });
+
+  it('reports nothing pruned, and warns, when the table is unavailable', () => {
+    vi.mocked(logger.warn).mockClear();
+    db.exec('DROP TABLE polls');
+
+    expect(pollRepository.removeExpired()).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to prune expired polls')
+    );
   });
 });
 

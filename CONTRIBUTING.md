@@ -12,8 +12,13 @@
 - `feature/<name>` or `feat/<name>` — new features
 - `fix/<name>` or `bugfix/<name>` — bug fixes
 - `docs/<name>` — documentation changes
+- `hotfix/<name>` — urgent production fixes, branched from `main`
 
-Branch from `main`, merge back to `main` when ready.
+Branch from `develop` and open the pull request against `develop` (squash
+merge). `develop` deploys to the staging bot; releases reach `main` - and
+production - through a `develop` → `main` pull request merged with a merge
+commit. Hotfixes branch from `main` and are merged back into `develop`
+afterwards. See [docs/operations.md](docs/operations.md).
 
 ## Commit Messages
 
@@ -39,7 +44,7 @@ Examples:
 - **Cursor / AI**: Project conventions and CI order live in [`.cursor/rules/architecture.mdc`](.cursor/rules/architecture.mdc).
 - **Prettier**: Run `npm run format` before committing (or `npm run format:check` to verify). CI fails at **Check formatting** if Prettier output does not match—this step runs before ESLint in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 - Run `npm run lint` and `npm run type-check`
-- Use `bash scripts/validate.sh` for full CI parity (format check, lint, type-check, test, audit, build)
+- Use `bash scripts/validate.sh` for full CI parity (format check, lint, type-check, test with coverage floors, audit, build)
 
 ## Adding Features
 
@@ -64,7 +69,15 @@ No manual registration in `features/index.ts` is needed.
 - Shared utility tests may live under `src/shared/**/__tests__/`
 - Infrastructure tests may live under `src/infrastructure/**/__tests__/`
 - Run tests: `npm test`
-- Run with coverage: `npm run test:coverage`
+- Run with coverage: `npm run test:coverage` (CI runs this and fails below the
+  floors in `vitest.config.ts`)
+- New slash commands are exercised by `src/__tests__/integration/commands/`
+  once you declare them in `COMMAND_POLICY` and in `REACHES`/`READ_ONLY` (see
+  [`docs/quality.md`](docs/quality.md#testing)); still add a test for what the
+  command does
+- Test files are type-checked by `npm run type-check`
+- See [`docs/quality.md`](docs/quality.md#testing) for conventions such as
+  `it.fails` markers for known bugs
 
 All PRs should include tests for new functionality.
 
@@ -76,7 +89,7 @@ All PRs should include tests for new functionality.
 
 ## Pull Requests
 
-1. Ensure all checks pass: `npm run format:check && npm run lint && npm run type-check && npm test` (or `bash scripts/validate.sh`)
+1. Ensure all checks pass: `npm run format:check && npm run lint && npm run type-check && npm run test:coverage` (or `bash scripts/validate.sh`)
 2. Write a clear PR description explaining the change
 3. Reference related issues if applicable
 4. Keep PRs focused — one logical change per PR
