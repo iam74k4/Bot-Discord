@@ -51,6 +51,7 @@ In Railway dashboard, add the following variables:
 | `DATABASE_PATH`                 | SQLite database path (must stay relative to repo root)                                    | No                |
 | `RECORDINGS_DIR`                | Generated recording files directory (must stay relative to repo root)                     | No                |
 | `BACKUP_DIR`                    | Backup output directory (must stay relative to repo root)                                 | No                |
+| `VOICEVOX_URL`                  | VOICEVOX engine URL; enables `/tts` and the Message Content intent (see below)            | No                |
 
 If you enable voice recording in production, remember that `/voice record` now requires `Manage Server`, and generated files are delivered ephemerally and cleaned up automatically according to `RECORDING_RETENTION_HOURS`.
 
@@ -68,6 +69,61 @@ exits with code 1 so the `ON_FAILURE` restart policy brings the bot back.
 After a redeploy, the old deployment's logs should end with
 `Received SIGTERM, initiating graceful shutdown...` and
 `Graceful shutdown complete`.
+
+### Text-to-speech (optional)
+
+`/tts` reads chat aloud with [VOICEVOX](https://voicevox.hiroshiba.jp/), which
+runs as its own service next to the bot:
+
+1. In the same Railway project, add a service from the Docker image
+   `voicevox/voicevox_engine:cpu-latest`. It listens on port `50021` and needs
+   no volume. Name the service `voicevox`, or note the private domain shown
+   under the service's **Settings → Networking**: Railway derives it from the
+   service name, and a service created from an image is usually named after
+   the image instead.
+2. Set `VOICEVOX_URL` on the bot to the engine's private address,
+   `http://<private-domain>:50021` - for a service named `voicevox`,
+   `http://voicevox.railway.internal:50021`. Keeping the engine on private
+   networking means it is never exposed to the internet.
+
+   The image listens on IPv4 only (`VV_HOST=0.0.0.0`). Railway environments
+   created before October 16, 2025 have an IPv6-only private network, so there
+   the bot cannot connect until you set `VV_HOST=::` on the VOICEVOX service.
+   `::` works in newer environments too, so setting it is always safe. If
+   `/tts start` keeps answering that it cannot reach the speech engine, check
+   the domain and this variable first.
+
+3. In the Discord Developer Portal, open **Bot → Privileged Gateway Intents** and
+   turn on **MESSAGE CONTENT INTENT**. The bot only requests that intent when
+   `VOICEVOX_URL` is set, and Discord refuses the login (close code 4014) if it
+   is requested without being enabled; the bot then logs which intents to
+   enable before exiting. Apps with fewer than 10,000 users can toggle it
+   directly; larger apps must apply for it.
+4. Give the bot the **Speak** permission in voice channels where people will use
+   it.
+
+Playback needs no ffmpeg: the bot asks VOICEVOX for 48 kHz stereo audio and
+encodes it to Opus with the bundled encoder.
+
+VOICEVOX and each character's terms require a credit (for example
+`VOICEVOX:ずんだもん`). The public `/tts start` message credits the default
+voice and the voices of everyone in the channel at that moment. Every other
+character is credited in the voice channel's chat the first time a line in it
+is read during the session: a member who joins later, or who switches voice
+(even from another server), so every voice listeners hear has been credited
+where they can see it. Each character is credited once per session.
+
+Where a server has turned auto-join off (`/voice autojoin disable` or an
+excluded channel), `/tts start` still joins, but deafened and without buffering
+any audio, so reading never overrides that choice; turning auto-join off or
+excluding the channel later leaves such a join alone. A connection that does
+buffer is still dropped by those commands, which ends any reading through it
+(the channel is told, and `/tts start` resumes reading deafened).
+
+With `VOICEVOX_URL` set the bot receives every guild message, but it keeps no
+message cache (discord.js would otherwise hold the last 200 per channel).
+Members who post are still cached, as other events would cache them, so
+reading adds little memory beyond the sizing above.
 
 ### 4. Choose how production deploys run
 

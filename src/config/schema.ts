@@ -41,6 +41,12 @@ export interface AppConfig {
   readonly TZ: string;
   readonly ALERT_WEBHOOK_URL: string;
   readonly LOG_LEVEL: string;
+
+  /**
+   * Base URL of a VOICEVOX engine (e.g. http://voicevox.railway.internal:50021).
+   * Empty disables text-to-speech, and with it the Message Content intent.
+   */
+  readonly VOICEVOX_URL: string;
 }
 
 export interface ConfigResult {
@@ -155,6 +161,25 @@ function parseAlertWebhook(source: EnvSource): string {
   return url;
 }
 
+function parseVoicevoxUrl(source: EnvSource): string {
+  const raw = source.VOICEVOX_URL?.trim();
+  if (!raw) return '';
+
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('VOICEVOX_URL is not a valid URL');
+  }
+  // Plain http is allowed on purpose: the engine normally sits on a private
+  // network next to the bot (Railway internal networking, docker compose).
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('VOICEVOX_URL must use http or https');
+  }
+
+  return raw.replace(/\/+$/, '');
+}
+
 function parseNodeEnv(source: EnvSource, warnings: string[]): NodeEnv {
   const value = source.NODE_ENV;
   if (!value) return 'development';
@@ -175,6 +200,7 @@ export function parseConfig(source: EnvSource): ConfigResult {
 
   requireKeys(source);
   const alertWebhookUrl = parseAlertWebhook(source);
+  const voicevoxUrl = parseVoicevoxUrl(source);
   const nodeEnv = parseNodeEnv(source, warnings);
 
   const num = (key: keyof AppConfig & string, fallback: number) =>
@@ -294,6 +320,7 @@ export function parseConfig(source: EnvSource): ConfigResult {
       TZ: source.TZ || 'UTC',
       ALERT_WEBHOOK_URL: alertWebhookUrl,
       LOG_LEVEL: source.LOG_LEVEL || '',
+      VOICEVOX_URL: voicevoxUrl,
     },
   };
 }

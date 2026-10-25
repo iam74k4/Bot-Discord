@@ -257,6 +257,18 @@ function maxAbsInt16(buf: Buffer): number {
 }
 
 describe('ChannelMixRingManager', () => {
+  it('reports which channels hold a ring', () => {
+    const mgr = new ChannelMixRingManager();
+    expect(mgr.has('c1')).toBe(false);
+
+    mgr.getOrCreate('c1');
+    expect(mgr.has('c1')).toBe(true);
+    expect(mgr.has('c2')).toBe(false);
+
+    mgr.remove('c1');
+    expect(mgr.has('c1')).toBe(false);
+  });
+
   it('remove drops channel', () => {
     const mgr = new ChannelMixRingManager();
     mgr.getOrCreate('c1');

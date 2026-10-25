@@ -329,7 +329,11 @@ export interface TranslationKeys {
       exclusionCount: string;
       currentChannelBuffered: string;
       currentChannelExcluded: string;
+      currentChannelReadingOnly: string;
+      currentChannelNotKept: string;
       currentChannelNone: string;
+      readingStopped: string;
+      ttsStillReads: string;
     };
     notice: {
       title: string;
@@ -363,6 +367,66 @@ export interface TranslationKeys {
       deliveryIncompleteDesc: string;
       failed: string;
       failedDesc: string;
+    };
+  };
+
+  // Text-to-speech
+  tts: {
+    errors: {
+      notConfigured: string;
+      notConfiguredDesc: string;
+      engineDown: string;
+      engineDownDesc: string;
+      notInVoice: string;
+      notInVoiceDesc: string;
+      busyElsewhere: string;
+      busyElsewhereDesc: string;
+      cannotJoin: string;
+      cannotJoinDesc: string;
+      notRunning: string;
+      notRunningDesc: string;
+      notInSameVoice: string;
+      notInSameVoiceDesc: string;
+      stageUnsupported: string;
+      stageUnsupportedDesc: string;
+    };
+    started: string;
+    startedDesc: string;
+    startedDescVoiceOnly: string;
+    howToTitle: string;
+    howTo: string;
+    noSpeakPermission: string;
+    noViewPermission: string;
+    credit: string;
+    stopped: string;
+    stoppedDesc: string;
+    stoppedByOptOut: string;
+    skipped: string;
+    nothingToSkip: string;
+    voice: {
+      currentTitle: string;
+      current: string;
+      changeHint: string;
+      setTitle: string;
+      unknown: string;
+      unknownDesc: string;
+      credit: string;
+      preview: string;
+      changed: string;
+    };
+    dict: {
+      addedTitle: string;
+      added: string;
+      updated: string;
+      removedTitle: string;
+      removed: string;
+      notFound: string;
+      notOwner: string;
+      full: string;
+      listTitle: string;
+      listEmpty: string;
+      listMore: string;
+      invalid: string;
     };
   };
 }

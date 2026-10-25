@@ -281,7 +281,7 @@ export const ja: TranslationKeys = {
       enabled:
         'このサーバーでVCへの自動参加を有効にしました。Botは人がいるVCに参加し、直近{minutes}分の音声を保持します。',
       disabled:
-        'このサーバーでVCへの自動参加を無効にしました。Botはこれ以降VCに参加せず、音声も保持しません。',
+        'このサーバーでVCへの自動参加を無効にしました。Botが自分からVCに参加することはなくなり、音声も保持しません。',
       excluded:
         '<#{channel}> を自動参加の対象外にしました。このチャンネルの音声は保持されません。',
       included: '<#{channel}> を自動参加の対象に戻しました。',
@@ -291,7 +291,14 @@ export const ja: TranslationKeys = {
       exclusionCount: '対象外チャンネル',
       currentChannelBuffered: '現在のチャンネルは音声を保持中です',
       currentChannelExcluded: '現在のチャンネルは対象外です',
+      currentChannelReadingOnly:
+        '現在のチャンネルでは読み上げだけを行っており、音声は保持していません',
+      currentChannelNotKept: '現在のチャンネルの音声は保持していません',
       currentChannelNone: 'VCに参加していません',
+      readingStopped:
+        '<#{channel}> では音声を保持していたため、読み上げも終了しました。`/tts start` を実行すると、音声を保持せずに読み上げを再開できます。',
+      ttsStillReads:
+        '`/tts start` で読み上げるときだけ、Botはスピーカーミュートの状態で参加します。',
     },
     notice: {
       title: '音声を保持しています',
@@ -332,6 +339,82 @@ export const ja: TranslationKeys = {
         '分割録音のパート {parts}（全{total}件中）を配信できませんでした。完全な音声が必要な場合は `/record` を再実行してください。',
       failed: '録音失敗',
       failedDesc: '録音の処理中にエラーが発生しました: {error}',
+    },
+  },
+
+  tts: {
+    errors: {
+      notConfigured: '読み上げは設定されていません',
+      notConfiguredDesc:
+        'このBotには読み上げエンジン（VOICEVOX）が設定されていません。Botの運営者に `VOICEVOX_URL` の設定を依頼してください。',
+      engineDown: '読み上げエンジンに接続できません',
+      engineDownDesc:
+        'VOICEVOXが応答していません。少し待ってからもう一度お試しください。続く場合はBotの運営者に連絡してください。',
+      notInVoice: 'VCに参加してください',
+      notInVoiceDesc:
+        '読み上げたいボイスチャンネルに先に参加してから、`/tts start` を実行してください。',
+      busyElsewhere: 'Botは別のVCにいます',
+      busyElsewhereDesc:
+        'Botは今 <#{channel}> に参加しています（Discordの仕様で、1つのサーバーで同時に入れるVCは1つだけです）。そのVCで使うか、Botが抜けるまでお待ちください。',
+      cannotJoin: 'VCに参加できませんでした',
+      cannotJoinDesc:
+        'Botにそのチャンネルの「接続」権限があるか、同時接続数の上限に達していないか確認してください。',
+      notRunning: '読み上げは行われていません',
+      notRunningDesc: '`/tts start` で読み上げを始められます。',
+      notInSameVoice: '操作できません',
+      notInSameVoiceDesc:
+        '読み上げ中のVC（<#{channel}>）に参加している人か、「サーバーの管理」権限を持つ人だけが操作できます。',
+      stageUnsupported: 'ステージチャンネルでは読み上げできません',
+      stageUnsupportedDesc:
+        'ステージではBotが聞き手として参加するため、読み上げても声が届きません。通常のボイスチャンネルで `/tts start` を実行してください。',
+    },
+    started: '読み上げを開始しました',
+    startedDesc:
+      '<#{voice}> で、このチャンネルとVCのチャットに書かれた発言を読み上げます。',
+    startedDescVoiceOnly:
+      '<#{voice}> で、VCのチャットに書かれた発言を読み上げます。',
+    howToTitle: '使い方',
+    howTo:
+      '・読み上げるのは <#{voice}> にいる人の発言だけです\n・先頭に `;` を付けると読み上げません\n・`/tts voice` で自分の声と速さを変えられます\n・`/tts dict add` で読み方を登録できます\n・`/tts skip` で今の発言を飛ばし、`/tts stop` で終了します',
+    noSpeakPermission:
+      '⚠️ Botに <#{voice}> の「発言」権限がないため、声が届かない可能性があります。',
+    noViewPermission:
+      '⚠️ Botはこのチャンネルを閲覧できないため、ここでの発言は読み上げられません。読み上げるのはVCのチャットだけです。',
+    credit: '音声: {credits}',
+    stopped: '読み上げを終了しました',
+    stoppedDesc: 'また使うときは `/tts start` を実行してください。',
+    stoppedByOptOut:
+      '管理者が音声の保持を止めたため、Botは退出しました。`/tts start` を実行すると、音声を保持せずに読み上げを再開できます。',
+    skipped: '今の発言を飛ばしました。',
+    nothingToSkip: '今は何も読み上げていません。',
+    voice: {
+      currentTitle: 'あなたの読み上げ設定',
+      current: '声: **{voice}**\n速さ: **{speed}倍**',
+      changeHint:
+        '`/tts voice` の `speaker` で声を、`speed` で速さ（0.5〜2.0）を変えられます。',
+      setTitle: '読み上げの声を変更しました',
+      unknown: 'その声は見つかりませんでした',
+      unknownDesc: '入力欄に表示される候補から選んでください。',
+      credit: 'クレジット: VOICEVOX:{character}',
+      preview: 'この声で読み上げます',
+      changed: '<@{user}> さんの読み上げの声が **{voice}** になりました。',
+    },
+    dict: {
+      addedTitle: '辞書に登録しました',
+      added: '{word} を {reading} と読みます。',
+      updated: '{word} の読み方を {reading} に更新しました。',
+      removedTitle: '辞書から削除しました',
+      removed: '{word} を辞書から削除しました。',
+      notFound: '{word} は辞書に登録されていません。',
+      notOwner:
+        '他の人が登録した単語は、登録した本人か「サーバーの管理」権限を持つ人だけが変更・削除できます。',
+      full: '辞書の登録数が上限（{max}件）に達しています。不要な単語を `/tts dict remove` で削除してください。',
+      listTitle: 'このサーバーの読み上げ辞書',
+      listEmpty:
+        'まだ単語が登録されていません。`/tts dict add` で登録できます。',
+      listMore: 'ほか{count}件',
+      invalid:
+        '単語は1〜{wordMax}文字、読み方は1〜{readingMax}文字で入力してください。',
     },
   },
 };

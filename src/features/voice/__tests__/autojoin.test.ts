@@ -32,6 +32,27 @@ vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: { getAllConnections, getConnection, disconnect },
 }));
 
+const ttsSessions = vi.hoisted(() => ({ get: vi.fn() }));
+
+vi.mock('../tts/sessionManager.js', () => ({ ttsSessions }));
+
+/** VOICEVOX_URL as the command sees it; everything else is the real config. */
+const tts = vi.hoisted(() => ({ url: '' }));
+
+vi.mock('../../../config/index.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../../config/index.js')>();
+  return {
+    ...actual,
+    env: new Proxy(actual.env, {
+      get: (target, property, receiver) =>
+        property === 'VOICEVOX_URL'
+          ? tts.url
+          : Reflect.get(target, property, receiver),
+    }),
+  };
+});
+
 const { executeAutoJoinCommand } = await import('../application/autojoin.js');
 const { voiceSettingsRepository } =
   await import('../repositories/voiceSettingsRepository.js');
@@ -53,8 +74,28 @@ function voiceChannel(id: string, type: ChannelType = ChannelType.GuildVoice) {
   return { id, type };
 }
 
-function connectionInfo(channelId: string, guildId: string) {
-  return { channelId, guildId };
+/** One stand-in VoiceConnection per channel, so calls can be matched. */
+const voiceConnections = new Map<string, { channelId: string }>();
+function connectionOf(channelId: string) {
+  let connection = voiceConnections.get(channelId);
+  if (!connection) {
+    connection = { channelId };
+    voiceConnections.set(channelId, connection);
+  }
+  return connection;
+}
+
+function connectionInfo(
+  channelId: string,
+  guildId: string,
+  receiving?: boolean
+) {
+  return { channelId, guildId, receiving, connection: connectionOf(channelId) };
+}
+
+/** A voice channel's own text chat, as the guild cache returns it. */
+function voiceChat() {
+  return { isSendable: () => true, send: vi.fn().mockResolvedValue(undefined) };
 }
 
 function createInteraction(
@@ -63,11 +104,15 @@ function createInteraction(
     channel?: { id: string; type: ChannelType };
     guildId?: string | null;
     locale?: string;
+    channels?: Record<string, object>;
   } = {}
 ) {
   const guildId = options.guildId === undefined ? GUILD : options.guildId;
+  const channels = new Map(Object.entries(options.channels ?? {}));
   return {
-    guild: guildId ? { id: guildId } : null,
+    guild: guildId
+      ? { id: guildId, preferredLocale: 'en-US', channels: { cache: channels } }
+      : null,
     guildId,
     locale: options.locale ?? 'en-US',
     options: {
@@ -141,6 +186,8 @@ describe('/voice autojoin', () => {
     getAllConnections.mockReturnValue(new Map());
     getConnection.mockReturnValue(undefined);
     disconnect.mockResolvedValue(undefined);
+    ttsSessions.get.mockReturnValue(undefined);
+    tts.url = '';
   });
 
   describe('outside a guild', () => {
@@ -205,9 +252,17 @@ describe('/voice autojoin', () => {
       await executeAutoJoinCommand(interaction);
 
       expect(disconnect).toHaveBeenCalledTimes(2);
-      expect(disconnect).toHaveBeenCalledWith('voice-a');
-      expect(disconnect).toHaveBeenCalledWith('voice-b');
-      expect(disconnect).not.toHaveBeenCalledWith('voice-other');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-b',
+        connectionOf('voice-b')
+      );
+      expect(disconnect.mock.calls.map(([id]) => id)).not.toContain(
+        'voice-other'
+      );
     });
 
     it('tells the admin it is off only after every disconnect has finished', async () => {
@@ -296,7 +351,10 @@ describe('/voice autojoin', () => {
       );
 
       expect(disconnect).toHaveBeenCalledTimes(1);
-      expect(disconnect).toHaveBeenCalledWith('voice-9');
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-9',
+        connectionOf('voice-9')
+      );
     });
 
     it('confirms the exclusion only after the bot has actually left', async () => {
@@ -381,6 +439,229 @@ describe('/voice autojoin', () => {
       expect(interaction.reply).not.toHaveBeenCalled();
       expect(disconnect).not.toHaveBeenCalled();
     });
+  });
+
+  describe('text-to-speech joins', () => {
+    const READING = { voiceChannelId: 'voice-a' };
+
+    it.each(['disable', 'exclude'])(
+      '%s leaves a deafened reading join connected: it keeps no audio',
+      async (subcommand) => {
+        voiceSettingsRepository.setAutoJoinEnabled(GUILD, false);
+        const info = connectionInfo('voice-a', GUILD, false);
+        getAllConnections.mockReturnValue(new Map([['voice-a', info]]));
+        getConnection.mockReturnValue(info);
+        ttsSessions.get.mockReturnValue(READING);
+        const chat = voiceChat();
+        const interaction = createInteraction({
+          subcommand,
+          channel: voiceChannel('voice-a'),
+          channels: { 'voice-a': chat },
+        });
+
+        await executeAutoJoinCommand(interaction);
+
+        expect(disconnect).not.toHaveBeenCalled();
+        expect(chat.send).not.toHaveBeenCalled();
+        // The setting itself still applies.
+        expect(voiceSettingsRepository.mayAutoJoin(GUILD, 'voice-a')).toBe(
+          false
+        );
+        expect(replyEmbed(interaction).description).not.toContain(
+          t('record.autojoin.readingStopped', 'en', { channel: 'voice-a' })
+        );
+      }
+    );
+
+    it('disable still drops a listening connection being read through, and says reading stopped', async () => {
+      getAllConnections.mockReturnValue(
+        new Map([
+          ['voice-a', connectionInfo('voice-a', GUILD, true)],
+          ['voice-b', connectionInfo('voice-b', GUILD, false)],
+        ])
+      );
+      ttsSessions.get.mockImplementation((id: string) =>
+        id === 'voice-a' ? READING : undefined
+      );
+      const chat = voiceChat();
+      const interaction = createInteraction({
+        subcommand: 'disable',
+        channels: { 'voice-a': chat },
+      });
+
+      await executeAutoJoinCommand(interaction);
+
+      // Privacy wins over reading: the listening connection goes.
+      expect(disconnect).toHaveBeenCalledTimes(1);
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
+      expect(replyEmbed(interaction).description).toBe(
+        `${t('record.autojoin.disabled', 'en')}\n\n${t(
+          'record.autojoin.readingStopped',
+          'en',
+          { channel: 'voice-a' }
+        )}`
+      );
+      // The people being read are told why the bot left.
+      expect(chat.send).toHaveBeenCalledTimes(1);
+      const notice = chat.send.mock.calls[0][0].embeds[0].toJSON();
+      expect(notice.title).toBe(t('tts.stopped', 'en'));
+      expect(notice.description).toBe(t('tts.stoppedByOptOut', 'en'));
+    });
+
+    it('exclude drops a listening connection being read through, and says reading stopped', async () => {
+      getConnection.mockReturnValue(connectionInfo('voice-a', GUILD, true));
+      ttsSessions.get.mockReturnValue(READING);
+      const chat = voiceChat();
+      const interaction = createInteraction({
+        subcommand: 'exclude',
+        channel: voiceChannel('voice-a'),
+        channels: { 'voice-a': chat },
+      });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
+      expect(replyEmbed(interaction).description).toBe(
+        `${t('record.autojoin.excluded', 'en', { channel: 'voice-a' })}\n\n${t(
+          'record.autojoin.readingStopped',
+          'en',
+          { channel: 'voice-a' }
+        )}`
+      );
+      expect(chat.send).toHaveBeenCalledTimes(1);
+    });
+
+    it('says nothing about reading when the dropped connection was not being read', async () => {
+      getConnection.mockReturnValue(connectionInfo('voice-a', GUILD, true));
+      const chat = voiceChat();
+      const interaction = createInteraction({
+        subcommand: 'exclude',
+        channel: voiceChannel('voice-a'),
+        channels: { 'voice-a': chat },
+      });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
+      expect(chat.send).not.toHaveBeenCalled();
+      expect(replyEmbed(interaction).description).toBe(
+        t('record.autojoin.excluded', 'en', { channel: 'voice-a' })
+      );
+    });
+
+    it.each<[string, object | undefined]>([
+      ['cannot be sent to', { isSendable: () => false, send: vi.fn() }],
+      [
+        'rejects the notice',
+        {
+          isSendable: () => true,
+          send: vi.fn().mockRejectedValue(new Error('Missing Access')),
+        },
+      ],
+      ['is not cached', undefined],
+    ])('still stops buffering when the voice chat %s', async (_label, chat) => {
+      getConnection.mockReturnValue(connectionInfo('voice-a', GUILD, true));
+      ttsSessions.get.mockReturnValue(READING);
+      const interaction = createInteraction({
+        subcommand: 'exclude',
+        channel: voiceChannel('voice-a'),
+        channels: chat ? { 'voice-a': chat } : {},
+      });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(disconnect).toHaveBeenCalledWith(
+        'voice-a',
+        connectionOf('voice-a')
+      );
+      expect(replyEmbed(interaction).description).toContain(
+        t('record.autojoin.readingStopped', 'en', { channel: 'voice-a' })
+      );
+    });
+  });
+
+  describe('opt-out timing', () => {
+    it.each(['disable', 'exclude'])(
+      '%s stops buffering and replies even while the notice never goes out',
+      async (subcommand) => {
+        const info = connectionInfo('voice-a', GUILD, true);
+        getAllConnections.mockReturnValue(new Map([['voice-a', info]]));
+        getConnection.mockReturnValue(info);
+        ttsSessions.get.mockReturnValue({ voiceChannelId: 'voice-a' });
+        const order: string[] = [];
+        disconnect.mockImplementation(async () => {
+          order.push('disconnect');
+        });
+        const chat = {
+          isSendable: () => true,
+          send: vi.fn(() => {
+            order.push('send');
+            return new Promise(() => undefined);
+          }),
+        };
+        const interaction = createInteraction({
+          subcommand,
+          channel: voiceChannel('voice-a'),
+          channels: { 'voice-a': chat },
+        });
+
+        await executeAutoJoinCommand(interaction);
+
+        // The opt-out takes effect before anything is posted, and the
+        // reply does not wait for the post.
+        expect(order).toEqual(['disconnect', 'send']);
+        expect(disconnect).toHaveBeenCalledWith(
+          'voice-a',
+          connectionOf('voice-a')
+        );
+        expect(replyEmbed(interaction).description).toContain(
+          t('record.autojoin.readingStopped', 'en', { channel: 'voice-a' })
+        );
+      }
+    );
+  });
+
+  describe('mentioning text-to-speech', () => {
+    it.each<['en' | 'ja', string, string]>([
+      ['en', 'en-US', 'disable'],
+      ['ja', 'ja', 'disable'],
+      ['en', 'en-US', 'exclude'],
+      ['ja', 'ja', 'exclude'],
+    ])(
+      'says /tts start still reads only when text-to-speech is set up (%s, %s)',
+      async (locale, discordLocale, subcommand) => {
+        const base =
+          subcommand === 'disable'
+            ? t('record.autojoin.disabled', locale)
+            : t('record.autojoin.excluded', locale, { channel: 'voice-9' });
+        const run = async () => {
+          const interaction = createInteraction({
+            subcommand,
+            locale: discordLocale,
+            channel: voiceChannel('voice-9'),
+          });
+          await executeAutoJoinCommand(interaction);
+          return replyEmbed(interaction).description;
+        };
+
+        tts.url = '';
+        expect(await run()).toBe(base);
+
+        tts.url = 'http://voicevox.railway.internal:50021';
+        expect(await run()).toBe(
+          `${base} ${t('record.autojoin.ttsStillReads', locale)}`
+        );
+      }
+    );
   });
 
   describe('include', () => {

@@ -10,6 +10,11 @@ const disconnect = vi.fn();
 const getAllConnections = vi.fn(() => new Map<string, unknown>());
 const setServiceStatus = vi.fn();
 const reconcileOccupiedVoiceChannels = vi.fn().mockResolvedValue(undefined);
+const unsubscribe = vi.fn();
+const onDisconnect = vi.fn(
+  (_listener: (channelId: string) => void) => unsubscribe
+);
+const ttsSessions = { handleDisconnect: vi.fn(), stopAll: vi.fn() };
 
 vi.mock('../jobs/memoryMonitor.js', () => ({
   MemoryMonitor: class {
@@ -35,8 +40,11 @@ vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: {
     disconnect,
     getAllConnections,
+    onDisconnect,
   },
 }));
+
+vi.mock('../tts/sessionManager.js', () => ({ ttsSessions }));
 
 vi.mock('../application/reconcile.js', () => ({
   reconcileOccupiedVoiceChannels,
@@ -53,6 +61,35 @@ describe('voice feature lifecycle', () => {
     getAllConnections.mockReturnValue(new Map());
     reconcileOccupiedVoiceChannels.mockResolvedValue(undefined);
     disconnect.mockResolvedValue(undefined);
+    onDisconnect.mockImplementation(() => unsubscribe);
+  });
+
+  it('ends a reading session when its voice connection goes away', async () => {
+    const { start, stop } = await import('../index.js');
+    await start({ client: {}, config: {} } as never);
+
+    expect(onDisconnect).toHaveBeenCalledTimes(1);
+    const listener = onDisconnect.mock.calls[0][0];
+    listener('vc-1');
+    expect(ttsSessions.handleDisconnect).toHaveBeenCalledWith('vc-1');
+
+    await stop();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops every reading session before leaving the voice channels', async () => {
+    const order: string[] = [];
+    ttsSessions.stopAll.mockImplementation(() => order.push('stopAll'));
+    disconnect.mockImplementation(async (channelId: string) => {
+      order.push(`disconnect:${channelId}`);
+    });
+    getAllConnections.mockReturnValue(new Map([['vc-1', {}]]));
+    const { start, stop } = await import('../index.js');
+    await start({ client: {}, config: {} } as never);
+
+    await stop();
+
+    expect(order).toEqual(['stopAll', 'disconnect:vc-1']);
   });
 
   it('is registered under the name "voice"', async () => {
