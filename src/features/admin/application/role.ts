@@ -1,29 +1,46 @@
 import {
   ChatInputCommandInteraction,
+  DiscordAPIError,
   GuildMember,
   MessageFlags,
-  PermissionsBitField,
+  PermissionFlagsBits,
+  RESTJSONErrorCodes,
+  escapeMarkdown,
+  type EmbedBuilder,
+  type Guild,
 } from 'discord.js';
-import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
+import {
+  createEmbed,
+  createErrorEmbed,
+  createWarningEmbed,
+} from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
-import { t } from '../../../locales/index.js';
-import { resolveLocale } from '../../../locales/guildLocale.js';
+import { createPermissionDeniedEmbed } from '../../../shared/utils/discord.js';
+import { t, type Locale } from '../../../locales/index.js';
+import {
+  resolveBackgroundLocale,
+  resolveLocale,
+} from '../../../locales/guildLocale.js';
 import { audit } from '../../../infrastructure/audit/index.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
+import {
+  botServerPermissions,
+  memberHasServerPermission,
+} from './permissions.js';
 
-function checkManageRoles(interaction: ChatInputCommandInteraction): boolean {
-  if (!interaction.guild || !interaction.member) return false;
-  const memberPerms = interaction.member.permissions;
-  if (!(memberPerms instanceof PermissionsBitField)) return false;
-  return memberPerms.has(PermissionsBitField.Flags.ManageRoles);
+/** The bot's role as people see it in Server Settings → Roles. */
+function botRoleName(interaction: ChatInputCommandInteraction): string {
+  const roles = interaction.guild?.members.me?.roles;
+  return (
+    roles?.botRole?.name ??
+    roles?.highest?.name ??
+    interaction.client.user?.username ??
+    'Bot'
+  );
 }
 
-function checkBotCanManageRole(
-  interaction: ChatInputCommandInteraction,
-  roleId: string
-): boolean {
-  const guild = interaction.guild;
-  if (!guild?.members.me) return false;
+function checkBotCanManageRole(guild: Guild, roleId: string): boolean {
+  if (!guild.members.me) return false;
   const botHighestRole = guild.members.me.roles.highest;
   const role = guild.roles.cache.get(roleId);
   if (!role) return false;
@@ -57,202 +74,229 @@ function checkActorCanManageMember(
   return executor.roles.highest.position > target.roles.highest.position;
 }
 
-function checkBotCanManageMember(
-  interaction: ChatInputCommandInteraction,
-  target: GuildMember
-): boolean {
-  const botMember = interaction.guild?.members.me;
+function checkBotCanManageMember(guild: Guild, target: GuildMember): boolean {
+  const botMember = guild.members.me;
   if (!botMember) return false;
   if (target.id === target.guild.ownerId) return false;
   return botMember.roles.highest.position > target.roles.highest.position;
+}
+
+/** Discord's answer when the bot lacks a permission for the request. */
+function isMissingPermissions(error: unknown): boolean {
+  return (
+    error instanceof DiscordAPIError &&
+    error.code === RESTJSONErrorCodes.MissingPermissions
+  );
+}
+
+async function replyPrivately(
+  interaction: ChatInputCommandInteraction,
+  embed: EmbedBuilder
+): Promise<void> {
+  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+function refusal(locale: Locale, description: string): EmbedBuilder {
+  return createErrorEmbed(t('common.error', locale), description);
 }
 
 export async function executeRoleCommand(
   interaction: ChatInputCommandInteraction
 ): Promise<void> {
   const locale = resolveLocale(interaction);
+  const guild = interaction.guild;
 
-  if (!interaction.guild) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('common.guildOnly', locale)
+  if (!guild) {
+    await replyPrivately(
+      interaction,
+      createWarningEmbed(
+        t('common.serverOnlyTitle', locale),
+        t('common.guildOnly', locale)
+      )
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
-  if (!checkManageRoles(interaction)) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('admin.role.errors.noPermission', locale)
+  if (
+    !memberHasServerPermission(interaction, PermissionFlagsBits.ManageRoles)
+  ) {
+    await replyPrivately(
+      interaction,
+      createPermissionDeniedEmbed(PermissionFlagsBits.ManageRoles, locale)
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
   const user = interaction.options.getUser('user', true);
   const role = interaction.options.getRole('role', true);
+  const roleName = escapeMarkdown(role.name);
 
-  const member = await interaction.guild.members
-    .fetch(user.id)
-    .catch(() => null);
+  const member = await guild.members.fetch(user.id).catch(() => null);
   if (!member || !(member instanceof GuildMember)) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('admin.role.errors.memberNotFound', locale)
+    await replyPrivately(
+      interaction,
+      refusal(locale, t('admin.role.errors.memberNotFound', locale))
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
-  if (!checkBotCanManageRole(interaction, role.id)) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('admin.role.errors.botRoleHierarchy', locale)
+  // Roles nobody can assign by hand, checked before anything the server
+  // could fix, so the moderator is not sent to fix permissions in vain.
+  // @everyone (id = guild id) is in every member's role cache, so without
+  // this an add would claim the member "already has it".
+  if (role.id === guild.id) {
+    await replyPrivately(
+      interaction,
+      refusal(locale, t('admin.role.errors.everyoneRole', locale))
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
-  const executor = await interaction.guild.members
+  if ((guild.roles.cache.get(role.id) ?? role).managed) {
+    await replyPrivately(
+      interaction,
+      refusal(
+        locale,
+        t('admin.role.errors.managedRole', locale, { role: roleName })
+      )
+    );
+    return;
+  }
+
+  const botPermissions = botServerPermissions(guild);
+  if (botPermissions && !botPermissions.has(PermissionFlagsBits.ManageRoles)) {
+    await replyPrivately(
+      interaction,
+      refusal(
+        locale,
+        t('admin.role.errors.botMissingManageRoles', locale, {
+          botRole: escapeMarkdown(botRoleName(interaction)),
+        })
+      )
+    );
+    return;
+  }
+
+  if (!checkBotCanManageRole(guild, role.id)) {
+    await replyPrivately(
+      interaction,
+      refusal(
+        locale,
+        t('admin.role.errors.botRoleHierarchy', locale, {
+          role: roleName,
+          botRole: escapeMarkdown(botRoleName(interaction)),
+        })
+      )
+    );
+    return;
+  }
+
+  const executor = await guild.members
     .fetch(interaction.user.id)
     .catch(() => null);
-  if (!executor || !checkActorCanManageRole(executor, role.id)) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('admin.role.errors.actorRoleHierarchy', locale)
+  // Discord lets the server owner manage every role and member regardless
+  // of where their own roles sit; only the bot's limits still apply.
+  const isOwner = executor?.id === guild.ownerId;
+  if (!executor || (!isOwner && !checkActorCanManageRole(executor, role.id))) {
+    await replyPrivately(
+      interaction,
+      refusal(locale, t('admin.role.errors.actorRoleHierarchy', locale))
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
-  if (!checkActorCanManageMember(executor, member)) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('admin.role.errors.targetMemberHierarchy', locale)
+  if (!isOwner && !checkActorCanManageMember(executor, member)) {
+    await replyPrivately(
+      interaction,
+      refusal(locale, t('admin.role.errors.targetMemberHierarchy', locale))
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
-  if (!checkBotCanManageMember(interaction, member)) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('admin.role.errors.botTargetMemberHierarchy', locale)
+  if (!checkBotCanManageMember(guild, member)) {
+    await replyPrivately(
+      interaction,
+      refusal(locale, t('admin.role.errors.botTargetMemberHierarchy', locale))
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
-  const subcommand = interaction.options.getSubcommand();
+  const adding = interaction.options.getSubcommand() === 'add';
 
+  if (adding === member.roles.cache.has(role.id)) {
+    await replyPrivately(
+      interaction,
+      createWarningEmbed(
+        t('common.warning', locale),
+        t(
+          adding
+            ? 'admin.role.errors.alreadyHasRole'
+            : 'admin.role.errors.doesNotHaveRole',
+          locale
+        )
+      )
+    );
+    return;
+  }
+
+  // Only the change itself is guarded here. A lost confirmation below is
+  // not a failed change, so it is left to the router's error reply rather
+  // than reported as "failed" for a role that was in fact changed.
   try {
-    if (subcommand === 'add') {
-      if (member.roles.cache.has(role.id)) {
-        const embed = createErrorEmbed(
-          t('common.warning', locale),
-          t('admin.role.errors.alreadyHasRole', locale)
-        );
-        await interaction.reply({
-          embeds: [embed],
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
+    if (adding) {
       await member.roles.add(role.id);
-      void audit.roleAdd(
-        interaction.client,
-        interaction.guild.id,
-        interaction.user.id,
-        member.id,
-        `Role: ${role.name} (${role.id})`
-      );
-      const embed = createEmbed({
-        title: t('admin.role.add.success', locale),
-        description: t('admin.role.add.successDesc', locale, {
-          user: user.tag,
-          role: role.name,
-        }),
-        color: COLORS.SUCCESS,
-        timestamp: true,
-      });
-      await interaction.reply({
-        embeds: [embed],
-        flags: MessageFlags.Ephemeral,
-      });
     } else {
-      if (!member.roles.cache.has(role.id)) {
-        const embed = createErrorEmbed(
-          t('common.warning', locale),
-          t('admin.role.errors.doesNotHaveRole', locale)
-        );
-        await interaction.reply({
-          embeds: [embed],
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
       await member.roles.remove(role.id);
-      void audit.roleRemove(
-        interaction.client,
-        interaction.guild.id,
-        interaction.user.id,
-        member.id,
-        `Role: ${role.name} (${role.id})`
-      );
-      const embed = createEmbed({
-        title: t('admin.role.remove.success', locale),
-        description: t('admin.role.remove.successDesc', locale, {
-          user: user.tag,
-          role: role.name,
-        }),
-        color: COLORS.SUCCESS,
-        timestamp: true,
-      });
-      await interaction.reply({
-        embeds: [embed],
-        flags: MessageFlags.Ephemeral,
-      });
     }
   } catch (error) {
     logger.error(
-      `Failed to ${subcommand} role ${role.id} for ${user.id}:`,
+      `Failed to ${adding ? 'add' : 'remove'} role ${role.id} for ${user.id}:`,
       getErrorMessage(error)
     );
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('admin.role.errors.failed', locale)
+    await replyPrivately(
+      interaction,
+      refusal(
+        locale,
+        isMissingPermissions(error)
+          ? t('admin.role.errors.botMissingManageRoles', locale, {
+              botRole: escapeMarkdown(botRoleName(interaction)),
+            })
+          : t('admin.role.errors.failed', locale)
+      )
     );
-    if (interaction.replied || interaction.deferred) {
-      await interaction.editReply({ embeds: [embed] }).catch(() => {});
-    } else {
-      await interaction
-        .reply({
-          embeds: [embed],
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => {});
-    }
+    return;
   }
+
+  const details = t('audit.details.role', resolveBackgroundLocale(guild), {
+    roleId: role.id,
+    roleName,
+  });
+  void (adding ? audit.roleAdd : audit.roleRemove)(
+    interaction.client,
+    guild.id,
+    interaction.user.id,
+    member.id,
+    details
+  );
+
+  await replyPrivately(
+    interaction,
+    createEmbed({
+      title: t(
+        adding ? 'admin.role.add.success' : 'admin.role.remove.success',
+        locale
+      ),
+      description: t(
+        adding ? 'admin.role.add.successDesc' : 'admin.role.remove.successDesc',
+        locale,
+        {
+          userId: member.id,
+          displayName: escapeMarkdown(member.displayName),
+          roleId: role.id,
+        }
+      ),
+      color: COLORS.SUCCESS,
+      timestamp: true,
+    })
+  );
 }

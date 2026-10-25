@@ -5,7 +5,9 @@ import { VoiceConnectionState } from '../../../shared/types/voice.js';
 import { logger } from '../../../shared/utils/logger.js';
 import { channelMixRingManager } from '../recording/channelMixRing.js';
 import {
+  BEFORE_DISCONNECT_TIMEOUT_MS,
   connectionManager,
+  getLiveDecoderCount,
   VoiceConnectionManager,
 } from '../recording/connectionManager.js';
 
@@ -13,7 +15,13 @@ const joinVoiceChannel = vi.hoisted(() => vi.fn());
 const entersState = vi.hoisted(() => vi.fn());
 const createAudioPlayer = vi.hoisted(() => vi.fn(() => ({ kind: 'player' })));
 const decoderOptions = vi.hoisted(() => [] as unknown[]);
-const mockRing = vi.hoisted(() => ({ addMonoPcmInt16: vi.fn() }));
+const mockRing = vi.hoisted(() => ({
+  /** Ring timeline in samples, with NOW as its epoch. */
+  globalIndexAt: vi.fn(
+    (ms: number) => (ms - new Date('2026-10-24T12:00:00.000Z').getTime()) * 48
+  ),
+  addMonoPcmInt16At: vi.fn(),
+}));
 const limitState = vi.hoisted(() => ({ max: 3, reads: 0 }));
 
 vi.mock('@discordjs/voice', () => ({
@@ -158,16 +166,6 @@ async function join(
   joinVoiceChannel.mockImplementationOnce(() => fake.connection);
   await expect(connectTo(manager, channel)).resolves.toBe(fake.connection);
   return fake;
-}
-
-/** Interleaved stereo s16le, as the Opus decoder emits it. */
-function stereo(frames: Array<[number, number]>): Buffer {
-  const buf = Buffer.alloc(frames.length * 4);
-  frames.forEach(([l, r], i) => {
-    buf.writeInt16LE(l, i * 4);
-    buf.writeInt16LE(r, i * 4 + 2);
-  });
-  return buf;
 }
 
 function mono(samples: number[]): Buffer {
@@ -398,7 +396,7 @@ describe('VoiceConnectionManager', () => {
   });
 
   describe('audio receive pipeline', () => {
-    it('subscribes to a speaker until 1.5s of silence and decodes 48 kHz stereo', async () => {
+    it('subscribes to a speaker until 1.5s of silence and decodes 48 kHz mono', async () => {
       const fake = await join(manager, makeChannel('ch-1'));
 
       fake.speak('user-1');
@@ -407,36 +405,136 @@ describe('VoiceConnectionManager', () => {
         'user-1',
         { end: { behavior: 'after-silence', duration: 1500 } }
       );
+      // Mono from the decoder: no JS downmix, and more decoders fit in the
+      // opusscript heap than stereo ones would.
       expect(decoderOptions).toEqual([
-        { rate: 48000, channels: 2, frameSize: 960 },
+        { rate: 48000, channels: 1, frameSize: 960 },
       ]);
     });
 
-    it('downmixes stereo PCM to mono and feeds the channel ring with the receive time', async () => {
+    it('feeds decoded mono PCM to the channel ring, ending at the receive time', async () => {
       const fake = await join(manager, makeChannel('ch-1'));
       fake.speak('user-1');
       vi.setSystemTime(NOW + 1_234);
+      const pcm = mono([2000, -200, 32767, -32768, 0]);
 
-      fake.opusStreams[0].pcm.emit(
-        'data',
-        stereo([
-          [1000, 3000],
-          [-100, -301],
-          [32767, 32767],
-          [-32768, -32768],
-          [32767, -32768],
-        ])
+      fake.opusStreams[0].pcm.emit('data', pcm);
+
+      // A new ring's timeline starts where this chunk starts (5 samples back).
+      expect(channelMixRingManager.getOrCreate).toHaveBeenCalledWith(
+        'ch-1',
+        NOW + 1_234 - 5 / 48
       );
-
-      expect(channelMixRingManager.getOrCreate).toHaveBeenCalledWith('ch-1');
-      expect(mockRing.addMonoPcmInt16).toHaveBeenCalledTimes(1);
-      const [chunk, receivedAt] = mockRing.addMonoPcmInt16.mock.calls[0] as [
+      expect(mockRing.addMonoPcmInt16At).toHaveBeenCalledTimes(1);
+      const [chunk, start] = mockRing.addMonoPcmInt16At.mock.calls[0] as [
         Buffer,
         number,
       ];
-      // Halves round toward +Infinity: -200.5 -> -200 and -0.5 -> 0.
-      expect(chunk.equals(mono([2000, -200, 32767, -32768, 0]))).toBe(true);
-      expect(receivedAt).toBe(NOW + 1_234);
+      expect(chunk.equals(pcm)).toBe(true);
+      expect(start).toBe(1_234 * 48 - 5);
+    });
+
+    it("lays a speaker's frames end to end however jittery their arrival", async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      fake.speak('user-1');
+      const frame = Buffer.alloc(960 * 2);
+
+      for (const [i, offset] of [0, 3, -4, 9, 1, -2, 12].entries()) {
+        vi.setSystemTime(NOW + 1_000 + i * 20 + offset);
+        fake.opusStreams[0].pcm.emit('data', frame);
+      }
+
+      const starts = mockRing.addMonoPcmInt16At.mock.calls.map(
+        ([, start]) => start as number
+      );
+      expect(starts[0]).toBe(1_000 * 48 - 960);
+      for (let i = 1; i < starts.length; i++) {
+        expect(starts[i] - starts[i - 1]).toBe(960);
+      }
+    });
+
+    it('drops frames instead of writing them more than a second ahead of now', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      fake.speak('user-1');
+      const frame = Buffer.alloc(960 * 2);
+      vi.setSystemTime(NOW + 1_000);
+
+      // 1.5 s of frames handled at one instant (a stall nobody paused in).
+      for (let i = 0; i < 75; i++) {
+        fake.opusStreams[0].pcm.emit('data', frame);
+      }
+
+      const starts = mockRing.addMonoPcmInt16At.mock.calls.map(
+        ([, start]) => start as number
+      );
+      const now = 1_000 * 48;
+      expect(starts.length).toBeLessThan(75);
+      expect(Math.max(...starts) - now).toBeLessThanOrEqual(48_000);
+    });
+
+    it('gives each speaker their own placement', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      fake.speak('user-1');
+      fake.speak('user-2');
+      const frame = Buffer.alloc(960 * 2);
+      vi.setSystemTime(NOW + 500);
+
+      fake.opusStreams[0].pcm.emit('data', frame);
+      fake.opusStreams[1].pcm.emit('data', frame);
+
+      const starts = mockRing.addMonoPcmInt16At.mock.calls.map(
+        ([, start]) => start as number
+      );
+      // Same instant, same slot: two people talking at once are mixed.
+      expect(starts).toEqual([500 * 48 - 960, 500 * 48 - 960]);
+    });
+
+    it('counts live decoders and frees one when its stream ends, once', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      const before = getLiveDecoderCount();
+
+      fake.speak('user-1');
+      fake.speak('user-2');
+      expect(getLiveDecoderCount()).toBe(before + 2);
+
+      fake.opusStreams[0].pcm.emit('error', new Error('corrupt'));
+      fake.opusStreams[0].pcm.emit('close');
+      expect(getLiveDecoderCount()).toBe(before + 1);
+    });
+
+    it('warns, with the live decoder count, when the Opus heap is exhausted - at most once a minute', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      fake.speak('user-1');
+      fake.speak('user-2');
+      fake.speak('user-3');
+      const exhausted = () =>
+        new Error('RuntimeError: memory access out of bounds');
+
+      vi.setSystemTime(NOW + 10 * 60_000);
+      fake.opusStreams[0].pcm.emit('error', exhausted());
+      fake.opusStreams[1].pcm.emit('error', exhausted());
+
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(logger.warn).mock.calls[0][0]).toMatch(
+        /ran out of memory with \d+ live decoders/
+      );
+
+      vi.setSystemTime(NOW + 11 * 60_000);
+      fake.opusStreams[2].pcm.emit('error', exhausted());
+      expect(logger.warn).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps ordinary decode errors at debug level', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      fake.speak('user-1');
+
+      fake.opusStreams[0].pcm.emit('error', new Error('corrupted packet'));
+
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(logger.debug).toHaveBeenCalledWith(
+        'Audio decode error for user user-1:',
+        'corrupted packet'
+      );
     });
 
     it('subscribes once per speaker while their stream is open', async () => {
@@ -496,10 +594,10 @@ describe('VoiceConnectionManager', () => {
       const [stream] = fake.opusStreams;
       await manager.disconnect('ch-1');
 
-      stream.pcm.emit('data', stereo([[1000, 1000]]));
+      stream.pcm.emit('data', mono([1000]));
 
       expect(channelMixRingManager.getOrCreate).not.toHaveBeenCalled();
-      expect(mockRing.addMonoPcmInt16).not.toHaveBeenCalled();
+      expect(mockRing.addMonoPcmInt16At).not.toHaveBeenCalled();
     });
 
     it('keeps audio from different channels in separate rings', async () => {
@@ -508,13 +606,14 @@ describe('VoiceConnectionManager', () => {
       a.speak('user-1');
       b.speak('user-1');
 
-      a.opusStreams[0].pcm.emit('data', stereo([[10, 10]]));
-      b.opusStreams[0].pcm.emit('data', stereo([[20, 20]]));
+      a.opusStreams[0].pcm.emit('data', mono([10]));
+      b.opusStreams[0].pcm.emit('data', mono([20]));
 
-      expect(vi.mocked(channelMixRingManager.getOrCreate).mock.calls).toEqual([
-        ['ch-a'],
-        ['ch-b'],
-      ]);
+      expect(
+        vi
+          .mocked(channelMixRingManager.getOrCreate)
+          .mock.calls.map(([channelId]) => channelId)
+      ).toEqual(['ch-a', 'ch-b']);
     });
   });
 
@@ -588,6 +687,102 @@ describe('VoiceConnectionManager', () => {
     });
   });
 
+  describe('before-disconnect hooks', () => {
+    it('runs the hook while the connection is still up, and leaves once it is done', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      let release!: () => void;
+      const seen: boolean[] = [];
+      manager.onBeforeDisconnect((channelId) => {
+        seen.push(manager.getConnection(channelId) !== undefined);
+        return new Promise<void>((resolve) => (release = resolve));
+      });
+
+      const leaving = manager.disconnect('ch-1');
+      await Promise.resolve();
+
+      expect(seen).toEqual([true]);
+      expect(fake.connection.destroy).not.toHaveBeenCalled();
+      release();
+      await leaving;
+      expect(fake.connection.destroy).toHaveBeenCalledTimes(1);
+      expect(manager.getConnection('ch-1')).toBeUndefined();
+    });
+
+    it('stays synchronous when no hook has anything to do', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      manager.onBeforeDisconnect(() => undefined);
+
+      void manager.disconnect('ch-1');
+
+      expect(fake.connection.destroy).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves after the timeout when a hook hangs', async () => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const fake = await join(manager, makeChannel('ch-1'));
+      manager.onBeforeDisconnect(() => new Promise<void>(() => undefined));
+
+      const leaving = manager.disconnect('ch-1');
+      await vi.advanceTimersByTimeAsync(BEFORE_DISCONNECT_TIMEOUT_MS - 1);
+      expect(fake.connection.destroy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await leaving;
+
+      expect(fake.connection.destroy).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves even when a hook throws or rejects', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      manager.onBeforeDisconnect(() => {
+        throw new Error('sync');
+      });
+      manager.onBeforeDisconnect(() => Promise.reject(new Error('async')));
+
+      await manager.disconnect('ch-1');
+
+      expect(fake.connection.destroy).toHaveBeenCalledTimes(1);
+      expect(manager.getConnection('ch-1')).toBeUndefined();
+    });
+
+    it('tears down once when two disconnects overlap the hook', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      const listener = vi.fn();
+      manager.onDisconnect(listener);
+      manager.onBeforeDisconnect(() => Promise.resolve());
+
+      await Promise.all([
+        manager.disconnect('ch-1'),
+        manager.disconnect('ch-1'),
+      ]);
+
+      expect(fake.connection.destroy).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops running a hook once it is unsubscribed', async () => {
+      await join(manager, makeChannel('ch-1'));
+      const hook = vi.fn(() => undefined);
+      const unsubscribe = manager.onBeforeDisconnect(hook);
+      unsubscribe();
+
+      await manager.disconnect('ch-1');
+
+      expect(hook).not.toHaveBeenCalled();
+    });
+
+    it('is not run when Discord already dropped the connection', async () => {
+      const fake = await join(manager, makeChannel('ch-1'));
+      const hook = vi.fn(() => undefined);
+      manager.onBeforeDisconnect(hook);
+      entersState.mockRejectedValue(new Error('timeout'));
+
+      await fake.fire('disconnected');
+
+      expect(manager.getConnection('ch-1')).toBeUndefined();
+      expect(hook).not.toHaveBeenCalled();
+    });
+  });
+
   describe('connection limit', () => {
     it('does not read the limit from config until it is needed', () => {
       new VoiceConnectionManager();
@@ -639,6 +834,18 @@ describe('VoiceConnectionManager', () => {
   });
 
   describe('bookkeeping', () => {
+    it('names the channel the bot is in for a guild, and nothing for other guilds', async () => {
+      await join(manager, makeChannel('ch-a', 'guild-a'));
+      await join(manager, makeChannel('ch-b', 'guild-b'));
+
+      expect(manager.getConnectedChannelInGuild('guild-a')).toBe('ch-a');
+      expect(manager.getConnectedChannelInGuild('guild-b')).toBe('ch-b');
+      expect(manager.getConnectedChannelInGuild('guild-c')).toBeUndefined();
+
+      await manager.disconnect('ch-a');
+      expect(manager.getConnectedChannelInGuild('guild-a')).toBeUndefined();
+    });
+
     it('returns undefined for an unknown channel', () => {
       expect(manager.getConnection('nope')).toBeUndefined();
       expect(manager.getConnectionCount()).toBe(0);

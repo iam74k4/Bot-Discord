@@ -3,7 +3,7 @@ import { Collection, EmbedBuilder, type Client } from 'discord.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { proxyDatabase } from '../../database/__tests__/infrastructure.helpers.js';
-import { formatAuditTarget } from '../format.js';
+import { formatAuditTarget, shortenAuditDetails } from '../format.js';
 
 /**
  * logAuditAction is fire-and-forget for its callers, so the properties that
@@ -33,9 +33,16 @@ vi.mock('../../../config/index.js', () => ({
   env: { AUDIT_LOG_RETENTION_DAYS: 90 },
 }));
 
-const { audit, auditRepository, logAuditAction } = await import('../index.js');
+const {
+  audit,
+  auditActionLabel,
+  auditLocaleOf,
+  auditRepository,
+  logAuditAction,
+} = await import('../index.js');
 const { guildSettingsRepository } =
   await import('../../guildSettings/index.js');
+const { t } = await import('../../../locales/index.js');
 const migrations = await Promise.all([
   import('../../database/migrations/003_settings.js'),
   import('../../database/migrations/007_voice_autojoin.js'),
@@ -53,13 +60,24 @@ const KNOWN_USERS: Record<string, { tag: string }> = {
   [TARGET_ID]: { tag: 'Target#0002' },
 };
 
-function createDiscord() {
+/**
+ * The audit trail is written in the server's language. These guilds are on
+ * "automatic" and not Community servers unless a test says otherwise, so
+ * that is Japanese; `userWithName` and the field names follow it.
+ */
+function userWithName(id: string, name: string, locale: 'ja' | 'en' = 'ja') {
+  return t('audit.userWithName', locale, { mention: `<@${id}>`, name });
+}
+
+function createDiscord(
+  guildExtras: { features?: string[]; preferredLocale?: string } = {}
+) {
   const send = vi.fn().mockResolvedValue(undefined);
   const channels = new Collection<string, unknown>([
     [AUDIT_CHANNEL_ID, { id: AUDIT_CHANNEL_ID, isTextBased: () => true, send }],
   ]);
   const guilds = new Collection<string, unknown>([
-    [GUILD_ID, { id: GUILD_ID, channels: { cache: channels } }],
+    [GUILD_ID, { id: GUILD_ID, channels: { cache: channels }, ...guildExtras }],
   ]);
   const fetchUser = vi.fn(async (id: string) => {
     const user = KNOWN_USERS[id];
@@ -116,6 +134,58 @@ describe('audit', () => {
       expect(formatAuditTarget('AUDIT_SETUP', null)).toBeNull();
       expect(formatAuditTarget('ROLE_ADD', undefined)).toBeNull();
       expect(formatAuditTarget('ROLE_ADD', '')).toBeNull();
+    });
+  });
+
+  describe('shortenAuditDetails', () => {
+    it('keeps details that fit, joined onto one line', () => {
+      expect(shortenAuditDetails('ロール: <@&1>\n  （mods）')).toBe(
+        'ロール: <@&1> （mods）'
+      );
+    });
+
+    it('cuts long details to the limit, ending in an ellipsis', () => {
+      const shortened = shortenAuditDetails('a'.repeat(200), 10);
+      expect(shortened).toBe(`${'a'.repeat(9)}…`);
+    });
+
+    it('counts an emoji as one character and never splits it', () => {
+      // Nine code points fit before the ellipsis; each 🎉 is two UTF-16
+      // units, so a UTF-16 cut would leave half of the last one.
+      const shortened = shortenAuditDetails(`${'🎉'.repeat(12)}`, 10);
+      expect(shortened).toBe(`${'🎉'.repeat(9)}…`);
+    });
+
+    it.each([
+      ['role', 'Role: <@&123456789012345678> (mods)'],
+      ['channel', 'Channel: <#123456789012345678>'],
+      ['user', 'User: <@!123456789012345678>'],
+      ['timestamp', 'At: <t:1700000000:R>'],
+    ])('drops a %s mention the cut would break', (_kind, tail) => {
+      const head = 'x'.repeat(10);
+      // The cut falls inside the mention, a few characters after its "<".
+      const shortened = shortenAuditDetails(
+        `${head} ${tail}`,
+        head.length + tail.indexOf('<') + 6
+      );
+      expect(shortened).toBe(
+        `${head} ${tail.slice(0, tail.indexOf('<')).trimEnd()}…`
+      );
+      expect(shortened).not.toContain('<');
+    });
+
+    it('keeps a mention that closes before the cut', () => {
+      const shortened = shortenAuditDetails(
+        'Role: <@&1> and a long tail of words',
+        16
+      );
+      expect(shortened).toBe('Role: <@&1> and…');
+    });
+
+    it('keeps a plain "<" that is not Discord markup', () => {
+      expect(shortenAuditDetails('limit < 5 then more words', 12)).toBe(
+        'limit < 5 t…'
+      );
     });
   });
 
@@ -194,23 +264,76 @@ describe('audit', () => {
           embeds: [expect.any(EmbedBuilder)],
         });
         expect(sentEmbed()).toEqual({
-          title: 'Role Added',
+          title: t('audit.actions.ROLE_ADD', 'ja'),
           color: COLORS.SUCCESS,
           timestamp: new Date(NOW).toISOString(),
           fields: [
             {
-              name: 'User',
-              value: `Actor#0001 (<@${ACTOR_ID}>)`,
+              name: t('audit.fields.user', 'ja'),
+              value: userWithName(ACTOR_ID, 'Actor#0001'),
               inline: true,
             },
             {
-              name: 'Target',
-              value: `Target#0002 (<@${TARGET_ID}>)`,
+              name: t('audit.fields.target', 'ja'),
+              value: userWithName(TARGET_ID, 'Target#0002'),
               inline: true,
             },
-            { name: 'Details', value: 'Role: Member', inline: false },
+            {
+              name: t('audit.fields.details', 'ja'),
+              value: 'Role: Member',
+              inline: false,
+            },
           ],
         });
+      });
+
+      it('writes in English for a server set to English', async () => {
+        guildSettingsRepository.setLanguage(GUILD_ID, 'en');
+
+        await logAuditAction(
+          discord.client,
+          GUILD_ID,
+          ACTOR_ID,
+          'ROLE_ADD',
+          TARGET_ID
+        );
+
+        expect(sentEmbed()).toMatchObject({
+          title: 'Role Added',
+          fields: [
+            { name: 'User', value: userWithName(ACTOR_ID, 'Actor#0001', 'en') },
+            {
+              name: 'Target',
+              value: userWithName(TARGET_ID, 'Target#0002', 'en'),
+            },
+          ],
+        });
+      });
+
+      it.each([
+        [
+          'follows the server language of a Community server',
+          ['COMMUNITY'],
+          'Role Added',
+        ],
+        // Discord keeps every other server on en-US, which nobody chose.
+        ['ignores the server language of other servers', [], 'ロールを付与'],
+      ])('on automatic, %s', async (_case, features, title) => {
+        discord = createDiscord({ features, preferredLocale: 'en-US' });
+
+        await logAuditAction(discord.client, GUILD_ID, ACTOR_ID, 'ROLE_ADD');
+
+        expect(sentEmbed().title).toBe(title);
+      });
+
+      it('escapes markdown in names so they cannot restyle the entry', async () => {
+        discord.fetchUser.mockResolvedValue({ tag: '*bold*_name_' });
+
+        await logAuditAction(discord.client, GUILD_ID, ACTOR_ID, 'ROLE_ADD');
+
+        expect(sentEmbed().fields?.[0]?.value).toBe(
+          userWithName(ACTOR_ID, '\\*bold\\*\\_name\\_')
+        );
       });
 
       it('shows only the actor when there is no target or details', async () => {
@@ -222,7 +345,11 @@ describe('audit', () => {
         );
 
         expect(sentEmbed().fields).toEqual([
-          { name: 'User', value: `Actor#0001 (<@${ACTOR_ID}>)`, inline: true },
+          {
+            name: t('audit.fields.user', 'ja'),
+            value: userWithName(ACTOR_ID, 'Actor#0001'),
+            inline: true,
+          },
         ]);
       });
 
@@ -237,12 +364,12 @@ describe('audit', () => {
         );
 
         expect(sentEmbed().fields?.map((field) => field.name)).toEqual([
-          'User',
-          'Details',
+          t('audit.fields.user', 'ja'),
+          t('audit.fields.details', 'ja'),
         ]);
       });
 
-      it('falls back to raw IDs when users cannot be fetched', async () => {
+      it('falls back to plain mentions when users cannot be fetched', async () => {
         discord.fetchUser.mockRejectedValue(new Error('Unknown User'));
 
         await logAuditAction(
@@ -253,9 +380,9 @@ describe('audit', () => {
           TARGET_ID
         );
 
-        expect(sentEmbed().fields).toEqual([
-          { name: 'User', value: ACTOR_ID, inline: true },
-          { name: 'Target', value: `<@${TARGET_ID}>`, inline: true },
+        expect(sentEmbed().fields?.map((field) => field.value)).toEqual([
+          `<@${ACTOR_ID}>`,
+          `<@${TARGET_ID}>`,
         ]);
         expect(logger.error).not.toHaveBeenCalled();
       });
@@ -274,9 +401,9 @@ describe('audit', () => {
           TARGET_ID
         );
 
-        expect(sentEmbed().fields).toEqual([
-          { name: 'User', value: `Actor#0001 (<@${ACTOR_ID}>)`, inline: true },
-          { name: 'Target', value: `<@${TARGET_ID}>`, inline: true },
+        expect(sentEmbed().fields?.map((field) => field.value)).toEqual([
+          userWithName(ACTOR_ID, 'Actor#0001'),
+          `<@${TARGET_ID}>`,
         ]);
         expect(logger.error).not.toHaveBeenCalled();
       });
@@ -295,13 +422,9 @@ describe('audit', () => {
           TARGET_ID
         );
 
-        expect(sentEmbed().fields).toEqual([
-          { name: 'User', value: ACTOR_ID, inline: true },
-          {
-            name: 'Target',
-            value: `Target#0002 (<@${TARGET_ID}>)`,
-            inline: true,
-          },
+        expect(sentEmbed().fields?.map((field) => field.value)).toEqual([
+          `<@${ACTOR_ID}>`,
+          userWithName(TARGET_ID, 'Target#0002'),
         ]);
       });
 
@@ -318,7 +441,7 @@ describe('audit', () => {
         );
 
         expect(sentEmbed().fields).toContainEqual({
-          name: 'Details',
+          name: t('audit.fields.details', 'ja'),
           value: details,
           inline: false,
         });
@@ -334,7 +457,7 @@ describe('audit', () => {
         );
 
         expect(sentEmbed().fields).toContainEqual({
-          name: 'Target',
+          name: t('audit.fields.target', 'ja'),
           value: '<#new-audit-chan>',
           inline: true,
         });
@@ -343,18 +466,74 @@ describe('audit', () => {
       });
 
       it.each([
-        ['NOTIFY_SETUP', 'Notification Setup', COLORS.SUCCESS],
-        ['NOTIFY_ENABLE', 'Notifications Enabled', COLORS.SUCCESS],
-        ['NOTIFY_DISABLE', 'Notifications Disabled', COLORS.WARNING],
-        ['NOTIFY_REMOVE', 'Notification Settings Removed', COLORS.ERROR],
-        ['SETTINGS_CHANGE', 'Settings Changed', COLORS.INFO],
-        ['AUDIT_SETUP', 'Audit Log Configured', COLORS.INFO],
-        ['ROLE_ADD', 'Role Added', COLORS.SUCCESS],
-        ['ROLE_REMOVE', 'Role Removed', COLORS.WARNING],
-      ] as const)('titles and colours %s', async (action, title, color) => {
+        ['NOTIFY_SETUP', '通知を設定', 'Notification Setup', COLORS.SUCCESS],
+        [
+          'NOTIFY_ENABLE',
+          '通知を有効化',
+          'Notifications Enabled',
+          COLORS.SUCCESS,
+        ],
+        [
+          'NOTIFY_DISABLE',
+          '通知を無効化',
+          'Notifications Disabled',
+          COLORS.WARNING,
+        ],
+        [
+          'NOTIFY_REMOVE',
+          '通知を解除',
+          'Notification Settings Removed',
+          COLORS.ERROR,
+        ],
+        ['SETTINGS_CHANGE', '設定を変更', 'Settings Changed', COLORS.INFO],
+        ['AUDIT_SETUP', '監査ログを設定', 'Audit Log Configured', COLORS.INFO],
+        ['ROLE_ADD', 'ロールを付与', 'Role Added', COLORS.SUCCESS],
+        ['ROLE_REMOVE', 'ロールを外す', 'Role Removed', COLORS.WARNING],
+      ] as const)('titles and colours %s', async (action, ja, en, color) => {
         await logAuditAction(discord.client, GUILD_ID, ACTOR_ID, action);
+        expect(sentEmbed()).toMatchObject({ title: ja, color });
+        expect(auditActionLabel(action, 'en')).toBe(en);
+      });
 
-        expect(sentEmbed()).toMatchObject({ title, color });
+      it('names an action this version does not know as readable text', () => {
+        expect(auditActionLabel('SOMETHING_NEW', 'ja')).toBe('SOMETHING NEW');
+      });
+
+      it('posts to the channel it is told to instead of the configured one', async () => {
+        const otherSend = vi.fn().mockResolvedValue(undefined);
+        discord.channels.set('old-audit', {
+          id: 'old-audit',
+          isTextBased: () => true,
+          send: otherSend,
+        });
+
+        await logAuditAction(
+          discord.client,
+          GUILD_ID,
+          ACTOR_ID,
+          'AUDIT_SETUP',
+          undefined,
+          'cleared',
+          { deliverTo: 'old-audit' }
+        );
+
+        expect(otherSend).toHaveBeenCalledTimes(1);
+        expect(discord.send).not.toHaveBeenCalled();
+      });
+
+      it('posts nowhere when told to deliver to no channel', async () => {
+        await logAuditAction(
+          discord.client,
+          GUILD_ID,
+          ACTOR_ID,
+          'AUDIT_SETUP',
+          undefined,
+          undefined,
+          { deliverTo: null }
+        );
+
+        expect(discord.send).not.toHaveBeenCalled();
+        expect(auditRepository.getLogsCount(GUILD_ID)).toBe(1);
       });
     });
 
@@ -500,15 +679,29 @@ describe('audit', () => {
       { action: string; target_id: string | null; details: string | null },
     ];
 
+    // Details are written once, in the server's language (Japanese here).
     const cases: Case[] = [
       [
         'notifySetup with a kind',
         (client) =>
-          audit.notifySetup(client, GUILD_ID, ACTOR_ID, 'chan-5', 'voice'),
+          audit.notifySetup(client, GUILD_ID, ACTOR_ID, 'chan-5', 'Voice'),
         {
           action: 'NOTIFY_SETUP',
           target_id: null,
-          details: 'voice notifications → <#chan-5>',
+          details: 'VC入退室通知 → <#chan-5>',
+        },
+      ],
+      [
+        'notifySetup with a kind it does not know',
+        (client) =>
+          audit.notifySetup(client, GUILD_ID, ACTOR_ID, 'chan-5', 'Polls'),
+        {
+          action: 'NOTIFY_SETUP',
+          target_id: null,
+          details: t('audit.details.notifySetup', 'ja', {
+            kind: 'Polls',
+            channel: 'chan-5',
+          }),
         },
       ],
       [
@@ -517,7 +710,9 @@ describe('audit', () => {
         {
           action: 'NOTIFY_SETUP',
           target_id: null,
-          details: 'Channel: <#chan-5>',
+          details: t('audit.details.notifyChannel', 'ja', {
+            channel: 'chan-5',
+          }),
         },
       ],
       [
@@ -532,11 +727,13 @@ describe('audit', () => {
       ],
       [
         'notifyRemove with a kind',
-        (client) => audit.notifyRemove(client, GUILD_ID, ACTOR_ID, 'voice'),
+        (client) => audit.notifyRemove(client, GUILD_ID, ACTOR_ID, 'Welcome'),
         {
           action: 'NOTIFY_REMOVE',
           target_id: null,
-          details: 'voice notifications disabled',
+          details: t('audit.details.notifyRemove', 'ja', {
+            kind: t('audit.kinds.Welcome', 'ja'),
+          }),
         },
       ],
       [
@@ -576,6 +773,22 @@ describe('audit', () => {
       ]);
     });
 
+    it('writes helper details in English for a server set to English', async () => {
+      guildSettingsRepository.setLanguage(GUILD_ID, 'en');
+
+      await audit.notifySetup(
+        discord.client,
+        GUILD_ID,
+        ACTOR_ID,
+        'chan-5',
+        'Voice'
+      );
+
+      expect(auditRepository.getLogs(GUILD_ID)[0]?.details).toBe(
+        'Voice notifications → <#chan-5>'
+      );
+    });
+
     it('delivers helper entries to the audit channel too', async () => {
       configureAuditChannel();
 
@@ -584,19 +797,28 @@ describe('audit', () => {
         GUILD_ID,
         ACTOR_ID,
         'chan-5',
-        'voice'
+        'Voice'
       );
 
       expect(sentEmbed()).toMatchObject({
-        title: 'Notification Setup',
+        title: t('audit.actions.NOTIFY_SETUP', 'ja'),
         fields: expect.arrayContaining([
           {
-            name: 'Details',
-            value: 'voice notifications → <#chan-5>',
+            name: t('audit.fields.details', 'ja'),
+            value: 'VC入退室通知 → <#chan-5>',
             inline: false,
           },
         ]),
       });
+    });
+  });
+
+  describe('auditLocaleOf', () => {
+    it('honours the configured language of a guild the bot has not cached', () => {
+      guildSettingsRepository.setLanguage('uncached', 'en');
+
+      expect(auditLocaleOf(discord.client, 'uncached')).toBe('en');
+      expect(auditLocaleOf(discord.client, 'unknown')).toBe('ja');
     });
   });
 });

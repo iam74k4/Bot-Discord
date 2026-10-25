@@ -6,6 +6,8 @@ import { logger } from '../../../shared/utils/logger.js';
 interface ActiveSession {
   sessionId: number;
   channelId: string;
+  /** Name when the session started, for stats when the channel is uncached. */
+  channelName: string;
   joinedAt: number;
 }
 
@@ -37,6 +39,7 @@ function startSession(
   activeSessions.set(key, {
     sessionId,
     channelId,
+    channelName,
     joinedAt: Date.now(),
   });
 
@@ -103,6 +106,9 @@ function reconcileActiveVoiceSessions(client: Client): void {
       ) {
         continue;
       }
+      // Idle members parked in the AFK channel are not counted as in VC,
+      // matching what the live voice-state handler does.
+      if (channel.id === guild.afkChannelId) continue;
 
       if (!('members' in channel) || !channel.members) continue;
 

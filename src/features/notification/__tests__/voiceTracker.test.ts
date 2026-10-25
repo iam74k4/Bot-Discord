@@ -85,7 +85,48 @@ describe('voiceTracker restart reconciliation', () => {
       expect.objectContaining({
         sessionId: 1,
         channelId: 'ch-1',
+        channelName: 'General',
       })
+    );
+  });
+
+  it('does not count members idling in the AFK channel after restart', async () => {
+    const { voiceTracker } = await import('../tracking/voiceTracker.js');
+
+    const voiceChannel = (id: string, userId: string) => ({
+      id,
+      name: id,
+      type: ChannelType.GuildVoice,
+      members: new Collection([
+        [userId, { id: userId, user: { id: userId, bot: false } }],
+      ]),
+    });
+    const afk = voiceChannel('afk', 'idle-user');
+    const lounge = voiceChannel('lounge', 'active-user');
+    const guild = {
+      id: 'guild-1',
+      afkChannelId: 'afk',
+      channels: {
+        cache: new Collection([
+          [afk.id, afk],
+          [lounge.id, lounge],
+        ]),
+      },
+    };
+
+    voiceTracker.reconcileActiveVoiceSessions({
+      guilds: { cache: new Collection([[guild.id, guild]]) },
+    } as never);
+
+    expect(startSession).toHaveBeenCalledTimes(1);
+    expect(startSession).toHaveBeenCalledWith(
+      'guild-1',
+      'active-user',
+      'lounge',
+      'lounge'
+    );
+    expect(voiceTracker.getActiveSession('guild-1', 'idle-user')).toBe(
+      undefined
     );
   });
 });

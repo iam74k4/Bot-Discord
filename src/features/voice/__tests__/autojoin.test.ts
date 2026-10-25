@@ -32,6 +32,15 @@ vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: { getAllConnections, getConnection, disconnect },
 }));
 
+const reconcileGuild = vi.hoisted(() => vi.fn());
+vi.mock('../application/reconcile.js', () => ({ reconcileGuild }));
+
+const releaseCooldown = vi.hoisted(() => vi.fn());
+vi.mock('../../../middleware/index.js', () => ({ releaseCooldown }));
+
+const logAuditAction = vi.hoisted(() => vi.fn());
+vi.mock('../../../infrastructure/audit/index.js', () => ({ logAuditAction }));
+
 const ttsSessions = vi.hoisted(() => ({ get: vi.fn() }));
 
 vi.mock('../tts/sessionManager.js', () => ({ ttsSessions }));
@@ -125,6 +134,8 @@ function createInteraction(
         return options.channel ?? null;
       }),
     },
+    user: { id: 'admin-1' },
+    client: { id: 'client' },
     reply: vi.fn().mockResolvedValue(undefined),
   } as unknown as ChatInputCommandInteraction;
 }
@@ -142,6 +153,7 @@ function replyEmbed(interaction: ChatInputCommandInteraction) {
 }
 
 const minutes = () => Math.round(env.AUDIO_BUFFER_DURATION / 60);
+const enableCommand = '`/voice autojoin enable`';
 
 /**
  * Make each disconnect settle a few microtasks after it is called and record
@@ -186,6 +198,7 @@ describe('/voice autojoin', () => {
     getAllConnections.mockReturnValue(new Map());
     getConnection.mockReturnValue(undefined);
     disconnect.mockResolvedValue(undefined);
+    reconcileGuild.mockResolvedValue({ status: 'none' });
     ttsSessions.get.mockReturnValue(undefined);
     tts.url = '';
   });
@@ -221,11 +234,30 @@ describe('/voice autojoin', () => {
 
       const embed = replyEmbed(interaction);
       expect(embed.title).toBe(t('record.autojoin.title', 'en'));
-      expect(embed.description).toBe(t('record.autojoin.disabled', 'en'));
-      expect(embed.color).toBe(COLORS.WARNING);
+      // Nothing was connected, so nothing was discarded.
+      expect(embed.description).toBe(
+        t('record.autojoin.disabled', 'en', { command: enableCommand })
+      );
+      expect(embed.color).toBe(COLORS.SUCCESS);
     });
 
-    it('persists "enabled" again and states the buffer window in minutes', async () => {
+    it('says the kept audio was discarded when disabling dropped a connection', async () => {
+      getAllConnections.mockReturnValue(
+        new Map([['voice-a', connectionInfo('voice-a', GUILD)]])
+      );
+      const interaction = createInteraction({ subcommand: 'disable' });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(replyEmbed(interaction).description).toBe(
+        `${t('record.autojoin.disabled', 'en', { command: enableCommand })}\n\n${t(
+          'record.autojoin.disabledDropped',
+          'en'
+        )}`
+      );
+    });
+
+    it('persists "enabled" again, states the buffer window and says it waits for people', async () => {
       voiceSettingsRepository.setAutoJoinEnabled(GUILD, false);
       const interaction = createInteraction({ subcommand: 'enable' });
 
@@ -234,9 +266,95 @@ describe('/voice autojoin', () => {
       expect(voiceSettingsRepository.isAutoJoinEnabled(GUILD)).toBe(true);
       const embed = replyEmbed(interaction);
       expect(embed.description).toBe(
-        t('record.autojoin.enabled', 'en', { minutes: minutes() })
+        `${t('record.autojoin.enabled', 'en', { minutes: minutes() })}\n\n${t(
+          'record.autojoin.waitingForMembers',
+          'en'
+        )}`
       );
       expect(embed.color).toBe(COLORS.SUCCESS);
+    });
+
+    it('joins an occupied channel as soon as auto-join is turned on', async () => {
+      voiceSettingsRepository.setAutoJoinEnabled(GUILD, false);
+      reconcileGuild.mockImplementation(async () => {
+        // The setting is saved before the bot looks for a channel.
+        expect(voiceSettingsRepository.isAutoJoinEnabled(GUILD)).toBe(true);
+        return { status: 'joined', channelId: 'voice-3' };
+      });
+      const interaction = createInteraction({ subcommand: 'enable' });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(reconcileGuild).toHaveBeenCalledWith(interaction.guild);
+      expect(replyEmbed(interaction).description).toContain(
+        t('record.autojoin.joinedNow', 'en', { channel: 'voice-3' })
+      );
+    });
+
+    it('says nothing is kept yet when the bot holds the slot only for reading aloud', async () => {
+      reconcileGuild.mockResolvedValue({ status: 'already', channelId: 'v' });
+      getConnection.mockImplementation((id: string) =>
+        id === 'v'
+          ? { channelId: 'v', guildId: GUILD, receiving: false }
+          : undefined
+      );
+      const interaction = createInteraction({ subcommand: 'enable' });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(replyEmbed(interaction).description).toBe(
+        `${t('record.autojoin.enabled', 'en', { minutes: minutes() })}\n\n${t(
+          'record.autojoin.alreadyReadOnly',
+          'en',
+          { channel: 'v' }
+        )}`
+      );
+    });
+
+    it('records who turned it on or off in the audit trail, in the server language', async () => {
+      const enable = createInteraction({ subcommand: 'enable' });
+      await executeAutoJoinCommand(enable);
+      const disable = createInteraction({ subcommand: 'disable' });
+      await executeAutoJoinCommand(disable);
+
+      // No language configured and not a Community server: Japanese.
+      expect(logAuditAction.mock.calls).toEqual([
+        [
+          enable.client,
+          GUILD,
+          'admin-1',
+          'SETTINGS_CHANGE',
+          undefined,
+          t('record.audit.autoJoinEnabled', 'ja', {
+            via: t('record.audit.viaCommand', 'ja', {
+              command: '/voice autojoin enable',
+            }),
+          }),
+        ],
+        [
+          disable.client,
+          GUILD,
+          'admin-1',
+          'SETTINGS_CHANGE',
+          undefined,
+          t('record.audit.autoJoinDisabled', 'ja', {
+            via: t('record.audit.viaCommand', 'ja', {
+              command: '/voice autojoin disable',
+            }),
+          }),
+        ],
+      ]);
+    });
+
+    it('says nothing more when the bot is already in a channel of the server', async () => {
+      reconcileGuild.mockResolvedValue({ status: 'already', channelId: 'v' });
+      const interaction = createInteraction({ subcommand: 'enable' });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(replyEmbed(interaction).description).toBe(
+        t('record.autojoin.enabled', 'en', { minutes: minutes() })
+      );
     });
 
     it('drops every live connection in this guild when disabled, and only this guild', async () => {
@@ -311,7 +429,9 @@ describe('/voice autojoin', () => {
 
       const embed = replyEmbed(interaction);
       expect(embed.title).toBe(t('record.autojoin.title', 'ja'));
-      expect(embed.description).toBe(t('record.autojoin.disabled', 'ja'));
+      expect(embed.description).toBe(
+        t('record.autojoin.disabled', 'ja', { command: enableCommand })
+      );
     });
   });
 
@@ -335,7 +455,7 @@ describe('/voice autojoin', () => {
       expect(embed.description).toBe(
         t('record.autojoin.excluded', 'en', { channel: 'voice-9' })
       );
-      expect(embed.color).toBe(COLORS.WARNING);
+      expect(embed.color).toBe(COLORS.SUCCESS);
     });
 
     it('leaves the channel immediately when the bot is already buffering it', async () => {
@@ -354,6 +474,27 @@ describe('/voice autojoin', () => {
       expect(disconnect).toHaveBeenCalledWith(
         'voice-9',
         connectionOf('voice-9')
+      );
+    });
+
+    it('says the bot left and moves on to another occupied channel', async () => {
+      getConnection.mockImplementation((id: string) =>
+        id === 'voice-9' ? connectionInfo('voice-9', GUILD) : undefined
+      );
+      const interaction = createInteraction({
+        subcommand: 'exclude',
+        channel: voiceChannel('voice-9'),
+      });
+
+      await executeAutoJoinCommand(interaction);
+
+      expect(reconcileGuild).toHaveBeenCalledWith(interaction.guild);
+      expect(replyEmbed(interaction).description).toBe(
+        `${t('record.autojoin.excluded', 'en', { channel: 'voice-9' })}\n\n${t(
+          'record.autojoin.excludedLeft',
+          'en',
+          { channel: 'voice-9' }
+        )}`
       );
     });
 
@@ -381,6 +522,7 @@ describe('/voice autojoin', () => {
 
       expect(getConnection).toHaveBeenCalledWith('voice-9');
       expect(disconnect).not.toHaveBeenCalled();
+      expect(reconcileGuild).not.toHaveBeenCalled();
     });
 
     it('accepts stage channels', async () => {
@@ -394,7 +536,7 @@ describe('/voice autojoin', () => {
       expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([
         'stage-1',
       ]);
-      expect(replyEmbed(interaction).color).toBe(COLORS.WARNING);
+      expect(replyEmbed(interaction).color).toBe(COLORS.SUCCESS);
     });
 
     it('is idempotent when the same channel is excluded twice', async () => {
@@ -409,7 +551,21 @@ describe('/voice autojoin', () => {
       expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([
         'voice-9',
       ]);
-      expect(replyEmbed(second).color).toBe(COLORS.WARNING);
+      const embed = replyEmbed(second);
+      expect(embed.description).toBe(
+        t('record.autojoin.alreadyExcluded', 'en', { channel: 'voice-9' })
+      );
+      expect(embed.color).toBe(COLORS.INFO);
+      // Only the change that changed something is on the audit trail.
+      expect(logAuditAction).toHaveBeenCalledTimes(1);
+      expect(logAuditAction.mock.calls[0][5]).toBe(
+        t('record.audit.channelExcluded', 'ja', {
+          channel: 'voice-9',
+          via: t('record.audit.viaCommand', 'ja', {
+            command: '/voice autojoin exclude',
+          }),
+        })
+      );
     });
 
     it('rejects a non-voice channel and stores nothing', async () => {
@@ -422,10 +578,11 @@ describe('/voice autojoin', () => {
 
       const embed = replyEmbed(interaction);
       expect(embed.title).toBe(t('common.error', 'en'));
-      expect(embed.description).toBe(t('record.errors.notInVoiceDesc', 'en'));
+      expect(embed.description).toBe(t('record.errors.notVoiceChannel', 'en'));
       expect(embed.color).toBe(COLORS.ERROR);
       expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([]);
       expect(disconnect).not.toHaveBeenCalled();
+      expect(releaseCooldown).toHaveBeenCalledWith(interaction);
     });
 
     it('fails loudly instead of excluding nothing when the channel option is missing', async () => {
@@ -498,11 +655,11 @@ describe('/voice autojoin', () => {
         connectionOf('voice-a')
       );
       expect(replyEmbed(interaction).description).toBe(
-        `${t('record.autojoin.disabled', 'en')}\n\n${t(
-          'record.autojoin.readingStopped',
-          'en',
-          { channel: 'voice-a' }
-        )}`
+        [
+          t('record.autojoin.disabled', 'en', { command: enableCommand }),
+          t('record.autojoin.disabledDropped', 'en'),
+          t('record.autojoin.readingStopped', 'en', { channel: 'voice-a' }),
+        ].join('\n\n')
       );
       // The people being read are told why the bot left.
       expect(chat.send).toHaveBeenCalledTimes(1);
@@ -528,11 +685,11 @@ describe('/voice autojoin', () => {
         connectionOf('voice-a')
       );
       expect(replyEmbed(interaction).description).toBe(
-        `${t('record.autojoin.excluded', 'en', { channel: 'voice-a' })}\n\n${t(
-          'record.autojoin.readingStopped',
-          'en',
-          { channel: 'voice-a' }
-        )}`
+        [
+          t('record.autojoin.excluded', 'en', { channel: 'voice-a' }),
+          t('record.autojoin.excludedLeft', 'en', { channel: 'voice-a' }),
+          t('record.autojoin.readingStopped', 'en', { channel: 'voice-a' }),
+        ].join('\n\n')
       );
       expect(chat.send).toHaveBeenCalledTimes(1);
     });
@@ -554,7 +711,10 @@ describe('/voice autojoin', () => {
       );
       expect(chat.send).not.toHaveBeenCalled();
       expect(replyEmbed(interaction).description).toBe(
-        t('record.autojoin.excluded', 'en', { channel: 'voice-a' })
+        [
+          t('record.autojoin.excluded', 'en', { channel: 'voice-a' }),
+          t('record.autojoin.excludedLeft', 'en', { channel: 'voice-a' }),
+        ].join('\n\n')
       );
     });
 
@@ -641,9 +801,12 @@ describe('/voice autojoin', () => {
       async (locale, discordLocale, subcommand) => {
         const base =
           subcommand === 'disable'
-            ? t('record.autojoin.disabled', locale)
+            ? t('record.autojoin.disabled', locale, { command: enableCommand })
             : t('record.autojoin.excluded', locale, { channel: 'voice-9' });
         const run = async () => {
+          // Each run starts from scratch, so the second one is not answered
+          // as "already excluded".
+          voiceSettingsRepository.removeExclusion(GUILD, 'voice-9');
           const interaction = createInteraction({
             subcommand,
             locale: discordLocale,
@@ -680,12 +843,15 @@ describe('/voice autojoin', () => {
       const embed = replyEmbed(interaction);
       expect(embed.title).toBe(t('record.autojoin.title', 'en'));
       expect(embed.description).toBe(
-        t('record.autojoin.included', 'en', { channel: 'voice-9' })
+        `${t('record.autojoin.included', 'en', { channel: 'voice-9' })}\n\n${t(
+          'record.autojoin.waitingForMembers',
+          'en'
+        )}`
       );
       expect(embed.color).toBe(COLORS.SUCCESS);
     });
 
-    it('reports an error when the channel was never excluded', async () => {
+    it('says plainly, not as an error, when the channel was never excluded', async () => {
       const interaction = createInteraction({
         subcommand: 'include',
         channel: voiceChannel('voice-9'),
@@ -694,11 +860,34 @@ describe('/voice autojoin', () => {
       await executeAutoJoinCommand(interaction);
 
       const embed = replyEmbed(interaction);
-      expect(embed.title).toBe(t('common.error', 'en'));
+      expect(embed.title).toBe(t('record.autojoin.title', 'en'));
       expect(embed.description).toBe(
         t('record.autojoin.notExcluded', 'en', { channel: 'voice-9' })
       );
-      expect(embed.color).toBe(COLORS.ERROR);
+      expect(embed.color).toBe(COLORS.INFO);
+      expect(reconcileGuild).not.toHaveBeenCalled();
+    });
+
+    it('warns that auto-join is still off for the whole server', async () => {
+      voiceSettingsRepository.setAutoJoinEnabled(GUILD, false);
+      voiceSettingsRepository.addExclusion(GUILD, 'voice-9');
+      const interaction = createInteraction({
+        subcommand: 'include',
+        channel: voiceChannel('voice-9'),
+      });
+
+      await executeAutoJoinCommand(interaction);
+
+      const embed = replyEmbed(interaction);
+      expect(embed.description).toBe(
+        `${t('record.autojoin.included', 'en', { channel: 'voice-9' })}\n\n${t(
+          'record.autojoin.includedWhileOff',
+          'en',
+          { command: enableCommand }
+        )}`
+      );
+      expect(embed.color).toBe(COLORS.WARNING);
+      expect(reconcileGuild).not.toHaveBeenCalled();
     });
 
     it("does not lift another guild's exclusion of the same channel id", async () => {
@@ -710,23 +899,32 @@ describe('/voice autojoin', () => {
       });
       await executeAutoJoinCommand(interaction);
 
-      expect(replyEmbed(interaction).color).toBe(COLORS.ERROR);
+      expect(replyEmbed(interaction).description).toBe(
+        t('record.autojoin.notExcluded', 'en', { channel: 'voice-9' })
+      );
       expect(
         voiceSettingsRepository.isChannelExcluded('guild-2', 'voice-9')
       ).toBe(true);
     });
 
-    it('never joins or leaves a channel by itself', async () => {
+    it('joins the re-included channel right away when people are in it', async () => {
       voiceSettingsRepository.addExclusion(GUILD, 'voice-9');
+      reconcileGuild.mockResolvedValue({
+        status: 'joined',
+        channelId: 'voice-9',
+      });
+      const interaction = createInteraction({
+        subcommand: 'include',
+        channel: voiceChannel('voice-9'),
+      });
 
-      await executeAutoJoinCommand(
-        createInteraction({
-          subcommand: 'include',
-          channel: voiceChannel('voice-9'),
-        })
-      );
+      await executeAutoJoinCommand(interaction);
 
+      expect(reconcileGuild).toHaveBeenCalledWith(interaction.guild);
       expect(disconnect).not.toHaveBeenCalled();
+      expect(replyEmbed(interaction).description).toContain(
+        t('record.autojoin.joinedNow', 'en', { channel: 'voice-9' })
+      );
     });
 
     it('rejects a non-voice channel without touching the exclusion list', async () => {
@@ -739,7 +937,7 @@ describe('/voice autojoin', () => {
       await executeAutoJoinCommand(interaction);
 
       expect(replyEmbed(interaction).description).toBe(
-        t('record.errors.notInVoiceDesc', 'en')
+        t('record.errors.notVoiceChannel', 'en')
       );
       expect(voiceSettingsRepository.listExclusions(GUILD)).toEqual([
         'voice-9',

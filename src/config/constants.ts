@@ -30,8 +30,18 @@ export const AUDIO = {
  * Discord platform limits
  */
 export const DISCORD_LIMITS = {
-  /** Maximum file upload size in MB (non-Nitro) */
-  MAX_FILE_SIZE_MB: 25,
+  /**
+   * Upload limit assumed when an interaction does not say
+   * (`interaction.attachmentSizeLimit` is missing or 0). Real interactions
+   * always carry the limit for that server and user, which is authoritative;
+   * this conservative value only keeps recordings deliverable without it.
+   */
+  FALLBACK_ATTACHMENT_BYTES: 10 * 1024 * 1024,
+  /**
+   * Room kept free under the upload limit for each recording part, so the
+   * file plus the request around it never brushes against the limit.
+   */
+  UPLOAD_HEADROOM_BYTES: 64 * 1024,
 } as const;
 
 /**

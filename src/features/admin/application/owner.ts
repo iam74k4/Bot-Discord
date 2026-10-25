@@ -1,25 +1,47 @@
 import {
+  ButtonStyle,
   ChatInputCommandInteraction,
   EmbedBuilder,
   MessageFlags,
+  escapeMarkdown,
+  type Guild,
 } from 'discord.js';
-import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
+import {
+  createEmbed,
+  createErrorEmbed,
+  createWarningEmbed,
+} from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { isBotOwner } from '../../../config/env.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
-import { withTimeout } from '../../../shared/utils/timeout.js';
+import { TimeoutError, withTimeout } from '../../../shared/utils/timeout.js';
 import { t, type Locale } from '../../../locales/index.js';
-import { resolveLocale } from '../../../locales/guildLocale.js';
-import { backupService } from '../../../infrastructure/backup/index.js';
+import { commandMention } from '../../../shared/utils/commandMentions.js';
+import {
+  resolveBackgroundLocale,
+  resolveLocale,
+} from '../../../locales/guildLocale.js';
 import { guildSettingsRepository } from '../../../infrastructure/guildSettings/index.js';
-import { getSendableTextChannel } from '../../../shared/utils/discord.js';
+import { awaitConfirmationResult } from '../../../shared/utils/confirm.js';
 import { showAdminSystemPanel } from './systemPanel.js';
-import { awaitConfirmation } from '../../../shared/utils/confirm.js';
+import { checkPostableChannel } from './channelCheck.js';
+import { runBackupSafely } from './backupRun.js';
 
 /** Limit broadcast fan-out per invocation (rate limits / UX). */
 const BROADCAST_MAX_GUILDS = 250;
-/** Update ephemeral progress text every N guilds. */
-const BROADCAST_PROGRESS_EVERY = 12;
+/**
+ * Announcements in flight at once. Delivery to one server at a time made a
+ * large broadcast take minutes; more lanes than this would mostly queue
+ * behind Discord's global rate limit and delay everyone else's
+ * notifications.
+ */
+export const BROADCAST_CONCURRENCY = 3;
+/** Progress edits are throttled to one per this many ms. */
+export const BROADCAST_PROGRESS_INTERVAL_MS = 2_000;
+/** A server whose channel does not answer within this counts as failed. */
+const BROADCAST_TIMEOUT = 5_000;
+/** Failed servers named in the result; the rest are counted. */
+const BROADCAST_FAILURES_LISTED = 10;
 
 function checkOwner(interaction: ChatInputCommandInteraction): boolean {
   return isBotOwner(interaction.user.id);
@@ -64,25 +86,102 @@ export function planBroadcast<G extends { id: string }>(
   };
 }
 
-async function handleStats(
-  interaction: ChatInputCommandInteraction,
-  locale: Locale
+/**
+ * Run `worker` over `items` with at most `limit` running at once, each lane
+ * taking the next item as soon as it is free. `worker` must not throw.
+ */
+export async function runWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>
 ): Promise<void> {
-  await showAdminSystemPanel(interaction, locale, 'stats');
+  let next = 0;
+  const lane = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++;
+      await worker(items[index]!, index);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, lane)
+  );
 }
 
-async function handleDb(
-  interaction: ChatInputCommandInteraction,
-  locale: Locale
-): Promise<void> {
-  await showAdminSystemPanel(interaction, locale, 'db');
+type FailureReason = 'notSendable' | 'timeout' | 'sendFailed';
+
+/** A configured channel that is deleted or no longer postable. */
+class NotSendableError extends Error {
+  constructor(channelId: string) {
+    super(`Announcement channel ${channelId} is not sendable`);
+    this.name = 'NotSendableError';
+  }
 }
 
-async function handleGuilds(
-  interaction: ChatInputCommandInteraction,
+/**
+ * Post the announcement to one server, in that server's language. Returns
+ * why it did not arrive, or null when it did.
+ */
+async function deliverAnnouncement(
+  guild: Guild,
+  channelId: string,
+  message: string
+): Promise<FailureReason | null> {
+  try {
+    const check = await checkPostableChannel(guild, channelId);
+    if (!check.ok) {
+      // Configured but no longer usable: deleted, or the bot lost access.
+      throw new NotSendableError(channelId);
+    }
+
+    const locale = resolveBackgroundLocale(guild);
+    const embed = new EmbedBuilder()
+      .setTitle(t('owner.broadcast.embedTitle', locale))
+      .setDescription(message)
+      .setColor(COLORS.INFO)
+      .setFooter({ text: t('owner.broadcast.embedFooter', locale) })
+      .setTimestamp();
+
+    await withTimeout(
+      check.channel.send({ embeds: [embed] }),
+      BROADCAST_TIMEOUT
+    );
+    return null;
+  } catch (error) {
+    logger.debug(
+      `Failed to send broadcast to guild ${guild.id}:`,
+      getErrorMessage(error)
+    );
+    if (error instanceof NotSendableError) return 'notSendable';
+    return error instanceof TimeoutError ? 'timeout' : 'sendFailed';
+  }
+}
+
+function formatFailures(
+  failures: ReadonlyArray<{
+    index: number;
+    guild: Guild;
+    reason: FailureReason;
+  }>,
   locale: Locale
-): Promise<void> {
-  await showAdminSystemPanel(interaction, locale, 'guilds');
+): string {
+  if (failures.length === 0) return '';
+
+  const listed = [...failures]
+    .sort((a, b) => a.index - b.index)
+    .slice(0, BROADCAST_FAILURES_LISTED)
+    .map(
+      ({ guild, reason }) =>
+        `• ${escapeMarkdown(guild.name)} — ${t(
+          `owner.broadcast.failureReasons.${reason}`,
+          locale
+        )}`
+    );
+  const hidden = failures.length - listed.length;
+  if (hidden > 0) {
+    listed.push(t('owner.broadcast.moreFailures', locale, { count: hidden }));
+  }
+
+  return t('owner.broadcast.failures', locale, { list: listed.join('\n') });
 }
 
 async function handleBroadcast(
@@ -91,19 +190,7 @@ async function handleBroadcast(
   const locale = resolveLocale(interaction);
   const message = interaction.options.getString('message', true);
 
-  const client = interaction.client;
-  let sent = 0;
-  let failed = 0;
-
-  const embed = new EmbedBuilder()
-    .setTitle('Announcement from Bot Owner')
-    .setDescription(message)
-    .setColor(COLORS.INFO)
-    .setTimestamp();
-
-  const BROADCAST_TIMEOUT = 5_000;
-
-  const allGuilds = [...client.guilds.cache.values()];
+  const allGuilds = [...interaction.client.guilds.cache.values()];
   const totalGuilds = allGuilds.length;
   const {
     targets: guilds,
@@ -120,95 +207,103 @@ async function handleBroadcast(
   if (guilds.length === 0) {
     await interaction.reply({
       embeds: [
-        createEmbed({
-          title: t('common.error', locale),
-          description: t('owner.broadcast.noChannel', locale),
-          color: COLORS.WARNING,
-        }),
+        createWarningEmbed(
+          t('common.warning', locale),
+          t('owner.broadcast.noChannel', locale, {
+            command: commandMention('admin settings announcements'),
+          })
+        ),
       ],
       flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
-  const confirmed = await awaitConfirmation(
+  const confirmation = await awaitConfirmationResult(
     interaction,
     t('owner.broadcast.confirm', locale, {
       count: guilds.length,
       total: totalGuilds,
       message,
     }),
-    { ephemeral: true, timeout: 45_000 }
+    {
+      ephemeral: true,
+      timeout: 45_000,
+      title: t('owner.broadcast.confirmTitle', locale),
+      confirmLabel: t('owner.broadcast.confirmLabel', locale),
+    }
   );
+  // Cancelled, timed out or closed by a restart: the prompt already says so.
+  if (confirmation.outcome !== 'confirmed') return;
 
-  if (!confirmed) {
-    await interaction.editReply({
-      embeds: [
-        createEmbed({
-          title: t('common.cancelled', locale),
-          color: COLORS.INFO,
-        }),
-      ],
-      components: [],
-    });
-    return;
-  }
-
-  await interaction.editReply({
-    content: t('owner.broadcast.progress', locale, {
-      processed: 0,
+  const capNote = capped
+    ? t('owner.broadcast.progressCap', locale, {
+        limit: BROADCAST_MAX_GUILDS,
+        total: addressable,
+      })
+    : '';
+  let sent = 0;
+  let failed = 0;
+  let processed = 0;
+  const failures: Array<{
+    index: number;
+    guild: Guild;
+    reason: FailureReason;
+  }> = [];
+  const progress = () =>
+    t('owner.broadcast.progress', locale, {
+      processed,
       total: guilds.length,
-      sent: 0,
-      failed: 0,
-      capNote: capped ? ` [${BROADCAST_MAX_GUILDS}/${addressable}]` : '',
-    }),
+      sent,
+      failed,
+      capNote,
+    });
+
+  // The press is answered by replacing the prompt with the progress line. If
+  // that fails, nothing has been sent and the error reaches the router.
+  await confirmation.response.update({
+    content: progress(),
     embeds: [],
     components: [],
   });
 
-  let processed = 0;
-  for (const { guild, channelId } of guilds) {
-    try {
-      const channel = await getSendableTextChannel(guild, channelId);
-      if (!channel) {
-        // Configured but no longer usable: deleted, or the bot lost access.
-        throw new Error(`Announcement channel ${channelId} is not sendable`);
-      }
-      await withTimeout(channel.send({ embeds: [embed] }), BROADCAST_TIMEOUT);
-      sent++;
-    } catch (error) {
-      failed++;
-      logger.debug(
-        `Failed to send broadcast to guild ${guild.id}:`,
-        getErrorMessage(error)
-      );
-    }
-    processed++;
-    if (
-      processed % BROADCAST_PROGRESS_EVERY === 0 ||
-      processed === guilds.length
-    ) {
-      const capNote = capped
-        ? ` (cap ${BROADCAST_MAX_GUILDS}/${addressable} guilds)`
-        : '';
-      await interaction
-        .editReply({
-          content: t('owner.broadcast.progress', locale, {
-            processed,
-            total: guilds.length,
-            sent,
-            failed,
-            capNote,
-          }),
-          embeds: [],
-        })
-        .catch((e: unknown) => {
+  // Progress edits are throttled, never awaited by a lane (a slow edit must
+  // not slow delivery), and chained so they land in order; the summary
+  // waits for the last one so a late progress edit cannot overwrite it.
+  let lastProgressAt = Date.now();
+  let progressEdits: Promise<void> = Promise.resolve();
+  const reportProgress = () => {
+    const now = Date.now();
+    if (now - lastProgressAt < BROADCAST_PROGRESS_INTERVAL_MS) return;
+    lastProgressAt = now;
+    progressEdits = progressEdits.then(() =>
+      interaction.editReply({ content: progress(), embeds: [] }).then(
+        () => undefined,
+        (error: unknown) => {
           logger.debug(
-            `Failed to edit broadcast progress: ${getErrorMessage(e)}`
+            `Failed to edit broadcast progress: ${getErrorMessage(error)}`
           );
-        });
+        }
+      )
+    );
+  };
+
+  await runWithConcurrency(
+    guilds,
+    BROADCAST_CONCURRENCY,
+    async ({ guild, channelId }, index) => {
+      const reason = await deliverAnnouncement(guild, channelId, message);
+      if (reason) {
+        failed++;
+        failures.push({ index, guild, reason });
+      } else {
+        sent++;
+      }
+      processed++;
+      reportProgress();
     }
-  }
+  );
+  await progressEdits;
 
   const capLine = capped
     ? t('owner.broadcast.capNote', locale, {
@@ -217,96 +312,66 @@ async function handleBroadcast(
       })
     : '';
 
-  const resultEmbed = createEmbed({
-    title: locale === 'ja' ? '一斉通知完了' : 'Broadcast Complete',
-    description: t('owner.broadcast.complete', locale, {
-      sent,
-      failed,
-      skipped,
-      capNote: capLine,
-    }),
-    color: COLORS.SUCCESS,
-    timestamp: true,
-  });
-
   await interaction.editReply({
     content: '',
-    embeds: [resultEmbed],
+    embeds: [
+      createEmbed({
+        title: t('owner.broadcast.completeTitle', locale),
+        description:
+          t('owner.broadcast.complete', locale, {
+            sent,
+            failed,
+            skipped,
+            capNote: capLine,
+          }) + formatFailures(failures, locale),
+        color: COLORS.SUCCESS,
+        timestamp: true,
+      }),
+    ],
   });
-}
-
-async function handleHealth(
-  interaction: ChatInputCommandInteraction,
-  locale: Locale
-): Promise<void> {
-  await showAdminSystemPanel(interaction, locale, 'health');
-}
-
-async function handleBackupList(
-  interaction: ChatInputCommandInteraction,
-  locale: Locale
-): Promise<void> {
-  await showAdminSystemPanel(interaction, locale, 'backups');
 }
 
 async function handleBackupRun(
   interaction: ChatInputCommandInteraction
 ): Promise<void> {
   const locale = resolveLocale(interaction);
-  const confirmed = await awaitConfirmation(
+  const confirmation = await awaitConfirmationResult(
     interaction,
     t('owner.backup.confirm', locale),
-    { ephemeral: true }
+    {
+      ephemeral: true,
+      title: t('owner.backup.confirmTitle', locale),
+      confirmLabel: t('owner.backup.confirmLabel', locale),
+      confirmStyle: ButtonStyle.Success,
+    }
   );
+  if (confirmation.outcome !== 'confirmed') return;
 
-  if (!confirmed) {
-    await interaction.editReply({
-      embeds: [
-        createEmbed({
-          title: t('common.cancelled', locale),
-          color: COLORS.INFO,
-        }),
-      ],
-      components: [],
-    });
-    return;
-  }
-
-  await interaction.editReply({
+  await confirmation.response.update({
+    content: t('owner.backup.running', locale),
     embeds: [],
     components: [],
-    content: locale === 'ja' ? 'バックアップを実行中...' : 'Running backup...',
   });
 
-  const result = await backupService.runBackup();
+  const result = await runBackupSafely();
 
-  if (result.success) {
-    const embed = createEmbed({
-      title: locale === 'ja' ? 'バックアップ完了' : 'Backup Complete',
-      description: t('owner.backup.complete', locale, {
-        filename: result.filename,
-        size: Math.round(result.size / 1024),
-      }),
-      color: COLORS.SUCCESS,
-      timestamp: true,
-    });
-    await interaction.editReply({ content: '', embeds: [embed] });
-  } else {
-    const embed = createErrorEmbed(
-      locale === 'ja' ? 'バックアップ失敗' : 'Backup Failed',
-      t('owner.backup.failed', locale, {
-        error: result.error || 'Unknown error occurred',
+  const embed = result.success
+    ? createEmbed({
+        title: t('owner.backup.completeTitle', locale),
+        description: t('owner.backup.complete', locale, {
+          filename: result.filename,
+          size: Math.round(result.size / 1024),
+        }),
+        color: COLORS.SUCCESS,
+        timestamp: true,
       })
-    );
-    await interaction.editReply({ content: '', embeds: [embed] });
-  }
-}
-
-async function handleMetrics(
-  interaction: ChatInputCommandInteraction,
-  locale: Locale
-): Promise<void> {
-  await showAdminSystemPanel(interaction, locale, 'metrics');
+    : createErrorEmbed(
+        t('owner.backup.failedTitle', locale),
+        t('owner.backup.failed', locale, {
+          error: result.error || t('owner.backup.noReason', locale),
+        })
+      );
+  await interaction.editReply({ content: '', embeds: [embed] });
 }
 
 export async function executeOwnerCommand(
@@ -315,12 +380,13 @@ export async function executeOwnerCommand(
   const locale = resolveLocale(interaction);
 
   if (!checkOwner(interaction)) {
-    const errorEmbed = createErrorEmbed(
-      t('common.error', locale),
-      t('owner.errors.ownerOnly', locale)
-    );
     await interaction.reply({
-      embeds: [errorEmbed],
+      embeds: [
+        createWarningEmbed(
+          t('common.permissionDeniedTitle', locale),
+          t('owner.errors.ownerOnly', locale)
+        ),
+      ],
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -332,7 +398,7 @@ export async function executeOwnerCommand(
   if (group === 'backup') {
     switch (subcommand) {
       case 'list':
-        await handleBackupList(interaction, locale);
+        await showAdminSystemPanel(interaction, locale, 'backups');
         break;
       case 'run':
         await handleBackupRun(interaction);
@@ -343,22 +409,14 @@ export async function executeOwnerCommand(
 
   switch (subcommand) {
     case 'stats':
-      await handleStats(interaction, locale);
-      break;
     case 'db':
-      await handleDb(interaction, locale);
-      break;
     case 'guilds':
-      await handleGuilds(interaction, locale);
+    case 'health':
+    case 'metrics':
+      await showAdminSystemPanel(interaction, locale, subcommand);
       break;
     case 'broadcast':
       await handleBroadcast(interaction);
-      break;
-    case 'health':
-      await handleHealth(interaction, locale);
-      break;
-    case 'metrics':
-      await handleMetrics(interaction, locale);
       break;
   }
 }

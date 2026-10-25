@@ -45,6 +45,11 @@ export interface AppConfig {
   readonly MEMORY_LIMIT_MB: number;
   readonly SHUTDOWN_TIMEOUT_MS: number;
   readonly TZ: string;
+  /**
+   * IANA zone whose midnight starts a day in VC stats ("today", "last 7
+   * days"). `STATS_TIMEZONE`, else `TZ`, else Asia/Tokyo.
+   */
+  readonly STATS_TIMEZONE: string;
   readonly ALERT_WEBHOOK_URL: string;
   readonly LOG_LEVEL: string;
 
@@ -219,6 +224,53 @@ function parseNodeEnv(source: EnvSource, warnings: string[]): NodeEnv {
   return 'development';
 }
 
+const DEFAULT_STATS_TIMEZONE = 'Asia/Tokyo';
+
+/** Canonical IANA name (`asia/tokyo` -> `Asia/Tokyo`), or null if unknown. */
+function canonicalTimeZone(value: string): string | null {
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', { timeZone: value });
+    return formatter.resolvedOptions().timeZone;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Zone for VC stats day boundaries. An explicit `STATS_TIMEZONE` must be
+ * valid: a typo would otherwise shift everyone's "today" silently. `TZ` is
+ * only a fallback and may hold a POSIX value Intl cannot read, so a bad `TZ`
+ * warns and uses the default instead of stopping the bot.
+ */
+function parseStatsTimeZone(
+  source: EnvSource,
+  warnings: string[],
+  errors: string[]
+): string {
+  const explicit = source.STATS_TIMEZONE?.trim();
+  if (explicit) {
+    const zone = canonicalTimeZone(explicit);
+    if (!zone) {
+      errors.push(
+        `STATS_TIMEZONE "${explicit}" is not a valid IANA time zone (e.g. Asia/Tokyo)`
+      );
+      return DEFAULT_STATS_TIMEZONE;
+    }
+    return zone;
+  }
+
+  const tz = source.TZ?.trim();
+  if (!tz) return DEFAULT_STATS_TIMEZONE;
+
+  const zone = canonicalTimeZone(tz);
+  if (zone) return zone;
+
+  warnings.push(
+    `TZ "${tz}" is not an IANA time zone, so VC stats use ${DEFAULT_STATS_TIMEZONE}. Set STATS_TIMEZONE to choose another zone.`
+  );
+  return DEFAULT_STATS_TIMEZONE;
+}
+
 /**
  * Build the application config, or throw with every problem found.
  */
@@ -230,6 +282,7 @@ export function parseConfig(source: EnvSource): ConfigResult {
   const alertWebhookUrl = parseAlertWebhook(source);
   const voicevoxUrl = parseVoicevoxUrl(source);
   const nodeEnv = parseNodeEnv(source, warnings);
+  const statsTimeZone = parseStatsTimeZone(source, warnings, errors);
 
   const num = (key: keyof AppConfig & string, fallback: number) =>
     parseNumber(source[key], fallback, key);
@@ -363,6 +416,7 @@ export function parseConfig(source: EnvSource): ConfigResult {
       MEMORY_LIMIT_MB: memoryLimitMb,
       SHUTDOWN_TIMEOUT_MS: shutdownTimeoutMs,
       TZ: source.TZ || 'UTC',
+      STATS_TIMEZONE: statsTimeZone,
       ALERT_WEBHOOK_URL: alertWebhookUrl,
       LOG_LEVEL: source.LOG_LEVEL || '',
       VOICEVOX_URL: voicevoxUrl,

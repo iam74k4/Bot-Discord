@@ -41,16 +41,20 @@ export function up(): void {
  * this would otherwise double-count. From here on `endSession` maintains the
  * rollup incrementally.
  *
- * Day boundaries here are UTC (SQLite's `date()`); the running bot uses the
- * process timezone, which `TZ` defaults to UTC. A deployment that sets `TZ`
- * elsewhere gets backfilled history bucketed a few hours off - only for
- * sessions that predate this migration.
+ * The guard asks whether any row exists rather than counting them: COUNT(*)
+ * reads every page of the table, which on a large database with a cold page
+ * cache took about 140 ms of every boot; EXISTS stops at the first row.
+ *
+ * Day boundaries here are UTC (SQLite's `date()`); the running bot uses
+ * `STATS_TIMEZONE` (Japan time by default). Backfilled history - only
+ * sessions that predate this migration - is therefore bucketed up to a few
+ * hours off, a one-time skew that was accepted rather than rewriting history.
  */
 function backfillFromSessions(): void {
-  const existing = database
-    .prepare('SELECT COUNT(*) as count FROM voice_daily_stats')
-    .get() as { count: number };
-  if (existing.count > 0) return;
+  const { populated } = database
+    .prepare('SELECT EXISTS (SELECT 1 FROM voice_daily_stats) AS populated')
+    .get() as { populated: number };
+  if (populated) return;
 
   database
     .prepare(

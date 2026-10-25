@@ -3,7 +3,7 @@ import type { ExtendedClient } from '../../client.js';
 import { Event } from '../../shared/types/index.js';
 import { getErrorMessage, logger } from '../../shared/utils/logger.js';
 import { registerCommands } from '../../handlers/commandHandler.js';
-import { isGuildAllowed } from '../../app/guildAllowlist.js';
+import { isGuildAllowed } from '../../shared/utils/guildAllowlist.js';
 
 /**
  * Servers the bot is already in but ALLOWED_GUILD_IDS excludes are reported,

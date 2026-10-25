@@ -3,14 +3,17 @@ import {
   Collection,
   GatewayIntentBits,
   type Guild,
+  GuildMember,
   GuildMemberManager,
   IntentsBitField,
-  type Message,
+  LimitedCollection,
+  Message,
   MessageManager,
   type TextChannel,
 } from 'discord.js';
-import { afterEach, describe, expect, it } from 'vitest';
-import { createClient, ExtendedClient } from '../client.js';
+import { Agent } from 'undici';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createClient, ExtendedClient, REST_KEEP_ALIVE_MS } from '../client.js';
 
 /**
  * Message Content is privileged: requesting it without enabling it in the
@@ -81,25 +84,59 @@ describe('createClient', () => {
   });
 });
 
-describe('message cache', () => {
+describe('caches', () => {
   afterEach(async () => {
     for (const client of created.splice(0)) await client.destroy();
   });
 
-  /** The cache discord.js would build for a manager, with its size cap. */
+  /** The cache the client would build for a manager. */
   function cacheFor(
     client: ExtendedClient,
-    manager: typeof MessageManager | typeof GuildMemberManager
-  ): { constructor: unknown; maxSize?: number } {
-    return client.options.makeCache!(
-      manager as never,
-      Object as never,
-      manager as never
-    ) as unknown as { constructor: unknown; maxSize?: number };
+    manager: unknown,
+    holds: unknown
+  ): Collection<unknown, unknown> {
+    const makeCache = client.options.makeCache as unknown as (
+      managerType: unknown,
+      holds: unknown,
+      manager: unknown
+    ) => Collection<unknown, unknown>;
+    return makeCache(manager, holds, manager);
   }
 
+  it('keeps no chat messages once the message intents are on', () => {
+    const cache = cacheFor(
+      make({ messageContent: true }),
+      MessageManager,
+      Message
+    );
+
+    expect(cache).toBeInstanceOf(LimitedCollection);
+    expect((cache as LimitedCollection<unknown, unknown>).maxSize).toBe(0);
+    cache.set('1', {});
+    expect(cache.size).toBe(0);
+  });
+
+  it('leaves member caches unlimited: text-to-speech resolves names from them', () => {
+    const cache = cacheFor(
+      make({ messageContent: true }),
+      GuildMemberManager,
+      GuildMember
+    );
+
+    expect(cache).not.toBeInstanceOf(LimitedCollection);
+  });
+
+  it('keeps discord.js defaults without the message intents', () => {
+    const cache = cacheFor(make(), MessageManager, Message);
+
+    expect((cache as LimitedCollection<unknown, unknown>).maxSize).toBe(200);
+  });
+
   const messageCacheOf = (client: ExtendedClient) =>
-    cacheFor(client, MessageManager);
+    cacheFor(client, MessageManager, Message) as LimitedCollection<
+      unknown,
+      unknown
+    >;
 
   /** discord.js's internal hooks the gateway uses to fill its caches. */
   interface Internals {
@@ -117,8 +154,16 @@ describe('message cache', () => {
   });
 
   it('leaves the other caches at their defaults', () => {
-    const tuned = cacheFor(make({ messageContent: true }), GuildMemberManager);
-    const stock = cacheFor(make(), GuildMemberManager);
+    const tuned = cacheFor(
+      make({ messageContent: true }),
+      GuildMemberManager,
+      GuildMember
+    ) as LimitedCollection<unknown, unknown>;
+    const stock = cacheFor(
+      make(),
+      GuildMemberManager,
+      GuildMember
+    ) as LimitedCollection<unknown, unknown>;
     expect(tuned.constructor).toBe(stock.constructor);
     expect(tuned.maxSize).toBe(stock.maxSize);
   });
@@ -169,5 +214,39 @@ describe('message cache', () => {
       'hello 2',
     ]);
     expect(channel.messages.cache.size).toBe(0);
+  });
+});
+
+describe('REST connection pool', () => {
+  it('keeps idle API connections open for 30 seconds', async () => {
+    const client = make();
+
+    expect(REST_KEEP_ALIVE_MS).toBe(30_000);
+    expect(client.restAgent).toBeInstanceOf(Agent);
+    // The REST client sends every request through this pool.
+    expect((client.rest as unknown as { agent: unknown }).agent).toBe(
+      client.restAgent
+    );
+    await client.destroy();
+    created.splice(created.indexOf(client), 1);
+  });
+
+  it('closes the pool when the client is destroyed, even if destroy fails', async () => {
+    const client = createClient();
+    expect(client.restAgent.closed).toBe(false);
+
+    await client.destroy();
+    expect(client.restAgent.closed).toBe(true);
+
+    const failing = createClient();
+    vi.spyOn(
+      Object.getPrototypeOf(ExtendedClient.prototype) as {
+        destroy(): Promise<void>;
+      },
+      'destroy'
+    ).mockRejectedValueOnce(new Error('gateway hung'));
+
+    await expect(failing.destroy()).rejects.toThrow('gateway hung');
+    expect(failing.restAgent.closed).toBe(true);
   });
 });

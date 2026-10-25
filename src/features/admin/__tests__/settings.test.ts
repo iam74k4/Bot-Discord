@@ -1,9 +1,11 @@
 import Database from 'better-sqlite3';
 import {
+  Collection,
   MessageFlags,
   PermissionFlagsBits,
   PermissionsBitField,
   type ChatInputCommandInteraction,
+  type Client,
   type Guild,
 } from 'discord.js';
 import {
@@ -52,6 +54,10 @@ const { t } = await import('../../../locales/index.js');
 const { COLORS } = await import('../../../shared/utils/constants/index.js');
 const { guildSettingsRepository } =
   await import('../../../infrastructure/guildSettings/index.js');
+const { formatPermissionNames } =
+  await import('../../../shared/utils/discord.js');
+const { commandMention } =
+  await import('../../../shared/utils/commandMentions.js');
 
 const MOD_LOG = textChannelStub({ id: 'mod-log', name: 'mod-log' });
 const NEWS = textChannelStub({ id: 'news', name: 'news' });
@@ -59,6 +65,15 @@ const READ_ONLY = textChannelStub({
   id: 'read-only',
   name: 'read-only',
   canSend: false,
+});
+/** The bot can post there, but not embeds - and every post is an embed. */
+const NO_EMBEDS = textChannelStub({
+  id: 'no-embeds',
+  name: 'no-embeds',
+  permissions: [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+  ],
 });
 
 function setup(
@@ -69,11 +84,12 @@ function setup(
     channel?: { id: string } | null;
     lang?: string;
     locale?: string;
+    client?: Client;
   } = {}
 ) {
   const guild =
     options.guild === undefined
-      ? guildStub({ channels: [MOD_LOG, NEWS, READ_ONLY] })
+      ? guildStub({ channels: [MOD_LOG, NEWS, READ_ONLY, NO_EMBEDS] })
       : options.guild;
   const reply = vi.fn().mockResolvedValue({});
   const interaction = {
@@ -85,7 +101,7 @@ function setup(
         options.permissions ??
         new PermissionsBitField(PermissionFlagsBits.ManageGuild),
     },
-    client: clientStub(),
+    client: options.client ?? clientStub(),
     locale: options.locale ?? 'en-US',
     options: {
       getSubcommand: vi.fn(() => options.subcommand ?? 'view'),
@@ -114,10 +130,10 @@ describe('executeSettingsCommand', () => {
 
   describe('access', () => {
     const denied = t('common.permissionsRequired', 'en', {
-      permissions: t('help.permission.manageGuild', 'en'),
+      permissions: formatPermissionNames(PermissionFlagsBits.ManageGuild, 'en'),
     });
 
-    it('requires Manage Server', async () => {
+    it('requires Manage Server, named the way Discord names it', async () => {
       const { interaction, reply } = setup({
         subcommand: 'language',
         lang: 'ja',
@@ -128,7 +144,10 @@ describe('executeSettingsCommand', () => {
 
       const { payload, embed } = replied(reply);
       expect(payload.flags).toBe(MessageFlags.Ephemeral);
+      expect(embed.title).toBe(t('common.permissionDeniedTitle', 'en'));
       expect(embed.description).toBe(denied);
+      expect(embed.description).toContain('Manage Server');
+      expect(embed.color).toBe(COLORS.WARNING);
       expect(settingsRow(db)).toBeUndefined();
       expect(auditRows(db)).toEqual([]);
     });
@@ -142,12 +161,27 @@ describe('executeSettingsCommand', () => {
       expect(replied(reply).embed.description).toBe(denied);
     });
 
-    it('denies outside a guild', async () => {
+    it('accepts the permissions Discord sent with the interaction', async () => {
+      const { interaction, reply } = setup({ permissions: '32' });
+      Object.assign(interaction, {
+        memberPermissions: new PermissionsBitField(
+          PermissionFlagsBits.ManageGuild
+        ),
+      });
+
+      await executeSettingsCommand(interaction);
+
+      expect(replied(reply).embed.title).toBe(t('settings.title', 'en'));
+    });
+
+    it('says the command only works in a server outside one', async () => {
       const { interaction, reply } = setup({ guild: null });
 
       await executeSettingsCommand(interaction);
 
-      expect(replied(reply).embed.description).toBe(denied);
+      const { embed } = replied(reply);
+      expect(embed.title).toBe(t('common.serverOnlyTitle', 'en'));
+      expect(embed.description).toBe(t('common.guildOnly', 'en'));
     });
 
     it('answers in the guild language when one is configured', async () => {
@@ -159,7 +193,9 @@ describe('executeSettingsCommand', () => {
 
       await executeSettingsCommand(interaction);
 
-      expect(replied(reply).embed.title).toBe(t('common.error', 'ja'));
+      expect(replied(reply).embed.title).toBe(
+        t('common.permissionDeniedTitle', 'ja')
+      );
     });
   });
 
@@ -167,28 +203,39 @@ describe('executeSettingsCommand', () => {
     it.each([
       ['ja', 'ja', '日本語'],
       ['en', 'en', 'English'],
-    ])('stores %s and audit-logs the change', async (lang, stored, display) => {
-      const { interaction, reply } = setup({ subcommand: 'language', lang });
+    ] as const)(
+      'stores %s, audit-logs it and confirms in that language',
+      async (lang, stored, display) => {
+        const { interaction, reply } = setup({ subcommand: 'language', lang });
 
-      await executeSettingsCommand(interaction);
+        await executeSettingsCommand(interaction);
 
-      expect(settingsRow(db)?.language).toBe(stored);
-      expect(auditRows(db)).toEqual([
-        {
-          action: 'SETTINGS_CHANGE',
-          user_id: USER_ID,
-          target_id: null,
-          details: `Language changed to: ${lang}`,
-        },
-      ]);
-      const { payload, embed } = replied(reply);
-      expect(payload.flags).toBe(MessageFlags.Ephemeral);
-      expect(embed.color).toBe(COLORS.SUCCESS);
-      expect(embed.description).toContain(
-        t('settings.language.changed', 'en', { language: display })
-      );
-      expect(embed.description).toContain('/admin settings view');
-    });
+        expect(settingsRow(db)?.language).toBe(stored);
+        // Details are written in the server's language, now the new one.
+        expect(auditRows(db)).toEqual([
+          {
+            action: 'SETTINGS_CHANGE',
+            user_id: USER_ID,
+            target_id: null,
+            details: t('audit.details.language', stored, {
+              language: display,
+            }),
+          },
+        ]);
+        const { payload, embed } = replied(reply);
+        expect(payload.flags).toBe(MessageFlags.Ephemeral);
+        expect(embed.color).toBe(COLORS.SUCCESS);
+        // Resolved after the change: an English-client admin who picks 日本語
+        // sees the confirmation in Japanese already.
+        expect(embed.title).toBe(t('settings.language.name', stored));
+        expect(embed.description).toContain(
+          t('settings.language.changed', stored, { language: display })
+        );
+        expect(embed.description).toContain(
+          commandMention('admin settings view')
+        );
+      }
+    );
 
     it('stores "auto" as NULL so replies follow each viewer', async () => {
       guildSettingsRepository.setLanguage(GUILD_ID, 'ja');
@@ -201,13 +248,16 @@ describe('executeSettingsCommand', () => {
       await executeSettingsCommand(interaction);
 
       expect(settingsRow(db)?.language).toBeNull();
+      // A non-Community server on automatic posts in Japanese.
       expect(auditRows(db).map((r) => r.details)).toEqual([
-        'Language changed to: auto',
-      ]);
-      // The reply was resolved before the change, in the then-current language.
-      expect(replied(reply).embed.description).toContain(
-        t('settings.language.changed', 'ja', {
+        t('audit.details.language', 'ja', {
           language: t('settings.language.auto', 'ja'),
+        }),
+      ]);
+      // Resolved after the change: back to the admin's own language.
+      expect(replied(reply).embed.description).toContain(
+        t('settings.language.changed', 'en', {
+          language: t('settings.language.auto', 'en'),
         })
       );
     });
@@ -234,9 +284,13 @@ describe('executeSettingsCommand', () => {
       disabledKey: 'settings.audit.disabled' as const,
       channel: MOD_LOG,
       action: 'AUDIT_SETUP',
-      details: 'Audit channel set to: #mod-log',
-      nextWhenSet: '/admin settings logs',
-      nextWhenCleared: '/admin settings audit',
+      // The audit channel is AUDIT_SETUP's target, shown as a channel, and
+      // not repeated in the details.
+      target: MOD_LOG.id as string | null,
+      details: null as string | null,
+      clearedDetails: t('audit.details.auditChannelCleared', 'ja'),
+      nextWhenSet: 'admin settings logs',
+      nextWhenCleared: 'admin settings audit',
     },
     {
       subcommand: 'announcements',
@@ -246,9 +300,15 @@ describe('executeSettingsCommand', () => {
       disabledKey: 'settings.announcements.disabled' as const,
       channel: NEWS,
       action: 'SETTINGS_CHANGE',
-      details: 'Announcement channel set to: #news',
-      nextWhenSet: '/admin settings view',
-      nextWhenCleared: '/admin settings announcements',
+      // A SETTINGS_CHANGE target is read as a member, so the channel is
+      // named in the details instead.
+      target: null,
+      details: t('audit.details.announcementChannelSet', 'ja', {
+        channel: NEWS.id,
+      }) as string | null,
+      clearedDetails: t('audit.details.announcementChannelCleared', 'ja'),
+      nextWhenSet: 'admin settings view',
+      nextWhenCleared: 'admin settings announcements',
     },
   ])('$subcommand channel', (c) => {
     it('stores a sendable channel and audit-logs it', async () => {
@@ -264,7 +324,7 @@ describe('executeSettingsCommand', () => {
         {
           action: c.action,
           user_id: USER_ID,
-          target_id: c.channel.id,
+          target_id: c.target,
           details: c.details,
         },
       ]);
@@ -276,18 +336,15 @@ describe('executeSettingsCommand', () => {
         `${t(c.configuredKey, 'en', { channel: c.channel.id })}\n\n${t(
           'common.nextStep',
           'en'
-        )}: ${c.nextWhenSet}`
+        )}: ${commandMention(c.nextWhenSet)}`
       );
     });
 
-    it.each([
-      ['the bot cannot send there', 'read-only'],
-      ['it no longer exists', 'deleted'],
-    ])('rejects a channel when %s', async (_case, channelId) => {
+    it('names every permission the bot lacks in a channel it cannot post in', async () => {
       guildSettingsRepository.update(GUILD_ID, { [c.column]: 'previous' });
       const { interaction, reply } = setup({
         subcommand: c.subcommand,
-        channel: { id: channelId },
+        channel: { id: READ_ONLY.id },
       });
 
       await executeSettingsCommand(interaction);
@@ -297,7 +354,54 @@ describe('executeSettingsCommand', () => {
       const { payload, embed } = replied(reply);
       expect(payload.flags).toBe(MessageFlags.Ephemeral);
       expect(embed.description).toBe(
-        t('notification.errors.channelNotSendable', 'en')
+        t('settings.errors.channelMissingPermissions', 'en', {
+          channel: READ_ONLY.id,
+          permissions: formatPermissionNames(
+            [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.EmbedLinks,
+            ],
+            'en'
+          ),
+        })
+      );
+    });
+
+    it('rejects a channel where the bot may post but not embed', async () => {
+      // Send Messages alone used to pass, and every post then failed.
+      const { interaction, reply } = setup({
+        subcommand: c.subcommand,
+        channel: { id: NO_EMBEDS.id },
+      });
+
+      await executeSettingsCommand(interaction);
+
+      expect(settingsRow(db)).toBeUndefined();
+      expect(replied(reply).embed.description).toBe(
+        t('settings.errors.channelMissingPermissions', 'en', {
+          channel: NO_EMBEDS.id,
+          permissions: formatPermissionNames(
+            PermissionFlagsBits.EmbedLinks,
+            'en'
+          ),
+        })
+      );
+    });
+
+    it('rejects a channel that no longer exists', async () => {
+      guildSettingsRepository.update(GUILD_ID, { [c.column]: 'previous' });
+      const { interaction, reply } = setup({
+        subcommand: c.subcommand,
+        channel: { id: 'deleted' },
+      });
+
+      await executeSettingsCommand(interaction);
+
+      expect(settingsRow(db)?.[c.column]).toBe('previous');
+      expect(auditRows(db)).toEqual([]);
+      expect(replied(reply).embed.description).toBe(
+        t('settings.errors.channelNotSendable', 'en')
       );
     });
 
@@ -312,7 +416,7 @@ describe('executeSettingsCommand', () => {
 
       expect(settingsRow(db)).toBeUndefined();
       expect(replied(reply).embed.description).toBe(
-        t('notification.errors.channelNotSendable', 'en')
+        t('settings.errors.channelNotSendable', 'en')
       );
     });
 
@@ -330,22 +434,20 @@ describe('executeSettingsCommand', () => {
       expect(payload.flags).toBe(MessageFlags.Ephemeral);
       expect(embed.color).toBe(COLORS.WARNING);
       expect(embed.description).toBe(
-        `${t(c.disabledKey, 'en')}\n\n${t('common.nextStep', 'en')}: ${
-          c.nextWhenCleared
-        }`
+        `${t(c.disabledKey, 'en')}\n\n${t(
+          'common.nextStep',
+          'en'
+        )}: ${commandMention(c.nextWhenCleared)}`
       );
     });
 
     /**
-     * KNOWN BUG (settings.ts handleChannelSetting, the `if (!channel)` branch):
-     * clearing writes NULL and replies, but never calls `logAuditAction`,
-     * while the settings panel's "clear" button does audit the same change.
-     * A Manage Server holder can switch audit logging (or announcements) off
-     * from the slash command without leaving a trace. `it.fails` keeps the
-     * suite green until the fix lands; then this starts failing and should
-     * become a plain `it`.
+     * Regression: clearing used to write NULL and reply without calling
+     * `logAuditAction`, while the settings panel's "clear" button did audit
+     * the same change, so a Manage Server holder could switch audit logging
+     * (or announcements) off from the slash command without leaving a trace.
      */
-    it.fails('audit-logs who cleared the channel', async () => {
+    it('audit-logs who cleared the channel', async () => {
       guildSettingsRepository.update(GUILD_ID, { [c.column]: c.channel.id });
       const { interaction } = setup({
         subcommand: c.subcommand,
@@ -354,11 +456,55 @@ describe('executeSettingsCommand', () => {
 
       await executeSettingsCommand(interaction);
 
-      // Loose on purpose: any audit row by the actor, with the same action
-      // the set path records, is a valid fix.
       expect(auditRows(db)).toEqual([
-        expect.objectContaining({ action: c.action, user_id: USER_ID }),
+        {
+          action: c.action,
+          user_id: USER_ID,
+          target_id: null,
+          details: c.clearedDetails,
+        },
       ]);
+    });
+
+    it('records nothing when clearing a channel that was never set', async () => {
+      const { interaction } = setup({
+        subcommand: c.subcommand,
+        channel: null,
+      });
+
+      await executeSettingsCommand(interaction);
+
+      expect(auditRows(db)).toEqual([]);
+    });
+  });
+
+  describe('clearing the audit channel', () => {
+    it('posts the entry to the channel that stops receiving logs', async () => {
+      const send = vi.fn().mockResolvedValue({});
+      const oldChannel = { id: 'old-audit', isTextBased: () => true, send };
+      const guild = guildStub({ channels: [MOD_LOG] });
+      (guild.channels.cache as Collection<string, unknown>).set(
+        oldChannel.id,
+        oldChannel
+      );
+      guildSettingsRepository.setAuditChannel(GUILD_ID, oldChannel.id);
+      const { interaction } = setup({
+        subcommand: 'audit',
+        channel: null,
+        guild,
+        client: clientStub([guild]),
+      });
+
+      await executeSettingsCommand(interaction);
+
+      expect(settingsRow(db)?.audit_channel_id).toBeNull();
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const [{ embeds }] = send.mock.calls[0] as [
+        { embeds: Array<{ toJSON(): { title?: string } }> },
+      ];
+      expect(embeds[0]!.toJSON().title).toBe(
+        t('audit.actions.AUDIT_SETUP', 'ja')
+      );
     });
   });
 

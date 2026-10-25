@@ -221,6 +221,24 @@ describe('009_voice_daily_stats', () => {
     expect(dailyStats()).toEqual(afterFirstBoot);
   });
 
+  it('checks for an existing row instead of counting the whole rollup', () => {
+    // This check runs on every boot. COUNT(*) reads every page of the table -
+    // about 140 ms on a large database with a cold page cache - where EXISTS
+    // stops at the first row.
+    const prepare = vi.spyOn(db, 'prepare');
+
+    createDailyStats();
+
+    const reads = prepare.mock.calls
+      .map(([sql]) => sql)
+      .filter((sql) => /FROM\s+voice_daily_stats\b/i.test(sql));
+    expect(reads).toEqual([
+      expect.stringMatching(
+        /^SELECT EXISTS \(SELECT 1 FROM voice_daily_stats\) AS populated$/
+      ),
+    ]);
+  });
+
   it('backfills on a later boot if the rollup is still empty', () => {
     createDailyStats();
     insertSession({ joinedAt: '2026-04-20T10:00:00Z', durationMs: 60_000 });

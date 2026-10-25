@@ -117,6 +117,35 @@ describe('pollRepository', () => {
     ).toBe('msg-1');
   });
 
+  it("finds the creator's poll anywhere in the server, but not in another", () => {
+    pollRepository.create(record({ channel_id: 'chan-2' }));
+
+    expect(
+      pollRepository.findActiveByCreatorInGuild('user-1', 'guild-1')?.message_id
+    ).toBe('msg-1');
+    expect(
+      pollRepository.findActiveByCreatorInGuild('user-1', 'guild-2')
+    ).toBeNull();
+    expect(
+      pollRepository.findActiveByCreatorInGuild('user-2', 'guild-1')
+    ).toBeNull();
+  });
+
+  it('finds an open poll by its message, and not once it has expired', () => {
+    pollRepository.create(record({ message_id: 'open' }));
+    pollRepository.create(
+      record({ message_id: 'closed', expires_at: Date.now() - 1 })
+    );
+
+    expect(pollRepository.findActive('open')).toMatchObject({
+      message_id: 'open',
+      creator_id: 'user-1',
+      guild_id: 'guild-1',
+    });
+    expect(pollRepository.findActive('closed')).toBeNull();
+    expect(pollRepository.findActive('missing')).toBeNull();
+  });
+
   describe('on a frozen clock', () => {
     const NOW = new Date('2026-05-01T12:00:00Z').getTime();
 
@@ -146,6 +175,39 @@ describe('pollRepository', () => {
       expect(
         pollRepository.findActiveByCreator('user-1', 'chan-1')?.message_id
       ).toBe('newer');
+    });
+
+    it('prefers the newest poll server-wide too', () => {
+      pollRepository.create(record({ message_id: 'older' }));
+      vi.advanceTimersByTime(1_000);
+      pollRepository.create(
+        record({ message_id: 'newer', channel_id: 'chan-2' })
+      );
+
+      expect(
+        pollRepository.findActiveByCreatorInGuild('user-1', 'guild-1')
+          ?.message_id
+      ).toBe('newer');
+    });
+
+    it("lists the creator's open polls in the server, newest first, up to the limit", () => {
+      for (const [index, id] of ['a', 'b', 'c', 'd'].entries()) {
+        pollRepository.create(
+          record({ message_id: id, channel_id: `chan-${index}` })
+        );
+        vi.advanceTimersByTime(1_000);
+      }
+      pollRepository.create(record({ message_id: 'theirs', creator_id: 'x' }));
+      pollRepository.create(record({ message_id: 'away', guild_id: 'g-2' }));
+      pollRepository.create(
+        record({ message_id: 'over', expires_at: Date.now() })
+      );
+
+      expect(
+        pollRepository
+          .listActiveByCreatorInGuild('user-1', 'guild-1', 3)
+          .map((poll) => poll.message_id)
+      ).toEqual(['d', 'c', 'b']);
     });
 
     describe('at the exact expiry instant', () => {

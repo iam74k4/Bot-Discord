@@ -2,23 +2,45 @@ import {
   ChatInputCommandInteraction,
   MessageFlags,
   PermissionFlagsBits,
+  type EmbedBuilder,
+  type Guild,
 } from 'discord.js';
-import { createEmbed, createErrorEmbed } from '../../../shared/utils/embed.js';
+import {
+  createEmbed,
+  createErrorEmbed,
+  createWarningEmbed,
+} from '../../../shared/utils/embed.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { guildSettingsRepository } from '../../../infrastructure/guildSettings/index.js';
 import { logAuditAction } from '../../../infrastructure/audit/index.js';
 import { t } from '../../../locales/index.js';
-import { LANGUAGE_AUTO, resolveLocale } from '../../../locales/guildLocale.js';
 import {
-  getSendableTextChannel,
-  interactionHasGuildPermission,
-} from '../../../shared/utils/discord.js';
+  LANGUAGE_AUTO,
+  resolveBackgroundLocale,
+  resolveLocale,
+} from '../../../locales/guildLocale.js';
+import { createPermissionDeniedEmbed } from '../../../shared/utils/discord.js';
+import { commandMention } from '../../../shared/utils/commandMentions.js';
 import { showSettingsPanel } from './settingsPanel.js';
+import {
+  checkPostableChannel,
+  describeChannelProblem,
+} from './channelCheck.js';
+import {
+  ANNOUNCEMENT_CHANNEL_SETTING,
+  AUDIT_CHANNEL_SETTING,
+  saveChannelSetting,
+  type ChannelSetting,
+} from './channelSettings.js';
+import { languageDisplayName } from './languages.js';
+import { memberHasServerPermission } from './permissions.js';
 
-const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
-  ja: '日本語',
-  en: 'English',
-};
+async function replyPrivately(
+  interaction: ChatInputCommandInteraction,
+  embed: EmbedBuilder
+): Promise<void> {
+  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
 
 async function handleView(
   interaction: ChatInputCommandInteraction
@@ -27,141 +49,94 @@ async function handleView(
   await showSettingsPanel(interaction, locale, 'overview');
 }
 
-/**
- * Shape shared by every "point this setting at a text channel" subcommand:
- * an empty option clears it, a set one is validated for sendability first.
- */
-interface ChannelSetting {
+/** How a channel subcommand words its reply. */
+interface ChannelSubcommand {
+  setting: ChannelSetting;
   nameKey: 'settings.audit.name' | 'settings.announcements.name';
   configuredKey:
     'settings.audit.configured' | 'settings.announcements.configured';
   disabledKey: 'settings.audit.disabled' | 'settings.announcements.disabled';
   /** Command to suggest next, by state. */
   nextStep: { set: string; cleared: string };
-  store: (guildId: string, channelId: string | null) => void;
-  auditLog: (channelName: string) => {
-    action: 'AUDIT_SETUP' | 'SETTINGS_CHANGE';
-    detail: string;
-  };
 }
 
+const AUDIT_SUBCOMMAND: ChannelSubcommand = {
+  setting: AUDIT_CHANNEL_SETTING,
+  nameKey: 'settings.audit.name',
+  configuredKey: 'settings.audit.configured',
+  disabledKey: 'settings.audit.disabled',
+  nextStep: { set: 'admin settings logs', cleared: 'admin settings audit' },
+};
+
+const ANNOUNCEMENTS_SUBCOMMAND: ChannelSubcommand = {
+  setting: ANNOUNCEMENT_CHANNEL_SETTING,
+  nameKey: 'settings.announcements.name',
+  configuredKey: 'settings.announcements.configured',
+  disabledKey: 'settings.announcements.disabled',
+  nextStep: {
+    set: 'admin settings view',
+    cleared: 'admin settings announcements',
+  },
+};
+
+/**
+ * Every "point this setting at a text channel" subcommand: an empty option
+ * clears it, a set one is checked for postability first.
+ */
 async function handleChannelSetting(
   interaction: ChatInputCommandInteraction,
-  setting: ChannelSetting
+  guild: Guild,
+  subcommand: ChannelSubcommand
 ): Promise<void> {
   const locale = resolveLocale(interaction);
-
-  if (!interaction.guild) {
-    const errorEmbed = createErrorEmbed(
-      t('common.error', locale),
-      t('common.guildOnly', locale)
-    );
-    await interaction.reply({
-      embeds: [errorEmbed],
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
   const channel = interaction.options.getChannel('channel');
+  const change = {
+    client: interaction.client,
+    guild,
+    userId: interaction.user.id,
+  };
 
   if (!channel) {
-    setting.store(interaction.guild.id, null);
-
-    const embed = createEmbed({
-      title: t(setting.nameKey, locale),
-      description: `${t(setting.disabledKey, locale)}\n\n${t(
-        'common.nextStep',
-        locale
-      )}: ${setting.nextStep.cleared}`,
-      color: COLORS.WARNING,
-    });
-
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  const sendableChannel = await getSendableTextChannel(
-    interaction.guild,
-    channel.id
-  );
-  if (!sendableChannel) {
-    const embed = createErrorEmbed(
-      t('common.error', locale),
-      t('notification.errors.channelNotSendable', locale)
+    saveChannelSetting(subcommand.setting, { ...change, channelId: null });
+    await replyPrivately(
+      interaction,
+      createEmbed({
+        title: t(subcommand.nameKey, locale),
+        description: `${t(subcommand.disabledKey, locale)}\n\n${t(
+          'common.nextStep',
+          locale
+        )}: ${commandMention(subcommand.nextStep.cleared)}`,
+        color: COLORS.WARNING,
+      })
     );
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
-  setting.store(interaction.guild.id, channel.id);
+  const check = await checkPostableChannel(guild, channel.id);
+  if (!check.ok) {
+    await replyPrivately(
+      interaction,
+      createErrorEmbed(
+        t('common.error', locale),
+        describeChannelProblem(check, locale)
+      )
+    );
+    return;
+  }
 
-  const embed = createEmbed({
-    title: t(setting.nameKey, locale),
-    description: `${t(setting.configuredKey, locale, {
-      channel: channel.id,
-    })}\n\n${t('common.nextStep', locale)}: ${setting.nextStep.set}`,
-    color: COLORS.SUCCESS,
-  });
-
-  await interaction.reply({
-    embeds: [embed],
-    flags: MessageFlags.Ephemeral,
-  });
-
-  const { action, detail } = setting.auditLog(sendableChannel.name);
-  void logAuditAction(
-    interaction.client,
-    interaction.guild.id,
-    interaction.user.id,
-    action,
-    channel.id,
-    detail
+  saveChannelSetting(subcommand.setting, { ...change, channelId: channel.id });
+  await replyPrivately(
+    interaction,
+    createEmbed({
+      title: t(subcommand.nameKey, locale),
+      description: `${t(subcommand.configuredKey, locale, {
+        channel: channel.id,
+      })}\n\n${t('common.nextStep', locale)}: ${commandMention(
+        subcommand.nextStep.set
+      )}`,
+      color: COLORS.SUCCESS,
+    })
   );
-}
-
-async function handleAudit(
-  interaction: ChatInputCommandInteraction
-): Promise<void> {
-  await handleChannelSetting(interaction, {
-    nameKey: 'settings.audit.name',
-    configuredKey: 'settings.audit.configured',
-    disabledKey: 'settings.audit.disabled',
-    nextStep: {
-      set: '/admin settings logs',
-      cleared: '/admin settings audit',
-    },
-    store: guildSettingsRepository.setAuditChannel,
-    auditLog: (channelName) => ({
-      action: 'AUDIT_SETUP',
-      detail: `Audit channel set to: #${channelName}`,
-    }),
-  });
-}
-
-async function handleAnnouncements(
-  interaction: ChatInputCommandInteraction
-): Promise<void> {
-  await handleChannelSetting(interaction, {
-    nameKey: 'settings.announcements.name',
-    configuredKey: 'settings.announcements.configured',
-    disabledKey: 'settings.announcements.disabled',
-    nextStep: {
-      set: '/admin settings view',
-      cleared: '/admin settings announcements',
-    },
-    store: guildSettingsRepository.setAnnouncementChannel,
-    auditLog: (channelName) => ({
-      action: 'SETTINGS_CHANGE',
-      detail: `Announcement channel set to: #${channelName}`,
-    }),
-  });
 }
 
 async function handleLogs(
@@ -172,56 +147,44 @@ async function handleLogs(
 }
 
 async function handleLanguage(
-  interaction: ChatInputCommandInteraction
+  interaction: ChatInputCommandInteraction,
+  guild: Guild
 ): Promise<void> {
-  const locale = resolveLocale(interaction);
-
-  if (!interaction.guild) {
-    const errorEmbed = createErrorEmbed(
-      t('common.error', locale),
-      t('common.guildOnly', locale)
-    );
-    await interaction.reply({
-      embeds: [errorEmbed],
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
   const lang = interaction.options.getString('lang', true);
   const isAuto = lang === LANGUAGE_AUTO;
 
   // `auto` is stored as NULL so replies keep following each viewer's locale.
-  guildSettingsRepository.setLanguage(
-    interaction.guild.id,
-    isAuto ? null : lang
-  );
+  guildSettingsRepository.setLanguage(guild.id, isAuto ? null : lang);
 
-  const languageDisplay = isAuto
-    ? t('settings.language.auto', locale)
-    : (LANGUAGE_DISPLAY_NAMES[lang] ?? lang);
-
-  const embed = createEmbed({
-    title: t('settings.language.name', locale),
-    description:
-      t('settings.language.changed', locale, {
-        language: languageDisplay,
-      }) + `\n\n${t('common.nextStep', locale)}: /admin settings view`,
-    color: COLORS.SUCCESS,
-  });
-
-  await interaction.reply({
-    embeds: [embed],
-    flags: MessageFlags.Ephemeral,
-  });
+  // Resolved after the change, so the confirmation is already in the
+  // language the server just chose (or the admin's own, on automatic).
+  const locale = resolveLocale(interaction);
+  const auditLocale = resolveBackgroundLocale(guild);
 
   void logAuditAction(
     interaction.client,
-    interaction.guild.id,
+    guild.id,
     interaction.user.id,
     'SETTINGS_CHANGE',
     undefined,
-    `Language changed to: ${lang}`
+    t('audit.details.language', auditLocale, {
+      language: languageDisplayName(lang, auditLocale),
+    })
+  );
+
+  await replyPrivately(
+    interaction,
+    createEmbed({
+      title: t('settings.language.name', locale),
+      description:
+        t('settings.language.changed', locale, {
+          language: languageDisplayName(lang, locale),
+        }) +
+        `\n\n${t('common.nextStep', locale)}: ${commandMention(
+          'admin settings view'
+        )}`,
+      color: COLORS.SUCCESS,
+    })
   );
 }
 
@@ -229,21 +192,26 @@ export async function executeSettingsCommand(
   interaction: ChatInputCommandInteraction
 ): Promise<void> {
   const locale = resolveLocale(interaction);
+  const guild = interaction.guild;
+
+  if (!guild) {
+    await replyPrivately(
+      interaction,
+      createWarningEmbed(
+        t('common.serverOnlyTitle', locale),
+        t('common.guildOnly', locale)
+      )
+    );
+    return;
+  }
 
   if (
-    !interaction.guild ||
-    !interactionHasGuildPermission(interaction, PermissionFlagsBits.ManageGuild)
+    !memberHasServerPermission(interaction, PermissionFlagsBits.ManageGuild)
   ) {
-    const errorEmbed = createErrorEmbed(
-      t('common.error', locale),
-      t('common.permissionsRequired', locale, {
-        permissions: t('help.permission.manageGuild', locale),
-      })
+    await replyPrivately(
+      interaction,
+      createPermissionDeniedEmbed(PermissionFlagsBits.ManageGuild, locale)
     );
-    await interaction.reply({
-      embeds: [errorEmbed],
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
 
@@ -254,16 +222,16 @@ export async function executeSettingsCommand(
       await handleView(interaction);
       break;
     case 'audit':
-      await handleAudit(interaction);
+      await handleChannelSetting(interaction, guild, AUDIT_SUBCOMMAND);
       break;
     case 'announcements':
-      await handleAnnouncements(interaction);
+      await handleChannelSetting(interaction, guild, ANNOUNCEMENTS_SUBCOMMAND);
       break;
     case 'logs':
       await handleLogs(interaction);
       break;
     case 'language':
-      await handleLanguage(interaction);
+      await handleLanguage(interaction, guild);
       break;
   }
 }

@@ -195,12 +195,16 @@ describe('ChannelMixRing', () => {
     expect(maxAbsInt16(ring.extractLastSeconds(0.02, epoch + 20))).toBe(0);
   });
 
-  it('reports its memory footprint (int32 mix + uint16 generation per sample)', () => {
+  it('reports its memory footprint (int32 mix per sample + one spare page, uint16 marker per page)', () => {
     const ring = new ChannelMixRing(10, epoch);
 
     expect(ring.getApproxSizeMB()).toBeCloseTo(
-      (10 * 48000 * (4 + 2)) / (1024 * 1024),
+      ringBytes(10) / (1024 * 1024),
       6
+    );
+    // A third less than the old per-sample generation array (6 bytes/sample).
+    expect(ring.getApproxSizeMB()).toBeLessThan(
+      (10 * 48000 * 6 * 0.7) / (1024 * 1024)
     );
   });
 
@@ -226,6 +230,12 @@ describe('ChannelMixRing', () => {
     expect(maxAbsInt16(samples(90, 100))).toBe(0);
   });
 });
+
+/** Bytes a ring of `seconds` allocates: whole pages plus one spare. */
+function ringBytes(seconds: number): number {
+  const pages = Math.ceil((seconds * 48000) / 960) + 1;
+  return pages * 960 * 4 + pages * 2;
+}
 
 /** The 20ms read-back of a ring holding one speaker at a constant level. */
 function singleSpeaker(value: number): Buffer {
@@ -292,12 +302,35 @@ describe('ChannelMixRingManager', () => {
 
   it('sizes rings from AUDIO_BUFFER_DURATION and sums them', () => {
     const mgr = new ChannelMixRingManager();
-    const perRingMB = (60 * 48000 * (4 + 2)) / (1024 * 1024);
+    const perRingMB = ringBytes(60) / (1024 * 1024);
 
     mgr.getOrCreate('a');
     expect(mgr.getTotalMixBufferSizeMB()).toBeCloseTo(perRingMB, 6);
     mgr.getOrCreate('b');
     expect(mgr.getTotalMixBufferSizeMB()).toBeCloseTo(2 * perRingMB, 6);
+  });
+
+  it('starts a new ring at the given epoch, so a first frame placed there survives', () => {
+    const end = 5_000_020;
+    const frame = constantPcm(960, 8000);
+
+    // The ring's own default epoch is "now", which for the first chunk is
+    // its end: every sample of it falls before the timeline and is dropped.
+    const late = new ChannelMixRingManager();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(end);
+      late.getOrCreate('a').addMonoPcmInt16(frame, end);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(maxAbsInt16(late.extractLastSeconds('a', 0.02, end))).toBe(0);
+
+    const mgr = new ChannelMixRingManager();
+    mgr.getOrCreate('a', end - 20).addMonoPcmInt16(frame, end);
+    expect(maxAbsInt16(mgr.extractLastSeconds('a', 0.02, end))).toBeGreaterThan(
+      4000
+    );
   });
 
   it('reads a channel ring at the requested time', () => {
@@ -323,6 +356,318 @@ describe('ChannelMixRingManager', () => {
     // Reading from an untouched channel must not allocate its ring; that is
     // what makes an idle voice connection free.
     expect(mgr.extractLastSeconds('quiet', 1).length).toBe(0);
+    expect(mgr.getTotalMixBufferSizeMB()).toBe(0);
+  });
+});
+
+/**
+ * The ring as it was before page generations and the lookup table: one
+ * generation per sample, Math.tanh per output sample. Kept here so the
+ * faster ring is held to producing exactly the same bytes.
+ */
+class ReferenceRing {
+  private readonly size: number;
+  private readonly mix: Int32Array;
+  private readonly generation: Uint16Array;
+
+  constructor(
+    seconds: number,
+    private readonly epochMs: number
+  ) {
+    this.size = Math.ceil(48000 * seconds);
+    this.mix = new Int32Array(this.size);
+    this.generation = new Uint16Array(this.size);
+  }
+
+  private generationOf(g: number): number {
+    return (Math.floor(g / this.size) % 0xffff) + 1;
+  }
+
+  add(pcm: Buffer, endMs: number): void {
+    const n = pcm.length >> 1;
+    const start = Math.round((endMs - (n / 48000) * 1000 - this.epochMs) * 48);
+    for (let j = 0; j < n; j++) {
+      const g = start + j;
+      if (g < 0) continue;
+      const idx = g % this.size;
+      const gen = this.generationOf(g);
+      if (this.generation[idx] !== gen) {
+        this.mix[idx] = 0;
+        this.generation[idx] = gen;
+      }
+      this.mix[idx] += pcm.readInt16LE(j * 2);
+    }
+  }
+
+  extract(seconds: number, nowMs: number): Buffer {
+    const total = Math.min(Math.floor(seconds * 48000), this.size);
+    const end = Math.floor((nowMs - this.epochMs) * 48);
+    const out = Buffer.allocUnsafe(total * 2);
+    for (let j = 0; j < total; j++) {
+      const g = end - total + j;
+      let v = 0;
+      if (g >= 0 && this.generation[g % this.size] === this.generationOf(g)) {
+        v = this.mix[g % this.size];
+      }
+      const s = Math.round(Math.tanh(v / 24000) * 32767);
+      out.writeInt16LE(Math.max(-32768, Math.min(32767, s)), j * 2);
+    }
+    return out;
+  }
+}
+
+/** Small deterministic PRNG so failures reproduce. */
+function prng(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+}
+
+function randomPcm(random: () => number, samples: number, scale: number) {
+  const buf = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i++) {
+    buf.writeInt16LE(Math.round((random() * 2 - 1) * scale), i * 2);
+  }
+  return buf;
+}
+
+describe('ChannelMixRing against the original per-sample ring', () => {
+  it.each([1, 2, 3, 4, 5, 6])(
+    'produces identical bytes for random mixes, laps and windows (seed %i)',
+    (seed) => {
+      const random = prng(seed);
+      const epochMs = 10_000;
+      const seconds = 0.1; // 4800 samples: short enough to lap many times
+      const ring = new ChannelMixRing(seconds, epochMs);
+      const reference = new ReferenceRing(seconds, epochMs);
+      let clock = epochMs - 15; // first chunks straddle the epoch
+
+      for (let step = 0; step < 120; step++) {
+        clock += 20 + Math.floor(random() * 7) - 3;
+        const speakers = 1 + Math.floor(random() * 6);
+        for (let s = 0; s < speakers; s++) {
+          // Sometimes every speaker is at full scale: sums beyond the
+          // lookup table's +/-131072 must still match the formula.
+          const scale = random() < 0.2 ? 32767 : 12000;
+          const chunk = randomPcm(random, 960, scale);
+          const end = clock - Math.floor(random() * 5);
+          ring.addMonoPcmInt16(chunk, end);
+          reference.add(chunk, end);
+        }
+
+        if (step % 7 === 0) {
+          const window = random() * 0.12; // includes over-long requests
+          expect(ring.extractLastSeconds(window, clock)).toEqual(
+            reference.extract(window, clock)
+          );
+          // A read at exactly the newest write, over the full window.
+          expect(ring.extractLastSeconds(seconds, clock)).toEqual(
+            reference.extract(seconds, clock)
+          );
+        }
+      }
+    }
+  );
+
+  it('matches before the epoch, after long silence and across many laps', () => {
+    const ring = new ChannelMixRing(0.05, 0);
+    const reference = new ReferenceRing(0.05, 0);
+    const chunk = randomPcm(prng(9), 960, 30000);
+
+    ring.addMonoPcmInt16(chunk, 30);
+    reference.add(chunk, 30);
+    for (const now of [-50, 0, 10, 30, 55, 80, 5_000]) {
+      expect(ring.extractLastSeconds(0.05, now)).toEqual(
+        reference.extract(0.05, now)
+      );
+    }
+
+    ring.addMonoPcmInt16(chunk, 5_020);
+    reference.add(chunk, 5_020);
+    expect(ring.extractLastSeconds(0.05, 5_020)).toEqual(
+      reference.extract(0.05, 5_020)
+    );
+  });
+});
+
+describe('ChannelMixRing placement', () => {
+  it('writes at the exact global sample index it is given', () => {
+    const ring = new ChannelMixRing(1, 0);
+    ring.addMonoPcmInt16At(constantPcm(10, 9000), 4800); // 100 ms in
+
+    const out = ring.extractLastSeconds(0.2, 200); // samples 0..9599
+    const nonSilent: number[] = [];
+    for (let i = 0; i < out.length / 2; i++) {
+      if (out.readInt16LE(i * 2) !== 0) nonSilent.push(i);
+    }
+    expect(nonSilent[0]).toBe(4800);
+    expect(nonSilent).toHaveLength(10);
+  });
+
+  it('places a chunk by receive time the same way as at its computed start', () => {
+    const byTime = new ChannelMixRing(1, 0);
+    const byIndex = new ChannelMixRing(1, 0);
+    const pcm = randomPcm(prng(3), 960, 20000);
+
+    byTime.addMonoPcmInt16(pcm, 333);
+    byIndex.addMonoPcmInt16At(pcm, byIndex.globalIndexAt(333) - 960);
+
+    expect(byTime.extractLastSeconds(1, 400)).toEqual(
+      byIndex.extractLastSeconds(1, 400)
+    );
+  });
+
+  it('accepts decoded samples as an Int16Array as well as a Buffer', () => {
+    const fromBuffer = new ChannelMixRing(1, 0);
+    const fromSamples = new ChannelMixRing(1, 0);
+    const pcm = randomPcm(prng(4), 960, 20000);
+    const samples = new Int16Array(960);
+    for (let i = 0; i < 960; i++) samples[i] = pcm.readInt16LE(i * 2);
+
+    fromBuffer.addMonoPcmInt16At(pcm, 1000);
+    fromSamples.addMonoPcmInt16At(samples, 1000);
+
+    expect(fromSamples.extractLastSeconds(1, 500)).toEqual(
+      fromBuffer.extractLastSeconds(1, 500)
+    );
+  });
+
+  it('reads an odd-offset Buffer correctly', () => {
+    const ring = new ChannelMixRing(1, 0);
+    const backing = Buffer.alloc(960 * 2 + 1);
+    const pcm = backing.subarray(1);
+    for (let i = 0; i < 960; i++) pcm.writeInt16LE(8000, i * 2);
+
+    ring.addMonoPcmInt16At(pcm, 0);
+
+    expect(minAbsInt16(ring.extractLastSeconds(0.02, 20))).toBeGreaterThan(0);
+  });
+
+  it('drops a chunk more than one window older than the newest audio instead of wiping it', () => {
+    const ring = new ChannelMixRing(0.1, 0); // 4800-sample window
+    ring.addMonoPcmInt16At(constantPcm(960, 8000), 9600);
+
+    // Lands on the same page one lap earlier: must not zero the new audio.
+    ring.addMonoPcmInt16At(constantPcm(960, -8000), 9600 - 5760);
+
+    const out = ring.extractLastSeconds(0.02, 220); // samples 9600..10559
+    expect(out).toEqual(singleSpeaker(8000));
+  });
+
+  it('keeps a chunk that is late but still inside the window', () => {
+    const ring = new ChannelMixRing(0.1, 0);
+    ring.addMonoPcmInt16At(constantPcm(960, 8000), 9600);
+    ring.addMonoPcmInt16At(constantPcm(960, 6000), 9600 - 2880);
+
+    const late = ring
+      .extractLastSeconds(0.1, 220)
+      .subarray((9600 - 2880 - (10560 - 4800)) * 2);
+    expect(late.readInt16LE(0)).toBe(singleSpeaker(6000).readInt16LE(0));
+  });
+
+  it('reads a page that was never written as silence', () => {
+    const ring = new ChannelMixRing(1, 0);
+    ring.addMonoPcmInt16At(constantPcm(960, 8000), 0);
+
+    expect(maxAbsInt16(ring.extractLastSeconds(0.5, 900))).toBe(0);
+  });
+});
+
+describe('ChannelMixRing.extractLastSecondsAsync', () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  function busyRing(): ChannelMixRing {
+    const ring = new ChannelMixRing(2, 0);
+    const random = prng(11);
+    for (let end = 20; end <= 2000; end += 20) {
+      ring.addMonoPcmInt16(randomPcm(random, 960, 25000), end);
+      ring.addMonoPcmInt16(randomPcm(random, 960, 25000), end);
+    }
+    return ring;
+  }
+
+  it('returns the same bytes as the synchronous read', async () => {
+    const ring = busyRing();
+
+    const result = await ring.extractLastSecondsAsync(1.5, 2000, {
+      stepSamples: 4800,
+    });
+
+    expect(result.pcm).toEqual(ring.extractLastSeconds(1.5, 2000));
+    expect(result.audible).toBe(true);
+  });
+
+  it('lets other work run between steps instead of blocking until done', async () => {
+    const ring = busyRing();
+    const order: string[] = [];
+
+    const extract = ring
+      .extractLastSecondsAsync(2, 2000, { stepSamples: 960 })
+      .then(() => order.push('extracted'));
+    setImmediate(() => order.push('other work'));
+    await extract;
+
+    expect(order).toEqual(['other work', 'extracted']);
+  });
+
+  it('reserves zeroed room for a header in front of the audio, in one allocation', async () => {
+    const ring = busyRing();
+
+    const { pcm, framed } = await ring.extractLastSecondsAsync(1, 2000, {
+      leadingBytes: 44,
+    });
+
+    expect(framed.length).toBe(44 + pcm.length);
+    expect(framed.buffer).toBe(pcm.buffer);
+    expect(framed.subarray(0, 44).every((byte) => byte === 0)).toBe(true);
+    expect(framed.subarray(44)).toEqual(ring.extractLastSeconds(1, 2000));
+  });
+
+  it.each([
+    ['silence', 0, 0, false],
+    ['a level that soft-limits to the noise threshold', 35, 48, false],
+    ['a level just above it', 36, 49, true],
+    ['a negative level just above it', -36, 49, true],
+  ])('flags %s correctly', async (_label, level, expectedPeak, audible) => {
+    const ring = new ChannelMixRing(1, 0);
+    ring.addMonoPcmInt16(constantPcm(960, level), 20);
+
+    const result = await ring.extractLastSecondsAsync(0.02, 20);
+
+    expect(maxAbsInt16(result.pcm)).toBe(expectedPeak);
+    expect(result.audible).toBe(audible);
+  });
+});
+
+describe('ChannelMixRing.getBufferedSeconds', () => {
+  it('counts from the first audio up to the window length', () => {
+    const ring = new ChannelMixRing(60, 1_000);
+
+    expect(ring.getBufferedSeconds(500)).toBe(0);
+    expect(ring.getBufferedSeconds(1_000)).toBe(0);
+    expect(ring.getBufferedSeconds(13_500)).toBe(12.5);
+    expect(ring.getBufferedSeconds(1_000 + 3_600_000)).toBe(60);
+  });
+
+  it('is 0 for a channel the manager never allocated a ring for', () => {
+    const mgr = new ChannelMixRingManager();
+    expect(mgr.getBufferedSeconds('quiet')).toBe(0);
+  });
+
+  it('reads an empty, unallocated channel asynchronously as silence', async () => {
+    const mgr = new ChannelMixRingManager();
+
+    const result = await mgr.extractLastSecondsAsync('quiet', 1, undefined, {
+      leadingBytes: 44,
+    });
+
+    expect(result.pcm.length).toBe(0);
+    expect(result.audible).toBe(false);
+    expect(result.framed.length).toBe(44);
     expect(mgr.getTotalMixBufferSizeMB()).toBe(0);
   });
 });

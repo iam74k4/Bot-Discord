@@ -9,8 +9,14 @@ vi.mock('../../infrastructure/guildSettings/index.js', () => ({
   },
 }));
 
-const { LANGUAGE_AUTO, getGuildLanguage, resolveGuildLocale, resolveLocale } =
-  await import('../guildLocale.js');
+const {
+  DEFAULT_BACKGROUND_LOCALE,
+  LANGUAGE_AUTO,
+  getGuildLanguage,
+  resolveBackgroundLocale,
+  resolveGuildLocale,
+  resolveLocale,
+} = await import('../guildLocale.js');
 
 describe('getGuildLanguage', () => {
   beforeEach(() => {
@@ -86,5 +92,77 @@ describe('resolveLocale', () => {
 
   it('exposes the automatic sentinel used by the settings command', () => {
     expect(LANGUAGE_AUTO).toBe('auto');
+  });
+});
+
+describe('resolveBackgroundLocale', () => {
+  const COMMUNITY = ['COMMUNITY', 'NEWS'];
+
+  beforeEach(() => {
+    getLanguage.mockReset();
+    getLanguage.mockReturnValue(null);
+  });
+
+  it('uses the language the guild chose, whatever Discord says', () => {
+    getLanguage.mockReturnValue('en');
+    expect(
+      resolveBackgroundLocale({
+        id: 'g1',
+        preferredLocale: 'ja',
+        features: COMMUNITY,
+      })
+    ).toBe('en');
+    expect(getLanguage).toHaveBeenCalledWith('g1');
+  });
+
+  it('follows the server language on a Community server set to auto', () => {
+    expect(
+      resolveBackgroundLocale({
+        id: 'g1',
+        preferredLocale: 'en-GB',
+        features: COMMUNITY,
+      })
+    ).toBe('en');
+    expect(
+      resolveBackgroundLocale({
+        id: 'g1',
+        preferredLocale: 'ja',
+        features: COMMUNITY,
+      })
+    ).toBe('ja');
+  });
+
+  it.each([
+    ['no features', []],
+    ['features missing', undefined],
+    ['other features only', ['NEWS', 'ANIMATED_ICON']],
+  ])(
+    'ignores the stuck en-US default on a non-Community server (%s)',
+    (_label, features) => {
+      expect(
+        resolveBackgroundLocale({
+          id: 'g1',
+          preferredLocale: 'en-US',
+          features,
+        })
+      ).toBe('ja');
+    }
+  );
+
+  it('falls back to Japanese, not the viewer default, when nothing is known', () => {
+    expect(DEFAULT_BACKGROUND_LOCALE).toBe('ja');
+    expect(DEFAULT_BACKGROUND_LOCALE).not.toBe(DEFAULT_LOCALE);
+    expect(resolveBackgroundLocale({ id: 'g1', features: COMMUNITY })).toBe(
+      'ja'
+    );
+    expect(resolveBackgroundLocale(null)).toBe('ja');
+    expect(getLanguage).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores an unsupported stored language', () => {
+    getLanguage.mockReturnValue('ko');
+    expect(
+      resolveBackgroundLocale({ id: 'g1', preferredLocale: 'en-US' })
+    ).toBe('ja');
   });
 });

@@ -13,6 +13,23 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 const db = new Database(':memory:');
 
+// The real allowlist check against a list each test sets (empty: every
+// server, as in production).
+const allowlist = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
+  return {
+    isGuildAllowed: (guildId: string | null) =>
+      actual.isGuildAllowed(guildId, allowlist.ids),
+  };
+});
+beforeEach(() => {
+  allowlist.ids = [];
+});
+
 vi.mock('../../../infrastructure/database/connection.js', () => ({
   database: db,
 }));
@@ -30,6 +47,7 @@ const fake = vi.hoisted(() => {
     disconnect: vi.fn(),
     getConnection: vi.fn(),
     getAllConnections: vi.fn(),
+    getConnectedChannelInGuild: vi.fn(),
     isAtLimit: vi.fn(),
     updateActivity: vi.fn(),
   };
@@ -47,6 +65,9 @@ vi.mock('../application/announce.js', () => ({
   announceBuffering,
   forgetAnnouncement,
 }));
+
+const reconcileGuild = vi.hoisted(() => vi.fn());
+vi.mock('../application/reconcile.js', () => ({ reconcileGuild }));
 
 const { event } = await import('../events/voiceStateUpdate.js');
 const { voiceSettingsRepository } =
@@ -143,6 +164,13 @@ describe('voiceStateUpdate', () => {
       fake.connections.get(channelId)
     );
     cm.getAllConnections.mockImplementation(() => new Map(fake.connections));
+    cm.getConnectedChannelInGuild.mockImplementation((guildId: string) => {
+      for (const info of fake.connections.values()) {
+        if (info.guildId === guildId) return info.channelId;
+      }
+      return undefined;
+    });
+    reconcileGuild.mockResolvedValue({ status: 'none' });
     cm.isAtLimit.mockImplementation(
       () => fake.connections.size >= fake.limit.value
     );
@@ -190,6 +218,16 @@ describe('voiceStateUpdate', () => {
 
     it('stays out of every channel in a guild that disabled auto-join', async () => {
       voiceSettingsRepository.setAutoJoinEnabled(guild.id, false);
+      const general = voiceChannel('general', [human('alice')]);
+
+      await fire(voiceState(null), voiceState(general));
+
+      expect(cm.connect).not.toHaveBeenCalled();
+      expect(announceBuffering).not.toHaveBeenCalled();
+    });
+
+    it('stays out of every channel in a server outside ALLOWED_GUILD_IDS', async () => {
+      allowlist.ids = ['some-other-guild'];
       const general = voiceChannel('general', [human('alice')]);
 
       await fire(voiceState(null), voiceState(general));
@@ -284,22 +322,27 @@ describe('voiceStateUpdate', () => {
       expect(announceBuffering).not.toHaveBeenCalled();
     });
 
-    // KNOWN BUG (voiceStateUpdate.ts handleUserJoined): another bot joining
-    // makes this bot connect and then immediately leave again, and the
-    // in-flight connect can block a human's join elsewhere in the guild.
-    // `it.fails` keeps the suite green until the fix lands; then this starts
-    // failing and should become a plain `it`.
-    it.fails(
-      'does not even try to connect when only another bot joined',
-      async () => {
-        const music = botUser('music-bot');
-        const general = voiceChannel('general', [music]);
+    // Regression: another bot joining used to make this bot connect and then
+    // immediately leave again, and that in-flight connect could block a
+    // human's join elsewhere in the guild. Humans are now counted first.
+    it('does not even try to connect when only another bot joined', async () => {
+      const music = botUser('music-bot');
+      const general = voiceChannel('general', [music]);
 
-        await fire(voiceState(null, music), voiceState(general, music));
+      await fire(voiceState(null, music), voiceState(general, music));
 
-        expect(cm.connect).not.toHaveBeenCalled();
-      }
-    );
+      expect(cm.connect).not.toHaveBeenCalled();
+      expect(cm.disconnect).not.toHaveBeenCalled();
+    });
+
+    it('still joins when a bot joins a channel people are already in', async () => {
+      const music = botUser('music-bot');
+      const general = voiceChannel('general', [human('alice'), music]);
+
+      await fire(voiceState(null, music), voiceState(general, music));
+
+      expect(cm.connect).toHaveBeenCalledWith(guild, general);
+    });
 
     it('ignores a state with no guild attached', async () => {
       const general = voiceChannel('general', [human('alice')]);
@@ -323,6 +366,29 @@ describe('voiceStateUpdate', () => {
       expect(cm.disconnect).toHaveBeenCalledWith('general');
       expect(forgetAnnouncement).toHaveBeenCalledWith('general');
       expect(fake.connections.size).toBe(0);
+    });
+
+    it('moves on to a channel people are still talking in after leaving the empty one', async () => {
+      alreadyConnected('general');
+      const general = voiceChannel('general', [me]);
+      reconcileGuild.mockImplementation(async () => {
+        // Only after the emptied channel was left.
+        expect(fake.connections.has('general')).toBe(false);
+        return { status: 'joined', channelId: 'lounge' };
+      });
+
+      await fire(voiceState(general), voiceState(null));
+
+      expect(reconcileGuild).toHaveBeenCalledWith(guild);
+    });
+
+    it('does not look elsewhere while it stays in its channel', async () => {
+      alreadyConnected('general');
+      const general = voiceChannel('general', [me, human('bob')]);
+
+      await fire(voiceState(general), voiceState(null));
+
+      expect(reconcileGuild).not.toHaveBeenCalled();
     });
 
     it('treats other bots as nobody when deciding the channel is empty', async () => {
@@ -351,6 +417,7 @@ describe('voiceStateUpdate', () => {
 
       expect(cm.disconnect).not.toHaveBeenCalled();
       expect(forgetAnnouncement).not.toHaveBeenCalled();
+      expect(reconcileGuild).not.toHaveBeenCalled();
     });
 
     it('ignores a state with no guild attached', async () => {
@@ -378,6 +445,8 @@ describe('voiceStateUpdate', () => {
       expect(cm.connect).toHaveBeenCalledWith(guild, lounge);
       expect(announceBuffering).toHaveBeenCalledWith(lounge);
       expect([...fake.connections.keys()]).toEqual(['lounge']);
+      // It followed, so there is nothing else to look for.
+      expect(reconcileGuild).not.toHaveBeenCalled();
     });
 
     it('stays with the people left behind instead of following', async () => {
@@ -403,6 +472,8 @@ describe('voiceStateUpdate', () => {
       expect(cm.disconnect).toHaveBeenCalledWith('general');
       expect(cm.connect).not.toHaveBeenCalled();
       expect(fake.connections.size).toBe(0);
+      // It could not follow: pick up whichever channel is still occupied.
+      expect(reconcileGuild).toHaveBeenCalledWith(guild);
     });
 
     it('only refreshes activity when moving into the channel the bot is in', async () => {
@@ -464,6 +535,8 @@ describe('voiceStateUpdate', () => {
       expect(cm.disconnect).toHaveBeenCalledWith('general');
       expect(forgetAnnouncement).toHaveBeenCalledWith('general');
       expect(cm.connect).not.toHaveBeenCalled();
+      // An admin removed it on purpose; it must not hop to another channel.
+      expect(reconcileGuild).not.toHaveBeenCalled();
     });
 
     it('does not reconnect into a channel with no humans', async () => {

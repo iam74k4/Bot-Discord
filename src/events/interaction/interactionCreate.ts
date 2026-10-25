@@ -4,7 +4,10 @@ import { ExtendedClient } from '../../client.js';
 import { routeInteraction } from '../../app/interactions/interactionRouter.js';
 
 /**
- * InteractionCreate event - handles slash command and autocomplete interactions
+ * InteractionCreate event: hands every interaction to the router - slash
+ * commands, autocomplete, buttons and select menus (live collectors,
+ * persistent handlers, expired ones), and submitted forms nobody is waiting
+ * for.
  */
 export const event: Event<typeof Events.InteractionCreate> = {
   name: Events.InteractionCreate,

@@ -20,9 +20,11 @@ vi.mock('../../../handlers/commandHandler.js', () => ({
   registerCommands,
 }));
 
-vi.mock('../../../app/guildAllowlist.js', async (importOriginal) => {
+vi.mock('../../../shared/utils/guildAllowlist.js', async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import('../../../app/guildAllowlist.js')>();
+    await importOriginal<
+      typeof import('../../../shared/utils/guildAllowlist.js')
+    >();
   return {
     isGuildAllowed: (guildId: string | null) =>
       actual.isGuildAllowed(guildId, allowlist.ids),
