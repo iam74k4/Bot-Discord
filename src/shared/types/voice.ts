@@ -91,8 +91,13 @@ export interface VoiceConnectionInfo {
   connectedAt: number;
   /** Last activity timestamp */
   lastActivity: number;
-  /** Whether audio is decoded into the record buffer (false = TTS-only join) */
+  /** Whether audio is received at all (false = deafened, TTS-only join) */
   receiving?: boolean;
+  /**
+   * Whether received audio goes into the record buffer. False for a join
+   * that listens only for captions; absent means the same as `receiving`.
+   */
+  buffering?: boolean;
 }
 
 /**

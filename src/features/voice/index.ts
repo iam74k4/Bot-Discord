@@ -15,6 +15,11 @@ import {
   settleBufferingStatus,
 } from './application/voiceChannelStatus.js';
 import { ttsSessions } from './tts/sessionManager.js';
+import { captionSessions } from './captions/sessionManager.js';
+import {
+  CAPTION_CONSENT_PREFIX,
+  handleConsentClick,
+} from './application/captions.js';
 import { setServiceStatus } from '../../infrastructure/health/index.js';
 import { registerComponentHandler } from '../../shared/interactions/index.js';
 import { registerSettingsSummary } from '../../shared/settingsSummary/index.js';
@@ -29,6 +34,9 @@ export const name = 'voice';
 let memoryMonitor: MemoryMonitor | null = null;
 let fileCleanupService: FileCleanupService | null = null;
 let unsubscribeTts: (() => void) | null = null;
+let unsubscribeCaptions: (() => void) | null = null;
+let removeCaptionTap: (() => void) | null = null;
+let unregisterConsent: (() => void) | null = null;
 let unregisterOptOut: (() => void) | null = null;
 let unhookStatus: (() => void) | null = null;
 let unregisterSummary: (() => void) | null = null;
@@ -51,6 +59,21 @@ export async function start({ client, config }: FeatureContext): Promise<void> {
   // A reading session cannot outlive the connection it plays through.
   unsubscribeTts = connectionManager.onDisconnect((channelId) =>
     ttsSessions.handleDisconnect(channelId)
+  );
+
+  // Captions hear speakers through the connection manager's audio tap and
+  // end with the connection, like reading aloud.
+  removeCaptionTap?.();
+  removeCaptionTap = connectionManager.addAudioTap(captionSessions);
+  unsubscribeCaptions?.();
+  unsubscribeCaptions = connectionManager.onDisconnect((channelId) =>
+    captionSessions.handleDisconnect(channelId)
+  );
+  // The consent buttons, including those posted before this process started.
+  unregisterConsent?.();
+  unregisterConsent = registerComponentHandler(
+    CAPTION_CONSENT_PREFIX,
+    handleConsentClick
   );
 
   // The bot's "keeping audio" voice channel status is cleared before each
@@ -89,6 +112,8 @@ export async function start({ client, config }: FeatureContext): Promise<void> {
 export async function stop(): Promise<void> {
   unregisterOptOut?.();
   unregisterOptOut = null;
+  unregisterConsent?.();
+  unregisterConsent = null;
   unregisterSummary?.();
   unregisterSummary = null;
 
@@ -103,6 +128,12 @@ export async function stop(): Promise<void> {
   ttsSessions.stopAll();
   unsubscribeTts?.();
   unsubscribeTts = null;
+
+  captionSessions.stopAll();
+  removeCaptionTap?.();
+  removeCaptionTap = null;
+  unsubscribeCaptions?.();
+  unsubscribeCaptions = null;
 
   for (const [channelId] of connectionManager.getAllConnections()) {
     // Starts clearing the voice channel status the bot set; the disconnect

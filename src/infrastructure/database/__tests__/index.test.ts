@@ -86,6 +86,14 @@ const DOCUMENTED_SCHEMA: Record<string, TableShape> = {
       idx_audit_logs_guild_created: ['guild_id', 'created_at'],
     },
   },
+  caption_consent: {
+    columns: {
+      guild_id: col('TEXT', { notNull: true, pk: 1 }),
+      user_id: col('TEXT', { notNull: true, pk: 2 }),
+      consented_at: col('INTEGER', { notNull: true }),
+    },
+    indexes: {},
+  },
   guild_settings: {
     columns: {
       guild_id: col('TEXT', { pk: 1 }),
@@ -402,7 +410,8 @@ describe('initializeDatabase', () => {
         '009',
         '010',
         '011',
-        '012'
+        '012',
+        '013'
       );
 
       expect(describeSchema(db)).toEqual(schemaBefore);

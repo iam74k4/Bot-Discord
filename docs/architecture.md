@@ -25,6 +25,7 @@ flowchart LR
     bot["Bot service (Docker, Node.js 22.22)"]
     volume[("Volume /app/data: SQLite, backups, recordings")]
     voicevox["VOICEVOX engine (optional, private network only)"]
+    whisper["Whisper engine (optional, private network only)"]
   end
 
   webhook["Alert webhook (a Discord channel)"]
@@ -35,6 +36,7 @@ flowchart LR
   bot <-- "Opus audio" --> voice
   bot <--> volume
   bot -- "HTTP: audio_query / synthesis" --> voicevox
+  bot -- "HTTP: transcription (consenting speakers only)" --> whisper
   bot -- "crashes, memory pressure" --> webhook
 ```
 
@@ -45,8 +47,9 @@ flowchart LR
   cache server, or queue: one process owns everything, which keeps shutdown,
   backups and migrations simple. It also means one replica per environment -
   see [Scaling limits](#scaling-limits).
-- **VOICEVOX** is reachable only over Railway private networking and is never
-  exposed to the internet.
+- **VOICEVOX** and **Whisper** are reachable only over Railway private
+  networking and are never exposed to the internet. Captions add no intent:
+  they use the voice connection the bot already holds.
 
 ## Inside the process
 
@@ -243,13 +246,17 @@ Every feature exports `name`, `start(context)` and `stop()` from its
   (`shared/settingsSummary`). A feature registers into them in `start()` and
   removes itself in `stop()`, so features stay unaware of each other.
 
-### Why text-to-speech lives inside `voice`
+### Why text-to-speech and captions live inside `voice`
 
 Discord lets a bot hold **one voice connection per server**. Recording,
-auto-join and text-to-speech all need that connection, so exactly one module
-must own it - `voice/recording/connectionManager.ts` - and arbitrate between
-them: whether a join may buffer audio, who may disconnect, which connection
-to shed under memory pressure.
+auto-join, text-to-speech and captions all need that connection, so exactly
+one module must own it - `voice/recording/connectionManager.ts` - and
+arbitrate between them: whether a join hears people and whether it keeps
+what it hears (`recording/audioMode.ts`: deafened for reading aloud,
+listening for captions, buffering for recording), who may disconnect, which
+connection to shed under memory pressure. Captions do not reach into the
+receive path: the manager hands every speaker's decoded audio to registered
+audio taps.
 
 ```mermaid
 flowchart LR
@@ -263,6 +270,9 @@ flowchart LR
     tsm["tts/sessionManager (queue, playback)"]
     sched["tts/synthesisScheduler (one fair queue for the shared engine)"]
     vv["tts/voicevoxClient"]
+    captions["application/captions.ts (/caption)"]
+    csm["captions/sessionManager (consent gate, utterances, posting)"]
+    wc["captions/whisperClient"]
     mem["jobs/memoryMonitor"]
   end
 
@@ -272,12 +282,19 @@ flowchart LR
   tsm --> cm
   tsm --> sched
   sched --> vv
+  captions --> csm
+  cm -- "audio tap" --> csm
+  csm --> sched
+  sched --> wc
   cm --> placer
   placer --> ring
   mem -- "shed oldest connection" --> cm
 ```
 
-A separate `tts` feature would have to import `connectionManager` from
+Captions use their own instance of the same scheduler class, so the Whisper
+engine gets the same fairness as VOICEVOX without the two queues mixing.
+
+A separate `tts` or `captions` feature would have to import `connectionManager` from
 `voice`, which "features never import each other" forbids for good reason:
 the two would change in lockstep anyway. Keeping them together is the honest
 boundary. If a third, unrelated consumer of the connection appears, move the
@@ -459,12 +476,13 @@ The design trades horizontal scale for simplicity, on purpose:
     │   │   ├── stats/            # calendar (STATS_TIMEZONE day keys), periods
     │   │   └── tracking/         # voiceTracker
     │   └── voice/
-    │       ├── commands/         # voice.ts (/voice), tts.ts (/tts)
-    │       ├── application/      # record, status panel, autojoin, onboarding, optOut, tts …
+    │       ├── commands/         # voice.ts (/voice), tts.ts (/tts), caption.ts (/caption)
+    │       ├── application/      # record, status panel, autojoin, onboarding, optOut, tts, captions …
     │       ├── events/           # voiceStateUpdate, guildCreate, voiceChannelStatus, ttsMessage
-    │       ├── recording/        # connectionManager, channelMixRing, chunkPlacer, recordingService
+    │       ├── recording/        # connectionManager, audioMode, channelMixRing, chunkPlacer, recordingService
     │       ├── tts/              # voicevoxClient, synthesisScheduler, sessionManager, nameAudioCache …
-    │       ├── repositories/     # voiceSettings, tts
+    │       ├── captions/         # sessionManager, whisperClient, utterances, transcriptFilter, captionPoster, audio
+    │       ├── repositories/     # voiceSettings, tts, captionConsent
     │       └── jobs/             # fileCleanup, memoryMonitor
     ├── infrastructure/
     │   ├── database/

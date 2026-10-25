@@ -23,6 +23,7 @@ import {
 } from '../../../shared/types/voice.js';
 import { channelMixRingManager } from './channelMixRing.js';
 import { ChunkPlacer } from './chunkPlacer.js';
+import { keepsAudio } from './audioMode.js';
 
 /**
  * opusscript (the bundled Opus backend) runs every decoder in one 16 MiB
@@ -112,12 +113,29 @@ export const BEFORE_DISCONNECT_TIMEOUT_MS = 2_000;
 
 export interface ConnectOptions {
   /**
-   * Decode and buffer what people say (the `/voice record` ring). Defaults to
-   * true. Text-to-speech joins with `false` where the server has opted out of
-   * buffering, and the bot then also deafens itself so members can see it is
-   * not listening.
+   * Decode what people say. Defaults to true. Text-to-speech joins with
+   * `false` where the server has opted out of buffering, and the bot then
+   * also deafens itself so members can see it is not listening.
    */
   receive?: boolean;
+  /**
+   * Keep what is received in the `/voice record` ring. Defaults to `receive`.
+   * Captions join with `false` where the server has opted out of buffering:
+   * they need to hear people, not to keep their audio.
+   */
+  buffer?: boolean;
+}
+
+/**
+ * Something that wants each speaker's decoded audio as it arrives (captions).
+ * Called for every listening connection, buffering or not; a tap decides for
+ * itself whose audio it wants. It must be quick and must not throw.
+ */
+export interface AudioTap {
+  /** One decoded chunk: 48 kHz mono 16-bit PCM. */
+  onAudio(channelId: string, userId: string, pcm: Buffer, now: number): void;
+  /** The speaker's stream ended: they went quiet, left, or the bot did. */
+  onSpeechEnd(channelId: string, userId: string): void;
 }
 
 /**
@@ -129,6 +147,7 @@ export class VoiceConnectionManager {
   /** One audio player per connection, used by text-to-speech playback. */
   private players: Map<string, AudioPlayer> = new Map();
   private readonly disconnectListeners = new Set<(channelId: string) => void>();
+  private readonly audioTaps = new Set<AudioTap>();
   private readonly beforeDisconnectHooks = new Set<BeforeDisconnectHook>();
   /** In-flight connect promises keyed by channel id (dedupe concurrent joins). */
   private readonly connecting = new Map<
@@ -243,10 +262,12 @@ export class VoiceConnectionManager {
       return null;
     }
 
+    const receive = options.receive !== false;
     const connectPromise = this.connectInternal(
       guild,
       channel,
-      options.receive !== false
+      receive,
+      receive && options.buffer !== false
     );
     this.connecting.set(channelId, connectPromise);
     this.connectingGuilds.set(guildId, channelId);
@@ -263,7 +284,8 @@ export class VoiceConnectionManager {
   private async connectInternal(
     guild: Guild,
     channel: VoiceChannel | StageChannel,
-    receive: boolean
+    receive: boolean,
+    buffer: boolean
   ): Promise<VoiceConnection | null> {
     const channelId = channel.id;
     const guildId = guild.id;
@@ -377,6 +399,7 @@ export class VoiceConnectionManager {
           if (!cleanedUp) {
             cleanedUp = true;
             liveDecoders--;
+            this.notifySpeechEnd(channelId, userId);
           }
           if (!opusStream.destroyed) opusStream.destroy();
           if (!pcmStream.destroyed) pcmStream.destroy();
@@ -391,7 +414,8 @@ export class VoiceConnectionManager {
         const placer = new ChunkPlacer();
         let chunkCount = 0;
         pcmStream.on('data', (chunk: Buffer) => {
-          if (!this.connections.has(channelId)) return;
+          const info = this.connections.get(channelId);
+          if (!info) return;
           chunkCount++;
           if (chunkCount === 1) {
             logger.debug(
@@ -399,13 +423,17 @@ export class VoiceConnectionManager {
             );
           }
 
+          const now = Date.now();
+          this.notifyAudio(channelId, userId, chunk, now);
+          // A captions-only join hears people but keeps nothing.
+          if (info.buffering === false) return;
+
           // Allocated here rather than on connect: the ring costs ~55MB at the
           // default buffer length, and a channel where nobody ever speaks
           // should not pay it. The first chunk also sets the ring's epoch, so
           // the timeline starts at real audio instead of at join time - at
           // the chunk's start, since it ends now: an epoch of now would put
           // the whole first frame before the timeline, where it is dropped.
-          const now = Date.now();
           const samples = chunk.length >> 1;
           const ring = channelMixRingManager.getOrCreate(
             channelId,
@@ -484,6 +512,7 @@ export class VoiceConnectionManager {
         connectedAt: Date.now(),
         lastActivity: Date.now(),
         receiving: receive,
+        buffering: buffer,
       };
 
       this.connections.set(channelId, info);
@@ -608,6 +637,47 @@ export class VoiceConnectionManager {
     return () => this.disconnectListeners.delete(listener);
   }
 
+  /**
+   * Hand every speaker's decoded audio to `tap` as well as (where the
+   * connection buffers) the record ring. Returns an unsubscribe.
+   */
+  addAudioTap(tap: AudioTap): () => void {
+    this.audioTaps.add(tap);
+    return () => this.audioTaps.delete(tap);
+  }
+
+  /** A tap that throws must not cost the recording its audio. */
+  private notifyAudio(
+    channelId: string,
+    userId: string,
+    pcm: Buffer,
+    now: number
+  ): void {
+    for (const tap of this.audioTaps) {
+      try {
+        tap.onAudio(channelId, userId, pcm, now);
+      } catch (error) {
+        logger.debug(
+          `Audio tap failed for ${userId} in ${channelId}:`,
+          getErrorMessage(error)
+        );
+      }
+    }
+  }
+
+  private notifySpeechEnd(channelId: string, userId: string): void {
+    for (const tap of this.audioTaps) {
+      try {
+        tap.onSpeechEnd(channelId, userId);
+      } catch (error) {
+        logger.debug(
+          `Audio tap failed for ${userId} in ${channelId}:`,
+          getErrorMessage(error)
+        );
+      }
+    }
+  }
+
   private notifyDisconnect(channelId: string): void {
     for (const listener of this.disconnectListeners) {
       try {
@@ -651,15 +721,49 @@ export class VoiceConnectionManager {
   /**
    * Start listening on a connection that joined deafened for text-to-speech
    * (`receive: false`), in place: reconnecting would end the reading session
-   * and race the bot's own leave/join voice-state events. False when the
-   * channel is not connected or is already listening.
+   * and race the bot's own leave/join voice-state events. With `buffer`
+   * (the default) what it hears is kept in the record ring, which also turns
+   * a captions-only connection into a buffering one. False when the channel
+   * is not connected or nothing changed.
    */
-  enableReceive(channelId: string): boolean {
+  enableReceive(
+    channelId: string,
+    { buffer = true }: { buffer?: boolean } = {}
+  ): boolean {
     const info = this.connections.get(channelId);
-    if (!info || info.receiving !== false) return false;
-    info.receiving = true;
-    this.updateVoiceState(channelId, { selfDeaf: false });
-    logger.info(`Started receiving audio in voice channel ${channelId}`);
+    if (!info) return false;
+    if (info.receiving === false) {
+      info.receiving = true;
+      info.buffering = buffer;
+      this.updateVoiceState(channelId, { selfDeaf: false });
+      logger.info(`Started receiving audio in voice channel ${channelId}`);
+      return true;
+    }
+    if (buffer && info.buffering === false) {
+      info.buffering = true;
+      logger.info(`Started keeping audio in voice channel ${channelId}`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Stop listening without leaving: the bot deafens itself, closes every
+   * speaker's stream and drops any audio it kept. For a connection that
+   * listened only for captions and stays to read chat aloud. False when the
+   * channel is not connected or is not listening.
+   */
+  disableReceive(channelId: string): boolean {
+    const info = this.connections.get(channelId);
+    if (!info || info.receiving === false) return false;
+    info.receiving = false;
+    info.buffering = false;
+    this.destroyStreamsForChannel(channelId);
+    // Streams of speakers who start talking again are tracked in a new set.
+    this.activeStreams.set(channelId, new Set());
+    channelMixRingManager.remove(channelId);
+    this.updateVoiceState(channelId, { selfDeaf: true });
+    logger.info(`Stopped receiving audio in voice channel ${channelId}`);
     return true;
   }
 
@@ -784,15 +888,15 @@ export class VoiceConnectionManager {
 
   /**
    * Shed connections when memory runs short: those holding a mix ring first
-   * (that is where the memory is), then other listening connections, then
-   * text-to-speech-only joins, which hold almost nothing - dropping one of
-   * those would end a reading session and free no memory. Oldest first
-   * within each group.
+   * (that is where the memory is), then other buffering connections, then
+   * joins that keep nothing (reading aloud, captions), which hold almost
+   * nothing - dropping one of those would end a session and free no memory.
+   * Oldest first within each group.
    */
   async disconnectOldest(count: number): Promise<void> {
     const sheddingOrder = (channelId: string, info: VoiceConnectionInfo) => {
       if (channelMixRingManager.has(channelId)) return 0;
-      return info.receiving === false ? 2 : 1;
+      return keepsAudio(info) ? 1 : 2;
     };
     const sorted = Array.from(this.connections.entries()).sort(
       (a, b) =>

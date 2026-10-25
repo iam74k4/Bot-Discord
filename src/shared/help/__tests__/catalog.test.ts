@@ -289,6 +289,7 @@ describe('the real command definitions', () => {
 
     expect([...roots].sort()).toEqual([
       'admin',
+      'caption',
       'community',
       'general',
       'notification',

@@ -19,6 +19,9 @@ const onBeforeDisconnect = vi.fn(
   (_hook: (channelId: string) => Promise<unknown> | undefined) => unhookStatus
 );
 const ttsSessions = { handleDisconnect: vi.fn(), stopAll: vi.fn() };
+const captionSessions = { handleDisconnect: vi.fn(), stopAll: vi.fn() };
+const removeCaptionTap = vi.fn();
+const addAudioTap = vi.fn((_tap: unknown) => removeCaptionTap);
 const settleBufferingStatus = vi.fn();
 const clearStaleBufferingStatuses = vi.fn();
 
@@ -45,6 +48,7 @@ vi.mock('../jobs/fileCleanup.js', () => ({
 const logOpusBackend = vi.fn();
 vi.mock('../recording/connectionManager.js', () => ({
   connectionManager: {
+    addAudioTap,
     disconnect,
     getAllConnections,
     onDisconnect,
@@ -59,6 +63,13 @@ vi.mock('../application/voiceChannelStatus.js', () => ({
 }));
 
 vi.mock('../tts/sessionManager.js', () => ({ ttsSessions }));
+vi.mock('../captions/sessionManager.js', () => ({ captionSessions }));
+
+const handleConsentClick = vi.fn();
+vi.mock('../application/captions.js', () => ({
+  CAPTION_CONSENT_PREFIX: 'caption-consent:',
+  handleConsentClick,
+}));
 
 vi.mock('../application/reconcile.js', () => ({
   reconcileOccupiedVoiceChannels,
@@ -89,7 +100,12 @@ vi.mock('../../../shared/settingsSummary/index.js', () => ({
 }));
 
 const unregisterOptOut = vi.fn();
-const registerComponentHandler = vi.fn(() => unregisterOptOut);
+const unregisterConsent = vi.fn();
+const routeFor = (prefix: string) =>
+  prefix === 'caption-consent:' ? unregisterConsent : unregisterOptOut;
+const registerComponentHandler = vi.fn((prefix: string, _handler: unknown) =>
+  routeFor(prefix)
+);
 vi.mock('../../../shared/interactions/index.js', () => ({
   registerComponentHandler,
 }));
@@ -104,7 +120,10 @@ describe('voice feature lifecycle', () => {
     onDisconnect.mockImplementation(() => unsubscribe);
     onBeforeDisconnect.mockImplementation(() => unhookStatus);
     clearStaleBufferingStatuses.mockResolvedValue(0);
-    registerComponentHandler.mockImplementation(() => unregisterOptOut);
+    registerComponentHandler.mockImplementation((prefix: string) =>
+      routeFor(prefix)
+    );
+    addAudioTap.mockImplementation(() => removeCaptionTap);
     registerSettingsSummary.mockImplementation(() => unregisterSummary);
   });
 
@@ -147,8 +166,38 @@ describe('voice feature lifecycle', () => {
     await start({ client: {}, config: {} } as never);
 
     // The first registration is released before the second is made.
-    expect(registerComponentHandler).toHaveBeenCalledTimes(2);
+    const optOutRoutes = registerComponentHandler.mock.calls.filter(
+      ([prefix]) => prefix === 'voice-optout:'
+    );
+    expect(optOutRoutes).toHaveLength(2);
     expect(unregisterOptOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes the caption consent buttons while started, and stops on stop', async () => {
+    const { start, stop } = await import('../index.js');
+
+    await start({ client: {}, config: {} } as never);
+    await start({ client: {}, config: {} } as never);
+    expect(registerComponentHandler).toHaveBeenCalledWith(
+      'caption-consent:',
+      handleConsentClick
+    );
+    expect(unregisterConsent).toHaveBeenCalledTimes(1);
+
+    await stop();
+    expect(unregisterConsent).toHaveBeenCalledTimes(2);
+  });
+
+  it('hands speakers audio to captions while started, once, and stops on stop', async () => {
+    const { start, stop } = await import('../index.js');
+
+    await start({ client: {}, config: {} } as never);
+    await start({ client: {}, config: {} } as never);
+    expect(addAudioTap).toHaveBeenCalledWith(captionSessions);
+    expect(removeCaptionTap).toHaveBeenCalledTimes(1);
+
+    await stop();
+    expect(removeCaptionTap).toHaveBeenCalledTimes(2);
   });
 
   it('takes down its notices state for each channel it leaves on stop', async () => {
@@ -210,22 +259,25 @@ describe('voice feature lifecycle', () => {
     expect(warmUpTts).toHaveBeenCalledTimes(1);
   });
 
-  it('ends a reading session when its voice connection goes away', async () => {
+  it('ends reading and caption sessions when their voice connection goes away', async () => {
     const { start, stop } = await import('../index.js');
     await start({ client: {}, config: {} } as never);
 
-    expect(onDisconnect).toHaveBeenCalledTimes(1);
-    const listener = onDisconnect.mock.calls[0][0];
-    listener('vc-1');
+    expect(onDisconnect).toHaveBeenCalledTimes(2);
+    for (const [listener] of onDisconnect.mock.calls) listener('vc-1');
     expect(ttsSessions.handleDisconnect).toHaveBeenCalledWith('vc-1');
+    expect(captionSessions.handleDisconnect).toHaveBeenCalledWith('vc-1');
 
     await stop();
-    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(2);
   });
 
-  it('stops every reading session before leaving the voice channels', async () => {
+  it('stops every reading and caption session before leaving the voice channels', async () => {
     const order: string[] = [];
     ttsSessions.stopAll.mockImplementation(() => order.push('stopAll'));
+    captionSessions.stopAll.mockImplementation(() =>
+      order.push('captions:stopAll')
+    );
     disconnect.mockImplementation(async (channelId: string) => {
       order.push(`disconnect:${channelId}`);
     });
@@ -235,7 +287,7 @@ describe('voice feature lifecycle', () => {
 
     await stop();
 
-    expect(order).toEqual(['stopAll', 'disconnect:vc-1']);
+    expect(order).toEqual(['stopAll', 'captions:stopAll', 'disconnect:vc-1']);
   });
 
   it('is registered under the name "voice"', async () => {

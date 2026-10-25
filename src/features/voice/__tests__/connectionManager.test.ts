@@ -256,6 +256,7 @@ describe('VoiceConnectionManager', () => {
         connectedAt: NOW,
         lastActivity: NOW,
         receiving: true,
+        buffering: true,
       });
       expect(manager.getConnectionCount()).toBe(1);
     });

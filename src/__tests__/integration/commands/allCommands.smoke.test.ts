@@ -68,6 +68,8 @@ const voice = vi.hoisted(() => {
       connectedAt: number;
       /** False for a join made only to read aloud (nothing is buffered). */
       receiving?: boolean;
+      /** False for a join that listens only for captions. */
+      buffering?: boolean;
       /** Stands in for the VoiceConnection; compared by identity. */
       connection: object;
     }
@@ -111,13 +113,14 @@ const voice = vi.hoisted(() => {
         async (
           guild: { id: string },
           channel: { id: string },
-          options: { receive?: boolean } = {}
+          options: { receive?: boolean; buffer?: boolean } = {}
         ) => {
           const info = {
             channelId: channel.id,
             guildId: guild.id,
             connectedAt: Date.now(),
             receiving: options.receive !== false,
+            buffering: options.receive !== false && options.buffer !== false,
             connection: {},
           };
           connections.set(channel.id, info);
@@ -129,10 +132,25 @@ const voice = vi.hoisted(() => {
         async (channelId: string) =>
           connections.get(channelId)?.connection ?? null
       ),
-      enableReceive: vi.fn((channelId: string) => {
+      enableReceive: vi.fn(
+        (channelId: string, { buffer = true }: { buffer?: boolean } = {}) => {
+          const connection = connections.get(channelId);
+          if (!connection) return false;
+          if (connection.receiving === false) {
+            connection.receiving = true;
+            connection.buffering = buffer;
+            return true;
+          }
+          if (!buffer || connection.buffering !== false) return false;
+          connection.buffering = true;
+          return true;
+        }
+      ),
+      disableReceive: vi.fn((channelId: string) => {
         const connection = connections.get(channelId);
-        if (!connection || connection.receiving !== false) return false;
-        connection.receiving = true;
+        if (!connection || connection.receiving === false) return false;
+        connection.receiving = false;
+        connection.buffering = false;
         return true;
       }),
       getPlayer: vi.fn((channelId: string) =>
@@ -232,6 +250,24 @@ vi.mock(
   })
 );
 
+/** Stand-in for a Whisper engine that is configured and up. */
+const whisper = vi.hoisted(() => ({
+  client: {
+    isAvailable: vi.fn(async () => true),
+    transcribe: vi.fn(async () => ({ text: 'スモークテスト', segments: [] })),
+  },
+}));
+
+vi.mock(
+  '../../../features/voice/captions/whisperClient.js',
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import('../../../features/voice/captions/whisperClient.js')
+    >()),
+    getWhisperClient: () => whisper.client,
+  })
+);
+
 vi.mock(
   '../../../features/voice/tts/voicevoxClient.js',
   async (importOriginal) => ({
@@ -279,6 +315,8 @@ import { pollRepository } from '../../../features/community/poll/index.js';
 import { voiceSettingsRepository } from '../../../features/voice/repositories/voiceSettingsRepository.js';
 import { ttsRepository } from '../../../features/voice/repositories/ttsRepository.js';
 import { ttsSessions } from '../../../features/voice/tts/sessionManager.js';
+import { captionSessions } from '../../../features/voice/captions/sessionManager.js';
+import { captionConsentRepository } from '../../../features/voice/repositories/captionConsentRepository.js';
 import {
   COMMAND_POLICY,
   DISCORD_OPTION_BOUNDS,
@@ -404,6 +442,32 @@ const SCENARIOS: Record<string, (world: SmokeWorld) => void> = {
       world.textChannel.id
     );
   },
+  'caption start': (world) => {
+    // The bot is in no voice channel yet and auto-join may not keep audio
+    // here, so starting joins listening only.
+    voice.connections.clear();
+    voiceSettingsRepository.setAutoJoinEnabled(world.guild.id, false);
+  },
+  'caption stop': (world) => {
+    // Someone else started captions on a join that only listens (auto-join
+    // is off), so stopping also leaves the channel.
+    voiceSettingsRepository.setAutoJoinEnabled(world.guild.id, false);
+    voice.connections.set(world.voiceChannel.id, {
+      channelId: world.voiceChannel.id,
+      guildId: world.guild.id,
+      connectedAt: Date.now(),
+      receiving: true,
+      buffering: false,
+      connection: {},
+    });
+    captionSessions.start({
+      guildId: world.guild.id,
+      voiceChannelId: world.voiceChannel.id,
+      startedBy: IDS.friendA,
+      post: async () => {},
+      nameOf: () => 'smoke-friend-a',
+    });
+  },
   'tts start': () => {
     // The bot is in no voice channel yet, so starting has to join one.
     voice.connections.clear();
@@ -470,8 +534,10 @@ beforeEach(() => {
     )
     .all() as Array<{ name: string }>;
   for (const { name } of tables) db.exec(`DELETE FROM "${name}"`);
-  // The repository caches dictionaries and voice choices per process.
+  // The repositories cache dictionaries, voice choices and consent per
+  // process.
   ttsRepository.clearCache();
+  captionConsentRepository.clearCache();
 
   world = createWorld(OWNER_ID);
   world.client.commands = buildCommandCollection(commands);
@@ -489,8 +555,9 @@ afterEach(() => {
   for (const command of commands) {
     clearCooldown(command.json.name, world.actor.id);
   }
-  // Nor a reading session: the next test's server starts silent.
+  // Nor a reading or caption session: the next test's server starts silent.
   ttsSessions.stopAll();
+  captionSessions.stopAll();
   vi.useRealTimers();
 });
 
@@ -1037,6 +1104,7 @@ const HANDLES_OWN_FAILURE: Record<string, (world: SmokeWorld) => void> = {};
  * "already acknowledged" branch is certainly exercised below.
  */
 const KNOWN_EDITORS = new Set([
+  'caption start',
   'community poll end',
   'community roulette member',
   'general ping',
@@ -1561,6 +1629,36 @@ const REACHES: Array<{
       expect(
         notificationChannelRepository.getEnabled(w.guild.id, 'member_join')
       ).toBeNull(),
+  },
+  {
+    label: 'caption start',
+    reached: (w) => {
+      // Joined listening but keeping nothing: auto-join is off here.
+      expect(voice.manager.connect).toHaveBeenCalledWith(
+        w.guild,
+        w.voiceChannel,
+        { receive: true, buffer: false }
+      );
+      expect(captionSessions.get(w.voiceChannel.id)?.startedBy).toBe(
+        w.actor.id
+      );
+    },
+  },
+  {
+    label: 'caption stop',
+    reached: (w) => {
+      expect(captionSessions.getForGuild(w.guild.id)).toBeUndefined();
+      expect(voice.manager.disconnect).toHaveBeenCalledWith(w.voiceChannel.id);
+    },
+  },
+  {
+    label: 'caption consent',
+    // With no option it only shows the current answer.
+    fill: 'all',
+    reached: (w) =>
+      expect(
+        captionConsentRepository.hasConsented(w.guild.id, w.actor.id)
+      ).toBe(true),
   },
   {
     label: 'tts start',

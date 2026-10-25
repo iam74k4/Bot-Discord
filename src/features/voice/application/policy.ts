@@ -1,13 +1,19 @@
 import type { Guild } from 'discord.js';
-import { mapDiscordLocale, t } from '../../../locales/index.js';
+import {
+  mapDiscordLocale,
+  t,
+  type TranslationKey,
+} from '../../../locales/index.js';
 import { resolveGuildLocale } from '../../../locales/guildLocale.js';
 import { COLORS } from '../../../shared/utils/constants/index.js';
 import { createEmbed } from '../../../shared/utils/embed.js';
 import { getErrorMessage, logger } from '../../../shared/utils/logger.js';
 import type { VoiceConnectionInfo } from '../../../shared/types/voice.js';
 import { connectionManager } from '../recording/connectionManager.js';
+import { keepsAudio } from '../recording/audioMode.js';
 import { voiceSettingsRepository } from '../repositories/voiceSettingsRepository.js';
 import { ttsSessions } from '../tts/sessionManager.js';
+import { captionSessions } from '../captions/sessionManager.js';
 import { reconcileGuild, type ReconcileOutcome } from './reconcile.js';
 
 /**
@@ -19,35 +25,46 @@ import { reconcileGuild, type ReconcileOutcome } from './reconcile.js';
  */
 
 /**
- * Stop the buffering in one channel. A deafened text-to-speech join keeps no
- * audio, so it is left alone and goes on reading. A listening connection is
- * dropped at once - the opt-out wins over reading through it - and if it was
- * being read through, the people there are told why and how to resume.
+ * Stop the buffering in one channel. A join that keeps no audio - deafened
+ * for text-to-speech, or listening only for captions - is left alone and
+ * goes on. A buffering connection is dropped at once - the opt-out wins over
+ * reading or captioning through it - and if either was running, the people
+ * there are told why and how to resume.
  */
 async function stopBuffering(
   guild: Guild,
   channelId: string,
   info: VoiceConnectionInfo
 ): Promise<{ dropped: boolean; readingStopped: boolean }> {
-  if (info.receiving === false)
-    return { dropped: false, readingStopped: false };
-  // Checked first: the disconnect ends the session.
+  if (!keepsAudio(info)) return { dropped: false, readingStopped: false };
+  // Checked first: the disconnect ends the sessions.
   const readingStopped = ttsSessions.get(channelId) !== undefined;
+  const captionsStopped = captionSessions.get(channelId) !== undefined;
   // Only this connection: one that replaced it meanwhile (say, a deafened
   // /tts start join) is not ours to remove.
   await connectionManager.disconnect(channelId, info.connection);
+  // Not awaited: a slow or rate-limited post must neither keep the bot
+  // buffering nor hold up the caller's reply. They catch their own errors.
   if (readingStopped) {
-    // Not awaited: a slow or rate-limited post must neither keep the bot
-    // buffering nor hold up the caller's reply. It catches its own errors.
-    void noticeReadingStopped(guild, channelId);
+    void noticeStopped(guild, channelId, 'tts.stopped', 'tts.stoppedByOptOut');
+  }
+  if (captionsStopped) {
+    void noticeStopped(
+      guild,
+      channelId,
+      'captions.stopped',
+      'captions.stoppedByOptOut'
+    );
   }
   return { dropped: true, readingStopped };
 }
 
 /** Best effort: a missing permission must not keep the bot buffering. */
-async function noticeReadingStopped(
+async function noticeStopped(
   guild: Guild,
-  channelId: string
+  channelId: string,
+  titleKey: TranslationKey,
+  descriptionKey: TranslationKey
 ): Promise<void> {
   try {
     const channel = guild.channels.cache.get(channelId);
@@ -59,15 +76,15 @@ async function noticeReadingStopped(
     await channel.send({
       embeds: [
         createEmbed({
-          title: t('tts.stopped', locale),
-          description: t('tts.stoppedByOptOut', locale),
+          title: t(titleKey, locale),
+          description: t(descriptionKey, locale),
           color: COLORS.WARNING,
         }),
       ],
     });
   } catch (error) {
     logger.debug(
-      `Could not tell ${channelId} reading stopped: ${getErrorMessage(error)}`
+      `Could not tell ${channelId} a session stopped: ${getErrorMessage(error)}`
     );
   }
 }

@@ -23,7 +23,7 @@ src/infrastructure/database/
 ├── migrations/
 │   ├── index.ts             # Runs all migrations in order at startup
 │   ├── 001_steam.ts …       # One file per migration, NNN_name.ts
-│   └── 012_query_indexes.ts # Latest: see Migration System
+│   └── 013_caption_consent.ts # Latest: see Migration System
 └── index.ts        # Public exports
 
 src/infrastructure/backup/
@@ -234,6 +234,22 @@ are one entry with one owner. `word` keeps the latest spelling for display.
 
 ---
 
+### caption_consent
+
+Members who agreed to have their voice captioned (`/caption consent`), per
+server. Captions transcribe only members with a row here; withdrawing deletes
+the row, so "no" and "never asked" look the same.
+
+| Column       | Type    | Constraints |
+| ------------ | ------- | ----------- |
+| guild_id     | TEXT    | NOT NULL    |
+| user_id      | TEXT    | NOT NULL    |
+| consented_at | INTEGER | NOT NULL    |
+
+PRIMARY KEY (`guild_id`, `user_id`)
+
+---
+
 ### audit_logs
 
 Audit log entries for admin actions.
@@ -287,6 +303,7 @@ Defined in `src/infrastructure/audit/auditRepository.ts`.
 | polls                                                    | community      | `poll/pollRepository.ts`                                        |
 | voice_autojoin_exclusions                                | voice          | `repositories/voiceSettingsRepository.ts`                       |
 | tts_user_settings, tts_dictionary                        | voice          | `repositories/ttsRepository.ts`                                 |
+| caption_consent                                          | voice          | `repositories/captionConsentRepository.ts`                      |
 
 `guild_settings` and `audit_logs` are owned by infrastructure rather than a
 feature because several features read them: locale resolution reads
@@ -315,6 +332,7 @@ Migrations live in `src/infrastructure/database/migrations/` and are run in orde
 10. `010_native_polls.ts` — drops poll_votes and the custom `polls` schema, replacing it with the message pointer Discord's native polls need
 11. `011_tts.ts` — tts_user_settings, tts_dictionary
 12. `012_query_indexes.ts` — adds `idx_audit_logs_guild_created`; drops `idx_audit_logs_guild_id`, `idx_voice_sessions_guild_user`, and `idx_voice_sessions_guild_channel`
+13. `013_caption_consent.ts` — caption_consent
 
 `initializeDatabase()` runs all migrations inside a single transaction. It is safe to call multiple times; migrations use `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, and `DROP TABLE IF EXISTS`. Initialization is performed once per process.
 
@@ -423,6 +441,12 @@ erDiagram
         integer total_duration_ms
         integer session_count
         integer updated_at
+    }
+
+    caption_consent {
+        text guild_id PK
+        text user_id PK
+        integer consented_at
     }
 ```
 

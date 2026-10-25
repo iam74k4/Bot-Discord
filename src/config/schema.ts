@@ -63,6 +63,16 @@ export interface AppConfig {
    * Empty disables text-to-speech, and with it the Message Content intent.
    */
   readonly VOICEVOX_URL: string;
+
+  /**
+   * Base URL of a Whisper engine serving the OpenAI-compatible transcription
+   * API (e.g. http://whisper.railway.internal:8000). Empty disables captions.
+   */
+  readonly WHISPER_URL: string;
+  /** Model id sent to engines that serve several (speaches); may be empty. */
+  readonly WHISPER_MODEL: string;
+  /** ISO-639-1 language spoken in voice channels; empty lets Whisper detect it. */
+  readonly WHISPER_LANGUAGE: string;
 }
 
 export interface ConfigResult {
@@ -199,23 +209,44 @@ function parseAlertWebhook(source: EnvSource): string {
   return url;
 }
 
-function parseVoicevoxUrl(source: EnvSource): string {
-  const raw = source.VOICEVOX_URL?.trim();
+/** Base URL of a self-hosted engine (VOICEVOX, Whisper); '' when unset. */
+function parseEngineUrl(
+  source: EnvSource,
+  name: 'VOICEVOX_URL' | 'WHISPER_URL'
+): string {
+  const raw = source[name]?.trim();
   if (!raw) return '';
 
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw new Error('VOICEVOX_URL is not a valid URL');
+    throw new Error(`${name} is not a valid URL`);
   }
   // Plain http is allowed on purpose: the engine normally sits on a private
   // network next to the bot (Railway internal networking, docker compose).
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('VOICEVOX_URL must use http or https');
+    throw new Error(`${name} must use http or https`);
   }
 
   return raw.replace(/\/+$/, '');
+}
+
+/**
+ * The language hint sent with every caption: `ja` unless set, and `auto`
+ * for none. A wrong hint makes Whisper translate rather than transcribe, so
+ * anything that is not a language code fails at startup.
+ */
+function parseWhisperLanguage(source: EnvSource): string {
+  const raw = source.WHISPER_LANGUAGE?.trim().toLowerCase();
+  if (!raw) return 'ja';
+  if (raw === 'auto') return '';
+  if (!/^[a-z]{2,3}$/.test(raw)) {
+    throw new Error(
+      `WHISPER_LANGUAGE must be a language code such as ja or en, or auto (got "${source.WHISPER_LANGUAGE}")`
+    );
+  }
+  return raw;
 }
 
 function parseNodeEnv(source: EnvSource, warnings: string[]): NodeEnv {
@@ -285,7 +316,9 @@ export function parseConfig(source: EnvSource): ConfigResult {
 
   requireKeys(source);
   const alertWebhookUrl = parseAlertWebhook(source);
-  const voicevoxUrl = parseVoicevoxUrl(source);
+  const voicevoxUrl = parseEngineUrl(source, 'VOICEVOX_URL');
+  const whisperUrl = parseEngineUrl(source, 'WHISPER_URL');
+  const whisperLanguage = parseWhisperLanguage(source);
   const nodeEnv = parseNodeEnv(source, warnings);
   const statsTimeZone = parseStatsTimeZone(source, warnings, errors);
 
@@ -426,6 +459,9 @@ export function parseConfig(source: EnvSource): ConfigResult {
       ALERT_WEBHOOK_URL: alertWebhookUrl,
       LOG_LEVEL: source.LOG_LEVEL || '',
       VOICEVOX_URL: voicevoxUrl,
+      WHISPER_URL: whisperUrl,
+      WHISPER_MODEL: source.WHISPER_MODEL?.trim() ?? '',
+      WHISPER_LANGUAGE: whisperLanguage,
     },
   };
 }

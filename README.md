@@ -26,6 +26,7 @@ A modular Discord bot built with TypeScript and discord.js v14.
 - Japanese-first replies with English for everyone else; every command name in a reply is a clickable mention
 - **Voice channel recording** (restricted past-audio recording with `/voice record`)
 - **Text-to-speech** (`/tts`): reads chat aloud in voice channels with VOICEVOX, so members who cannot or would rather not speak can still take part
+- **Captions** (`/caption`): shows what people say in a voice channel as text in its chat, transcribed by a self-hosted Whisper engine, for members who cannot or would rather not listen; only members who consented are captioned
 - VC join/leave and member-join notifications, plus per-user VC time stats
 - Community features (native Discord polls, VC roulette)
 - Admin system (`/admin` server settings with one overview of every feature's settings, `/owner` bot-owner tools)
@@ -388,6 +389,44 @@ Available when the bot operator sets `VOICEVOX_URL` (see
   other character - someone who joins later, or switches voice, even from
   another server - is credited in the voice channel's chat the first time it
   is read in that session. Each character's own terms apply
+
+### Captions (`/caption`)
+
+Shows what people say in a voice channel as text in its chat, transcribed by a
+self-hosted [Whisper](https://github.com/openai/whisper) engine. Available when
+the bot operator sets `WHISPER_URL` (see
+[docs/deployment.md](docs/deployment.md#captions-optional)).
+
+| Command                    | Description                                                        |
+| -------------------------- | ------------------------------------------------------------------ |
+| `/caption start`           | Start captions in your voice channel                               |
+| `/caption stop`            | Stop captions                                                      |
+| `/caption consent [allow]` | Show, give or withdraw your consent to be captioned in this server |
+
+**How it works:**
+
+- **Only members who consented are captioned.** Everyone else's audio never
+  reaches the engine. Consent is per server, given with `/caption consent` or
+  the button on the public `/caption start` message, and can be withdrawn at
+  any time; withdrawing also drops anything of yours not yet posted
+- Each line is `**name**: text`, posted silently (no notification, no
+  mentions) a few seconds after the speaker pauses; lines that arrive close
+  together share one message, under Discord's rate limit
+- Near-silent audio is not transcribed, and Whisper's well-known phantom lines
+  (`ご視聴ありがとうございました`, `(音楽)` …) are dropped rather than posted
+- Captions are only useful while the conversation is going on: when the engine
+  falls behind, the oldest waiting speech is dropped, and speech still waiting
+  after 20 seconds is skipped. If the engine keeps failing, the channel is told
+  once
+- One engine serves every server; servers take turns, as with text-to-speech
+- Audio is never kept for captions. Where the server lets auto-join keep audio,
+  the bot joins as auto-join would; where it does not, it joins listening only
+  and keeps nothing for `/voice record`. Turning auto-join off later drops a
+  connection that keeps audio, which ends captions through it (the channel is
+  told how to resume without keeping audio)
+- Anyone in a voice channel can start captions there; only members in that
+  channel (or with Manage Server) can stop them. They end on their own when the
+  channel empties
 
 ### Memory
 
