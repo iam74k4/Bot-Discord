@@ -1,7 +1,7 @@
 <!--
 develop 向けの通常PRテンプレートです。
 リリース（develop → main）は ?template=release.md を付けて作成してください:
-https://github.com/iam74k4/Bot-Discord/compare/main...develop?template=release.md
+https://github.com/iam74k4/Discord-Bot/compare/main...develop?template=release.md
 -->
 
 ## 概要

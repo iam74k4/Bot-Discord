@@ -210,7 +210,7 @@ gitGraph
 ### A release
 
 1. Open a pull request from `develop` to `main` with the release template:
-   `https://github.com/iam74k4/Bot-Discord/compare/main...develop?template=release.md`
+   `https://github.com/iam74k4/Discord-Bot/compare/main...develop?template=release.md`
 2. Bump `version` in `package.json` on `develop` first, following
    [Semantic Versioning](https://semver.org/), so it matches the tag you will
    push.

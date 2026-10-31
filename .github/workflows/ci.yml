@@ -77,7 +77,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build the production image
-        run: docker build -t bot-discord:ci .
+        run: docker build -t discord-bot:ci .
 
       # Railway deploys this image. Native modules are the part a Node or
       # base-image change breaks without failing the build (better-sqlite3 13
@@ -85,12 +85,12 @@ jobs:
       - name: Smoke-test the runtime
         run: |
           expected="v$(cat .nvmrc)"
-          actual="$(docker run --rm bot-discord:ci node --version)"
+          actual="$(docker run --rm discord-bot:ci node --version)"
           if [ "$actual" != "$expected" ]; then
             echo "::error::The image runs Node $actual but .nvmrc says $expected; update the Dockerfile's NODE_IMAGE."
             exit 1
           fi
-          docker run --rm bot-discord:ci node -e "
+          docker run --rm discord-bot:ci node -e "
             const Database = require('better-sqlite3');
             new Database(':memory:').prepare('select 1').get();
             require('sodium-native');
